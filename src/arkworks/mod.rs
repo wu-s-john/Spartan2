@@ -9,11 +9,10 @@
 //! - **Matrices**: `ark_relations::r1cs::Matrix<F>` → `SparseMatrix<F>` (CSR format)
 //! - **Column layout**: arkworks `[1 | instances | witnesses]` → Spartan `[witnesses | 1 | public_io]`
 
-use crate::r1cs::SparseMatrix;
+use crate::{r1cs::SparseMatrix, traits::circuit::SpartanCircuit};
 use ark_ff::PrimeField as ArkPrimeField;
 use ark_relations::r1cs::{ConstraintMatrices, ConstraintSystemRef};
-use ff::Field as FfField;
-use ff::PrimeField as FfPrimeField;
+use ff::{Field as FfField, PrimeField as FfPrimeField};
 
 /// Convert an arkworks field element to an ff field element via little-endian bytes.
 ///
@@ -328,7 +327,7 @@ impl<F: FfPrimeField> ArkworksCircuitAdapter<F> {
   }
 }
 
-impl<E: Engine> crate::traits::circuit::SpartanCircuit<E> for ArkworksCircuitAdapter<E::Scalar>
+impl<E: Engine> SpartanCircuit<E> for ArkworksCircuitAdapter<E::Scalar>
 where
   E::Scalar: FfPrimeField,
 {
@@ -398,7 +397,12 @@ where
       let b_lc = self.build_lc::<CS>(&self.B, row, &witness_vars, &public_vars);
       let c_lc = self.build_lc::<CS>(&self.C, row, &witness_vars, &public_vars);
 
-      cs.enforce(|| format!("constraint_{}", row), |_| a_lc, |_| b_lc, |_| c_lc);
+      cs.enforce(
+        || format!("constraint_{}", row),
+        |_| a_lc,
+        |_| b_lc,
+        |_| c_lc,
+      );
     }
 
     Ok(())
@@ -409,9 +413,7 @@ where
 mod tests {
   use super::*;
   use ark_bn254::Fr as ArkFr;
-  use ark_r1cs_std::alloc::AllocVar;
-  use ark_r1cs_std::eq::EqGadget;
-  use ark_r1cs_std::fields::fp::FpVar;
+  use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar};
   use ark_relations::r1cs::ConstraintSystem;
   use halo2curves::bn256::Fr as Bn256Fr;
 
@@ -593,7 +595,10 @@ mod tests {
     cs.finalize();
 
     // Verify arkworks constraint system is satisfied
-    assert!(cs.is_satisfied().unwrap(), "Arkworks CS should be satisfied");
+    assert!(
+      cs.is_satisfied().unwrap(),
+      "Arkworks CS should be satisfied"
+    );
 
     // Get matrices
     let matrices = cs.to_matrices().unwrap();
@@ -603,8 +608,10 @@ mod tests {
     let (mut w, x_pub) = extract_assignments::<ArkFr, Bn256Fr>(&cs);
 
     // Build R1CSShape (don't pad - padding is only needed for proving, not is_sat)
-    use crate::provider::Bn254Engine;
-    use crate::r1cs::{R1CSInstance, R1CSShape, R1CSWitness};
+    use crate::{
+      provider::Bn254Engine,
+      r1cs::{R1CSInstance, R1CSShape, R1CSWitness},
+    };
 
     let shape = R1CSShape::<Bn254Engine>::new(
       matrices.num_constraints,
@@ -629,15 +636,12 @@ mod tests {
     shape
       .is_sat(&ck, &instance, &witness)
       .expect("R1CS should be satisfied");
-
   }
 
   /// Test full SpartanZkSNARK prove/verify flow with arkworks circuit via adapter.
   #[test]
   fn test_arkworks_circuit_adapter_zksnark() {
-    use crate::provider::Bn254Engine;
-    use crate::spartan_zk::SpartanZkSNARK;
-    use crate::traits::snark::R1CSSNARKTrait;
+    use crate::{provider::Bn254Engine, spartan_zk::SpartanZkSNARK, traits::snark::R1CSSNARKTrait};
 
     // 1. Synthesize arkworks circuit: x³ + x + 5 = y
     let cs = ConstraintSystem::<ArkFr>::new_ref();
@@ -669,7 +673,10 @@ mod tests {
     cs.finalize();
 
     // Verify arkworks constraint system is satisfied
-    assert!(cs.is_satisfied().unwrap(), "Arkworks CS should be satisfied");
+    assert!(
+      cs.is_satisfied().unwrap(),
+      "Arkworks CS should be satisfied"
+    );
 
     // 2. Extract matrices and assignments
     let matrices = cs.to_matrices().unwrap();
@@ -692,11 +699,11 @@ mod tests {
     let (pk, vk) =
       SpartanZkSNARK::<Bn254Engine>::setup(adapter.clone()).expect("setup should succeed");
 
-    let prep =
-      SpartanZkSNARK::<Bn254Engine>::prep_prove(&pk, adapter.clone(), false).expect("prep should succeed");
+    let prep = SpartanZkSNARK::<Bn254Engine>::prep_prove(&pk, adapter.clone(), false)
+      .expect("prep should succeed");
 
-    let snark =
-      SpartanZkSNARK::<Bn254Engine>::prove(&pk, adapter, &prep, false).expect("prove should succeed");
+    let snark = SpartanZkSNARK::<Bn254Engine>::prove(&pk, adapter, &prep, false)
+      .expect("prove should succeed");
 
     // 5. Verify the proof
     let result = snark.verify(&vk);

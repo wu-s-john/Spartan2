@@ -1351,20 +1351,9 @@ where
     info!(elapsed_ms = %eval_rx_t.elapsed().as_millis(), "compute_eval_rx");
 
     let (_sparse_span, sparse_t) = start_span!("compute_eval_table_sparse");
-    let (evals_A_step, evals_B_step, evals_C_step) = pk.S_step.bind_row_vars(&evals_rx);
-    let (evals_A_core, evals_B_core, evals_C_core) = pk.S_core.bind_row_vars(&evals_rx);
+    let poly_ABC_step = pk.S_step.bind_row_vars_combined(&evals_rx, r);
+    let poly_ABC_core = pk.S_core.bind_row_vars_combined(&evals_rx, r);
     info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
-
-    let (_abc_span, abc_t) = start_span!("prepare_poly_ABC");
-    let poly_ABC_step = (0..evals_A_step.len())
-      .into_par_iter()
-      .map(|i| evals_A_step[i] + r * evals_B_step[i] + r * r * evals_C_step[i])
-      .collect::<Vec<E::Scalar>>();
-    let poly_ABC_core = (0..evals_A_core.len())
-      .into_par_iter()
-      .map(|i| evals_A_core[i] + r * evals_B_core[i] + r * r * evals_C_core[i])
-      .collect::<Vec<E::Scalar>>();
-    info!(elapsed_ms = %abc_t.elapsed().as_millis(), "prepare_poly_ABC");
 
     // inner sum-check
     let (_sc2_span, sc2_t) = start_span!("inner_sumcheck_batched");

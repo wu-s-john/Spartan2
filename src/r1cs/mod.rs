@@ -1014,6 +1014,9 @@ impl<E: Engine> SplitR1CSShape<E> {
 
         for row_idx in start_row..end_row {
           let rx_row = rx[row_idx];
+          // Precompute scaled values once per row (saves 2 mults per row)
+          let rx_r = rx_row * r;
+          let rx_r_sq = rx_row * r_sq;
 
           // Get row bounds for each matrix
           let a_ptrs = [self.A.indptr[row_idx], self.A.indptr[row_idx + 1]];
@@ -1025,21 +1028,21 @@ impl<E: Engine> SplitR1CSShape<E> {
             buffer[*col] += rx_row * val;
           }
           for (val, col) in self.B.get_row_unchecked(&b_ptrs) {
-            buffer[*col] += rx_row * r * val;
+            buffer[*col] += rx_r * val;
           }
           for (val, col) in self.C.get_row_unchecked(&c_ptrs) {
-            buffer[*col] += rx_row * r_sq * val;
+            buffer[*col] += rx_r_sq * val;
           }
         }
       });
 
-    // Reduce all thread buffers into the first one
+    // Sequential reduction with parallel inner loop (simple and efficient)
     let mut result = thread_buffers.swap_remove(0);
     for buffer in thread_buffers {
       result
         .par_iter_mut()
         .zip(buffer.par_iter())
-        .for_each(|(r, b)| *r += b);
+        .for_each(|(a, b)| *a += *b);
     }
 
     result
