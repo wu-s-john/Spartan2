@@ -47,6 +47,7 @@ pub mod sumcheck;
 mod macros;
 
 // public modules
+pub mod arkworks;
 pub mod bellpepper;
 pub mod errors;
 pub mod gadgets;
@@ -67,6 +68,11 @@ pub mod cli;
 /// SHA-256 circuits using small_sha256 gadget (small-value compatible).
 #[allow(missing_docs)]
 pub mod sha256_circuits;
+
+/// RS (Rao-Sandelius) shuffle gadget for arkworks R1CS.
+/// Implements stable-partition shuffle with ElGamal re-encryption.
+#[allow(missing_docs)]
+pub mod rs_shuffle;
 
 /// Start a span + timer, return `(Span, Instant)`.
 macro_rules! start_span {

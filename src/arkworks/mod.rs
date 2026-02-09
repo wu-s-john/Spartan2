@@ -11,7 +11,8 @@
 
 use crate::r1cs::SparseMatrix;
 use ark_ff::PrimeField as ArkPrimeField;
-use ark_relations::r1cs::ConstraintMatrices;
+use ark_relations::r1cs::{ConstraintMatrices, ConstraintSystemRef};
+use ff::Field as FfField;
 use ff::PrimeField as FfPrimeField;
 
 /// Convert an arkworks field element to an ff field element via little-endian bytes.
@@ -156,10 +157,262 @@ where
   (a, b, c)
 }
 
+/// Extract and convert witness/instance assignments from a finalized arkworks ConstraintSystem.
+///
+/// This function extracts the witness and public input assignments from an arkworks
+/// constraint system and converts them to Spartan's expected format.
+///
+/// ## Layout Conversion
+///
+/// - **Arkworks instance**: `[1, pub1, pub2, ...]` (constant 1 at index 0)
+/// - **Arkworks witness**: `[wit1, wit2, ...]`
+/// - **Spartan W**: `[wit1, wit2, ...]` (same as arkworks witness)
+/// - **Spartan X**: `[pub1, pub2, ...]` (arkworks instance without the constant 1)
+///
+/// ## Arguments
+///
+/// * `cs` - Reference to a finalized arkworks ConstraintSystem
+///
+/// ## Returns
+///
+/// A tuple `(W, X)` where:
+/// - `W` is the witness vector (private inputs)
+/// - `X` is the public input vector (public inputs, excluding the constant 1)
+///
+/// ## Panics
+///
+/// Panics if the constraint system cannot be borrowed (e.g., if it's still being modified).
+pub fn extract_assignments<ArkF, F>(cs: &ConstraintSystemRef<ArkF>) -> (Vec<F>, Vec<F>)
+where
+  ArkF: ArkPrimeField,
+  F: FfPrimeField,
+{
+  let binding = cs.borrow().expect("failed to borrow constraint system");
+
+  // Witness: all private variables (no layout change needed)
+  let w: Vec<F> = binding.witness_assignment.iter().map(ark_to_ff).collect();
+
+  // Public inputs: skip the constant 1 at index 0
+  let x: Vec<F> = binding
+    .instance_assignment
+    .iter()
+    .skip(1)
+    .map(ark_to_ff)
+    .collect();
+
+  (w, x)
+}
+
+use crate::traits::Engine;
+use bellpepper_core::{ConstraintSystem, LinearCombination, SynthesisError, num::AllocatedNum};
+
+/// Adapter that wraps arkworks R1CS data to implement `SpartanCircuit`.
+///
+/// This allows arkworks circuits to be proven using `SpartanZkSNARK`.
+///
+/// ## Usage
+///
+/// ```ignore
+/// // 1. Synthesize your arkworks circuit
+/// let cs = ConstraintSystem::<ArkFr>::new_ref();
+/// // ... allocate variables and constraints ...
+/// cs.finalize();
+///
+/// // 2. Extract matrices and assignments
+/// let matrices = cs.to_matrices().unwrap();
+/// let (A, B, C) = convert_constraint_matrices::<ArkFr, Fr>(&matrices);
+/// let (W, X) = extract_assignments::<ArkFr, Fr>(&cs);
+///
+/// // 3. Create adapter
+/// let adapter = ArkworksCircuitAdapter::new(
+///     matrices.num_constraints,
+///     matrices.num_witness_variables,
+///     matrices.num_instance_variables - 1,
+///     A, B, C, W, X,
+/// );
+///
+/// // 4. Use with SpartanZkSNARK
+/// let (pk, vk) = SpartanZkSNARK::<E>::setup(adapter.clone())?;
+/// let prep = SpartanZkSNARK::<E>::prep_prove(&pk, adapter.clone(), false)?;
+/// let snark = SpartanZkSNARK::<E>::prove(&pk, adapter, &prep, false)?;
+/// snark.verify(&vk)?;
+/// ```
+#[derive(Clone, Debug)]
+pub struct ArkworksCircuitAdapter<F: FfPrimeField> {
+  /// Number of constraints
+  pub num_constraints: usize,
+  /// Number of witness variables
+  pub num_witness: usize,
+  /// Number of public input variables (excluding constant 1)
+  pub num_public: usize,
+  /// Constraint matrix A in Spartan's CSR format and column layout
+  pub A: SparseMatrix<F>,
+  /// Constraint matrix B in Spartan's CSR format and column layout
+  pub B: SparseMatrix<F>,
+  /// Constraint matrix C in Spartan's CSR format and column layout
+  pub C: SparseMatrix<F>,
+  /// Witness assignment (private inputs)
+  pub W: Vec<F>,
+  /// Public input assignment (public inputs, excluding constant 1)
+  pub X: Vec<F>,
+}
+
+impl<F: FfPrimeField> ArkworksCircuitAdapter<F> {
+  /// Create a new adapter from arkworks R1CS data.
+  ///
+  /// # Arguments
+  /// * `num_constraints` - Number of R1CS constraints
+  /// * `num_witness` - Number of witness variables
+  /// * `num_public` - Number of public input variables (excluding constant 1)
+  /// * `A, B, C` - Constraint matrices in Spartan's format (use `convert_constraint_matrices`)
+  /// * `W` - Witness assignment (use `extract_assignments`)
+  /// * `X` - Public input assignment (use `extract_assignments`)
+  pub fn new(
+    num_constraints: usize,
+    num_witness: usize,
+    num_public: usize,
+    A: SparseMatrix<F>,
+    B: SparseMatrix<F>,
+    C: SparseMatrix<F>,
+    W: Vec<F>,
+    X: Vec<F>,
+  ) -> Self {
+    Self {
+      num_constraints,
+      num_witness,
+      num_public,
+      A,
+      B,
+      C,
+      W,
+      X,
+    }
+  }
+
+  /// Build a linear combination from a CSR matrix row.
+  ///
+  /// Spartan's z-vector layout: [W | 1 | X]
+  /// - columns 0..num_witness: witness variables
+  /// - column num_witness: constant 1
+  /// - columns num_witness+1..: public inputs
+  fn build_lc<CS: ConstraintSystem<F>>(
+    &self,
+    matrix: &SparseMatrix<F>,
+    row: usize,
+    witness_vars: &[AllocatedNum<F>],
+    public_vars: &[AllocatedNum<F>],
+  ) -> LinearCombination<F> {
+    let start = matrix.indptr[row];
+    let end = matrix.indptr[row + 1];
+
+    let mut lc = LinearCombination::zero();
+
+    for i in start..end {
+      let col = matrix.indices[i];
+      let coeff = matrix.data[i];
+
+      if col < self.num_witness {
+        // Witness variable
+        lc = lc + (coeff, witness_vars[col].get_variable());
+      } else if col == self.num_witness {
+        // Constant 1
+        lc = lc + (coeff, CS::one());
+      } else {
+        // Public input
+        let pub_idx = col - self.num_witness - 1;
+        lc = lc + (coeff, public_vars[pub_idx].get_variable());
+      }
+    }
+
+    lc
+  }
+}
+
+impl<E: Engine> crate::traits::circuit::SpartanCircuit<E> for ArkworksCircuitAdapter<E::Scalar>
+where
+  E::Scalar: FfPrimeField,
+{
+  fn public_values(&self) -> Result<Vec<E::Scalar>, SynthesisError> {
+    Ok(self.X.clone())
+  }
+
+  fn shared<CS: ConstraintSystem<E::Scalar>>(
+    &self,
+    _cs: &mut CS,
+  ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
+    // No shared variables for arkworks circuits
+    Ok(vec![])
+  }
+
+  fn precommitted<CS: ConstraintSystem<E::Scalar>>(
+    &self,
+    _cs: &mut CS,
+    _shared: &[AllocatedNum<E::Scalar>],
+  ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
+    // No precommitted variables for arkworks circuits
+    Ok(vec![])
+  }
+
+  fn num_challenges(&self) -> usize {
+    // No challenges for simple arkworks circuits
+    0
+  }
+
+  fn synthesize<CS: ConstraintSystem<E::Scalar>>(
+    &self,
+    cs: &mut CS,
+    _shared: &[AllocatedNum<E::Scalar>],
+    _precommitted: &[AllocatedNum<E::Scalar>],
+    _challenges: Option<&[E::Scalar]>,
+  ) -> Result<(), SynthesisError> {
+    // Allocate witness variables
+    let witness_vars: Vec<AllocatedNum<E::Scalar>> = (0..self.num_witness)
+      .map(|i| {
+        let value = if i < self.W.len() {
+          self.W[i]
+        } else {
+          E::Scalar::ZERO
+        };
+        AllocatedNum::alloc(cs.namespace(|| format!("w_{}", i)), || Ok(value))
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    // Allocate public input variables
+    let public_vars: Vec<AllocatedNum<E::Scalar>> = (0..self.num_public)
+      .map(|i| -> Result<AllocatedNum<E::Scalar>, SynthesisError> {
+        let value = if i < self.X.len() {
+          self.X[i]
+        } else {
+          E::Scalar::ZERO
+        };
+        let var = AllocatedNum::alloc(cs.namespace(|| format!("x_{}", i)), || Ok(value))?;
+        // Make it public
+        var.inputize(cs.namespace(|| format!("pub_x_{}", i)))?;
+        Ok(var)
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    // Add constraints from matrices
+    for row in 0..self.num_constraints {
+      let a_lc = self.build_lc::<CS>(&self.A, row, &witness_vars, &public_vars);
+      let b_lc = self.build_lc::<CS>(&self.B, row, &witness_vars, &public_vars);
+      let c_lc = self.build_lc::<CS>(&self.C, row, &witness_vars, &public_vars);
+
+      cs.enforce(|| format!("constraint_{}", row), |_| a_lc, |_| b_lc, |_| c_lc);
+    }
+
+    Ok(())
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
   use ark_bn254::Fr as ArkFr;
+  use ark_r1cs_std::alloc::AllocVar;
+  use ark_r1cs_std::eq::EqGadget;
+  use ark_r1cs_std::fields::fp::FpVar;
+  use ark_relations::r1cs::ConstraintSystem;
   use halo2curves::bn256::Fr as Bn256Fr;
 
   #[test]
@@ -264,5 +517,195 @@ mod tests {
     assert_eq!(spartan.indices[3], 4);
     assert_eq!(spartan.data[2], Bn256Fr::from(3u64));
     assert_eq!(spartan.data[3], Bn256Fr::from(4u64));
+  }
+
+  #[test]
+  fn test_extract_assignments() {
+    // Create a simple constraint system with known values
+    let cs = ConstraintSystem::<ArkFr>::new_ref();
+
+    // Allocate public inputs (these go to instance_assignment)
+    let x = FpVar::new_input(cs.clone(), || Ok(ArkFr::from(3u64))).unwrap();
+    let y = FpVar::new_input(cs.clone(), || Ok(ArkFr::from(35u64))).unwrap();
+
+    // Allocate witnesses (these go to witness_assignment)
+    let x_squared = FpVar::new_witness(cs.clone(), || Ok(ArkFr::from(9u64))).unwrap();
+    let x_cubed = FpVar::new_witness(cs.clone(), || Ok(ArkFr::from(27u64))).unwrap();
+
+    // Add constraints: x² = x * x, x³ = x² * x, y = x³ + x + 5
+    let computed_x_squared = &x * &x;
+    x_squared.enforce_equal(&computed_x_squared).unwrap();
+
+    let computed_x_cubed = &x_squared * &x;
+    x_cubed.enforce_equal(&computed_x_cubed).unwrap();
+
+    let five = FpVar::new_constant(cs.clone(), ArkFr::from(5u64)).unwrap();
+    let computed_y = &x_cubed + &x + &five;
+    y.enforce_equal(&computed_y).unwrap();
+
+    cs.finalize();
+
+    // Extract assignments
+    let (w, x_pub) = extract_assignments::<ArkFr, Bn256Fr>(&cs);
+
+    // Verify public inputs (X): should be [3, 35] (x and y values)
+    assert_eq!(x_pub.len(), 2);
+    assert_eq!(x_pub[0], Bn256Fr::from(3u64)); // x = 3
+    assert_eq!(x_pub[1], Bn256Fr::from(35u64)); // y = 35 = 27 + 3 + 5
+
+    // Verify witnesses (W): should contain x², x³, and intermediate values
+    // The exact count depends on how arkworks allocates intermediate variables
+    assert!(!w.is_empty());
+
+    // Verify the constraint system is satisfied
+    assert!(cs.is_satisfied().unwrap());
+  }
+
+  #[test]
+  fn test_extract_assignments_with_r1cs_shape() {
+    // Create a simple constraint system: x³ + x + 5 = y
+    let cs = ConstraintSystem::<ArkFr>::new_ref();
+
+    let x_val = ArkFr::from(3u64);
+    let x_squared_val = ArkFr::from(9u64);
+    let x_cubed_val = ArkFr::from(27u64);
+    let y_val = ArkFr::from(35u64); // 27 + 3 + 5 = 35
+
+    // Public: x (input), y (output)
+    let x = FpVar::new_input(cs.clone(), || Ok(x_val)).unwrap();
+    let y = FpVar::new_input(cs.clone(), || Ok(y_val)).unwrap();
+
+    // Witness: intermediate values
+    let x_squared = FpVar::new_witness(cs.clone(), || Ok(x_squared_val)).unwrap();
+    let x_cubed = FpVar::new_witness(cs.clone(), || Ok(x_cubed_val)).unwrap();
+
+    // Constraints
+    let computed_x_squared = &x * &x;
+    x_squared.enforce_equal(&computed_x_squared).unwrap();
+
+    let computed_x_cubed = &x_squared * &x;
+    x_cubed.enforce_equal(&computed_x_cubed).unwrap();
+
+    let five = FpVar::new_constant(cs.clone(), ArkFr::from(5u64)).unwrap();
+    let computed_y = &x_cubed + &x + &five;
+    y.enforce_equal(&computed_y).unwrap();
+
+    cs.finalize();
+
+    // Verify arkworks constraint system is satisfied
+    assert!(cs.is_satisfied().unwrap(), "Arkworks CS should be satisfied");
+
+    // Get matrices
+    let matrices = cs.to_matrices().unwrap();
+    let (a, b, c) = convert_constraint_matrices::<ArkFr, Bn256Fr>(&matrices);
+
+    // Get assignments
+    let (mut w, x_pub) = extract_assignments::<ArkFr, Bn256Fr>(&cs);
+
+    // Build R1CSShape (don't pad - padding is only needed for proving, not is_sat)
+    use crate::provider::Bn254Engine;
+    use crate::r1cs::{R1CSInstance, R1CSShape, R1CSWitness};
+
+    let shape = R1CSShape::<Bn254Engine>::new(
+      matrices.num_constraints,
+      matrices.num_witness_variables,
+      matrices.num_instance_variables - 1, // exclude constant
+      a,
+      b,
+      c,
+    )
+    .unwrap();
+
+    // Get commitment key
+    let (ck, _vk) = shape.commitment_key();
+
+    // Create witness (this pads W to match shape.num_vars)
+    let (witness, comm_w) = R1CSWitness::<Bn254Engine>::new(&ck, &shape, &mut w, false).unwrap();
+
+    // Create instance
+    let instance = R1CSInstance::<Bn254Engine>::new(&shape, &comm_w, &x_pub).unwrap();
+
+    // This is the ultimate test: verify R1CS satisfaction
+    shape
+      .is_sat(&ck, &instance, &witness)
+      .expect("R1CS should be satisfied");
+
+  }
+
+  /// Test full SpartanZkSNARK prove/verify flow with arkworks circuit via adapter.
+  #[test]
+  fn test_arkworks_circuit_adapter_zksnark() {
+    use crate::provider::Bn254Engine;
+    use crate::spartan_zk::SpartanZkSNARK;
+    use crate::traits::snark::R1CSSNARKTrait;
+
+    // 1. Synthesize arkworks circuit: x³ + x + 5 = y
+    let cs = ConstraintSystem::<ArkFr>::new_ref();
+
+    let x_val = ArkFr::from(3u64);
+    let x_squared_val = ArkFr::from(9u64);
+    let x_cubed_val = ArkFr::from(27u64);
+    let y_val = ArkFr::from(35u64); // 27 + 3 + 5 = 35
+
+    // Public: x (input), y (output)
+    let x = FpVar::new_input(cs.clone(), || Ok(x_val)).unwrap();
+    let y = FpVar::new_input(cs.clone(), || Ok(y_val)).unwrap();
+
+    // Witness: intermediate values
+    let x_squared = FpVar::new_witness(cs.clone(), || Ok(x_squared_val)).unwrap();
+    let x_cubed = FpVar::new_witness(cs.clone(), || Ok(x_cubed_val)).unwrap();
+
+    // Constraints
+    let computed_x_squared = &x * &x;
+    x_squared.enforce_equal(&computed_x_squared).unwrap();
+
+    let computed_x_cubed = &x_squared * &x;
+    x_cubed.enforce_equal(&computed_x_cubed).unwrap();
+
+    let five = FpVar::new_constant(cs.clone(), ArkFr::from(5u64)).unwrap();
+    let computed_y = &x_cubed + &x + &five;
+    y.enforce_equal(&computed_y).unwrap();
+
+    cs.finalize();
+
+    // Verify arkworks constraint system is satisfied
+    assert!(cs.is_satisfied().unwrap(), "Arkworks CS should be satisfied");
+
+    // 2. Extract matrices and assignments
+    let matrices = cs.to_matrices().unwrap();
+    let (a, b, c) = convert_constraint_matrices::<ArkFr, Bn256Fr>(&matrices);
+    let (w, x_pub) = extract_assignments::<ArkFr, Bn256Fr>(&cs);
+
+    // 3. Create adapter
+    let adapter = ArkworksCircuitAdapter::new(
+      matrices.num_constraints,
+      matrices.num_witness_variables,
+      matrices.num_instance_variables - 1, // exclude constant 1
+      a,
+      b,
+      c,
+      w,
+      x_pub.clone(),
+    );
+
+    // 4. Use with SpartanZkSNARK
+    let (pk, vk) =
+      SpartanZkSNARK::<Bn254Engine>::setup(adapter.clone()).expect("setup should succeed");
+
+    let prep =
+      SpartanZkSNARK::<Bn254Engine>::prep_prove(&pk, adapter.clone(), false).expect("prep should succeed");
+
+    let snark =
+      SpartanZkSNARK::<Bn254Engine>::prove(&pk, adapter, &prep, false).expect("prove should succeed");
+
+    // 5. Verify the proof
+    let result = snark.verify(&vk);
+    assert!(result.is_ok(), "verification should succeed");
+
+    // 6. Check that public outputs match
+    let public_outputs = result.unwrap();
+    assert_eq!(public_outputs.len(), 2);
+    assert_eq!(public_outputs[0], Bn256Fr::from(3u64)); // x = 3
+    assert_eq!(public_outputs[1], Bn256Fr::from(35u64)); // y = 35
   }
 }
