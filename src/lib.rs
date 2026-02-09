@@ -25,9 +25,11 @@
 mod digest;
 mod math;
 mod nifs;
-mod polys;
+/// Polynomial representations.
+pub mod polys;
 mod r1cs;
-mod sumcheck;
+/// Sumcheck protocol implementation.
+pub mod sumcheck;
 mod zk;
 
 #[macro_use]
