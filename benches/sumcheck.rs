@@ -6,12 +6,14 @@
 //! Field:    BENCH_FIELD=pallas cargo bench --bench sumcheck
 //!           Options: bn254 (default), pallas, vesta, t256
 
-use criterion::{BatchSize, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ff::Field;
+use rand::{SeedableRng, rngs::StdRng};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use spartan2::{
+  big_num::DelayedReduction,
   polys::multilinear::MultilinearPolynomial,
-  provider::{Bn254HyraxEngine, PallasHyraxEngine, T256HyraxEngine, VestaHyraxEngine},
+  provider::{Bn254Engine, PallasHyraxEngine, T256HyraxEngine, VestaHyraxEngine},
   sumcheck::SumcheckProof,
   traits::{Engine, transcript::TranscriptEngineTrait},
 };
@@ -28,7 +30,10 @@ criterion_group! {
 
 criterion_main!(sumcheck);
 
-fn bench_sumcheck_with_engine<E: Engine>(c: &mut Criterion, field_name: &str) {
+fn bench_sumcheck_with_engine<E: Engine>(c: &mut Criterion, field_name: &str)
+where
+  E::Scalar: DelayedReduction<E::Scalar>,
+{
   // Read sizes from env, default to 16..=26
   let sizes: Vec<usize> = std::env::var("BENCH_SIZES")
     .map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
@@ -37,24 +42,37 @@ fn bench_sumcheck_with_engine<E: Engine>(c: &mut Criterion, field_name: &str) {
   let max_vars = *sizes.iter().max().unwrap_or(&26);
   let max_len = 1 << max_vars;
 
-  // Pre-generate test data at maximum size
+  // Pre-generate random test data at maximum size using seeded RNG for reproducibility
+  // Using random data avoids masking branch misprediction or cache effects
+  const SEED: u64 = 0xDEADBEEF_CAFEBABE;
+
   let az: Vec<E::Scalar> = (0..max_len)
     .into_par_iter()
-    .map(|i| E::Scalar::from(i as u64 * 3 + 1))
+    .map_init(
+      || StdRng::seed_from_u64(SEED),
+      |rng, _| E::Scalar::random(&mut *rng),
+    )
     .collect();
 
   let bz: Vec<E::Scalar> = (0..max_len)
     .into_par_iter()
-    .map(|i| E::Scalar::from(i as u64 * 7 + 2))
+    .map_init(
+      || StdRng::seed_from_u64(SEED.wrapping_add(1)),
+      |rng, _| E::Scalar::random(&mut *rng),
+    )
     .collect();
 
   let cz: Vec<E::Scalar> = (0..max_len)
     .into_par_iter()
-    .map(|i| E::Scalar::from(i as u64 * 11 + 3))
+    .map_init(
+      || StdRng::seed_from_u64(SEED.wrapping_add(2)),
+      |rng, _| E::Scalar::random(&mut *rng),
+    )
     .collect();
 
+  let mut tau_rng = StdRng::seed_from_u64(SEED.wrapping_add(3));
   let taus: Vec<E::Scalar> = (0..max_vars)
-    .map(|i| E::Scalar::from(i as u64 + 1))
+    .map(|_| E::Scalar::random(&mut tau_rng))
     .collect();
 
   let group_name = format!("Sumcheck/{field_name}");
@@ -102,19 +120,19 @@ fn bench_sumcheck_with_engine<E: Engine>(c: &mut Criterion, field_name: &str) {
 }
 
 fn bench_sumcheck_split_eq(c: &mut Criterion) {
-  let field = std::env::var("BENCH_FIELD").unwrap_or_else(|_| "pallas".to_string());
+  let field = std::env::var("BENCH_FIELD").unwrap_or_else(|_| "bn254".to_string());
 
   match field.to_lowercase().as_str() {
-    "bn254" => bench_sumcheck_with_engine::<Bn254HyraxEngine>(c, "bn254"),
+    "bn254" => bench_sumcheck_with_engine::<Bn254Engine>(c, "bn254"),
     "pallas" => bench_sumcheck_with_engine::<PallasHyraxEngine>(c, "pallas"),
     "vesta" => bench_sumcheck_with_engine::<VestaHyraxEngine>(c, "vesta"),
     "t256" => bench_sumcheck_with_engine::<T256HyraxEngine>(c, "t256"),
     _ => {
       eprintln!(
-        "Unknown field '{}'. Options: bn254, pallas (default), vesta, t256",
+        "Unknown field '{}'. Options: bn254 (default), pallas, vesta, t256",
         field
       );
-      bench_sumcheck_with_engine::<PallasHyraxEngine>(c, "pallas")
+      bench_sumcheck_with_engine::<Bn254Engine>(c, "bn254")
     }
   }
 }
