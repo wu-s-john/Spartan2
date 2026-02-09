@@ -202,7 +202,67 @@ where
   (w, x)
 }
 
+/// Extract witness and public inputs from an arkworks circuit WITHOUT building constraint matrices.
+///
+/// This is the **fast path** for generating proofs with new inputs. It runs the circuit
+/// in `SynthesisMode::Prove { construct_matrices: false }`, which skips matrix construction
+/// entirely and only populates the witness assignments.
+///
+/// ## Usage
+///
+/// ```ignore
+/// // Setup (once) - full synthesis to get matrices
+/// let cs = ConstraintSystem::<ArkFr>::new_ref();
+/// my_circuit.generate_constraints(cs.clone())?;
+/// cs.finalize();
+/// let matrices = cs.to_matrices()?;
+/// let (A, B, C) = convert_constraint_matrices(&matrices);
+/// let (W, X) = extract_assignments(&cs);
+/// let mut adapter = ArkworksCircuitAdapter::new(..., A, B, C, W, X);
+///
+/// // Prove (multiple times) - fast witness-only extraction
+/// let circuit_new = MyCircuit::new(new_inputs);
+/// let (W_new, X_new) = extract_witness_only::<ArkFr, Fr, _>(circuit_new)?;
+/// adapter.update_witness(W_new, X_new);
+/// // Now use adapter with Spartan prover
+/// ```
+///
+/// ## Performance
+///
+/// This function is significantly faster than full constraint synthesis because:
+/// - No matrix construction (A, B, C are not built)
+/// - Only witness assignments are populated
+/// - Constraint enforcement is skipped internally
+///
+/// ## Note
+///
+/// This function takes ownership of the circuit. If you need to reuse the circuit,
+/// clone it before passing to this function.
+pub fn extract_witness_only<ArkF, F, C>(circuit: C) -> Result<(Vec<F>, Vec<F>), SynthesisError>
+where
+  ArkF: ArkPrimeField,
+  F: FfPrimeField,
+  C: ConstraintSynthesizer<ArkF>,
+{
+  use ark_relations::r1cs::ConstraintSystem as ArkConstraintSystem;
+
+  // Create constraint system in prove mode WITHOUT constructing matrices
+  let cs = ArkConstraintSystem::<ArkF>::new_ref();
+  cs.set_mode(SynthesisMode::Prove {
+    construct_matrices: false,
+  });
+
+  // Synthesize to extract witness only (fast!)
+  circuit
+    .generate_constraints(cs.clone())
+    .map_err(|_| SynthesisError::AssignmentMissing)?;
+
+  // Extract assignments
+  Ok(extract_assignments::<ArkF, F>(&cs))
+}
+
 use crate::traits::Engine;
+use ark_relations::r1cs::{ConstraintSynthesizer, SynthesisMode};
 use bellpepper_core::{ConstraintSystem, LinearCombination, SynthesisError, num::AllocatedNum};
 
 /// Adapter that wraps arkworks R1CS data to implement `SpartanCircuit`.
@@ -288,6 +348,19 @@ impl<F: FfPrimeField> ArkworksCircuitAdapter<F> {
     }
   }
 
+  /// Update the witness and public input assignments for a new proof.
+  ///
+  /// This is the fast path for generating multiple proofs with the same circuit structure
+  /// but different witness values. The matrices (A, B, C) remain unchanged.
+  ///
+  /// # Arguments
+  /// * `W` - New witness assignment
+  /// * `X` - New public input assignment
+  pub fn update_witness(&mut self, W: Vec<F>, X: Vec<F>) {
+    self.W = W;
+    self.X = X;
+  }
+
   /// Build a linear combination from a CSR matrix row.
   ///
   /// Spartan's z-vector layout: [W | 1 | X]
@@ -364,45 +437,71 @@ where
     _precommitted: &[AllocatedNum<E::Scalar>],
     _challenges: Option<&[E::Scalar]>,
   ) -> Result<(), SynthesisError> {
-    // Allocate witness variables
-    let witness_vars: Vec<AllocatedNum<E::Scalar>> = (0..self.num_witness)
-      .map(|i| {
-        let value = if i < self.W.len() {
-          self.W[i]
-        } else {
-          E::Scalar::ZERO
-        };
-        AllocatedNum::alloc(cs.namespace(|| format!("w_{}", i)), || Ok(value))
-      })
-      .collect::<Result<Vec<_>, _>>()?;
+    // Check if we're in witness generation mode (prove phase) vs setup phase
+    // In witness mode, SatisfyingAssignment.enforce() is a no-op, so we can skip
+    // the expensive constraint building entirely.
+    let witness_mode = cs.is_witness_generator();
 
-    // Allocate public input variables
-    let public_vars: Vec<AllocatedNum<E::Scalar>> = (0..self.num_public)
-      .map(|i| -> Result<AllocatedNum<E::Scalar>, SynthesisError> {
-        let value = if i < self.X.len() {
-          self.X[i]
-        } else {
-          E::Scalar::ZERO
-        };
-        let var = AllocatedNum::alloc(cs.namespace(|| format!("x_{}", i)), || Ok(value))?;
-        // Make it public
-        var.inputize(cs.namespace(|| format!("pub_x_{}", i)))?;
-        Ok(var)
-      })
-      .collect::<Result<Vec<_>, _>>()?;
+    tracing::debug!(
+      witness_mode,
+      num_witness = self.num_witness,
+      num_public = self.num_public,
+      num_constraints = self.num_constraints,
+      "ArkworksCircuitAdapter::synthesize"
+    );
 
-    // Add constraints from matrices
-    for row in 0..self.num_constraints {
-      let a_lc = self.build_lc::<CS>(&self.A, row, &witness_vars, &public_vars);
-      let b_lc = self.build_lc::<CS>(&self.B, row, &witness_vars, &public_vars);
-      let c_lc = self.build_lc::<CS>(&self.C, row, &witness_vars, &public_vars);
+    if witness_mode {
+      // FAST PATH: Prove phase - just allocate values, skip constraint enforcement
+      // Use extend_aux/extend_inputs for batch allocation (much faster than individual allocs)
+      //
+      // Note: aux_assignment contains BOTH witness AND public variables because
+      // inputize() first allocates as aux, then copies to input. So we must add
+      // both W and X to aux_assignment to match the slow path behavior.
+      cs.extend_aux(&self.W);
+      cs.extend_aux(&self.X); // Public vars also go to aux (inputize allocates then copies)
+      cs.extend_inputs(&self.X);
+    } else {
+      // SLOW PATH: Setup phase - need to build constraints for shape extraction
+      // Allocate witness variables
+      let witness_vars: Vec<AllocatedNum<E::Scalar>> = (0..self.num_witness)
+        .map(|i| {
+          let value = if i < self.W.len() {
+            self.W[i]
+          } else {
+            E::Scalar::ZERO
+          };
+          AllocatedNum::alloc(cs.namespace(|| format!("w_{}", i)), || Ok(value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-      cs.enforce(
-        || format!("constraint_{}", row),
-        |_| a_lc,
-        |_| b_lc,
-        |_| c_lc,
-      );
+      // Allocate public input variables
+      let public_vars: Vec<AllocatedNum<E::Scalar>> = (0..self.num_public)
+        .map(|i| -> Result<AllocatedNum<E::Scalar>, SynthesisError> {
+          let value = if i < self.X.len() {
+            self.X[i]
+          } else {
+            E::Scalar::ZERO
+          };
+          let var = AllocatedNum::alloc(cs.namespace(|| format!("x_{}", i)), || Ok(value))?;
+          // Make it public
+          var.inputize(cs.namespace(|| format!("pub_x_{}", i)))?;
+          Ok(var)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+      // Add constraints from matrices
+      for row in 0..self.num_constraints {
+        let a_lc = self.build_lc::<CS>(&self.A, row, &witness_vars, &public_vars);
+        let b_lc = self.build_lc::<CS>(&self.B, row, &witness_vars, &public_vars);
+        let c_lc = self.build_lc::<CS>(&self.C, row, &witness_vars, &public_vars);
+
+        cs.enforce(
+          || format!("constraint_{}", row),
+          |_| a_lc,
+          |_| b_lc,
+          |_| c_lc,
+        );
+      }
     }
 
     Ok(())

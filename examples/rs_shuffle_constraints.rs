@@ -16,13 +16,14 @@ use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::groups::curves::short_weierstrass::ProjectiveVar;
 use ark_r1cs_std::prelude::AllocationMode;
-use ark_relations::r1cs::ConstraintSystem;
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem, ConstraintSystemRef};
 use clap::{Parser, Subcommand};
 use halo2curves::bn256::Fr as Bn256Fr;
 
 use spartan2::rs_shuffle::bit_generation::derive_split_bits;
-use spartan2::rs_shuffle::data_structures::PermutationWitnessTraceVar;
-use spartan2::rs_shuffle::data_structures::{ElGamalCiphertext, ElGamalCiphertextVar};
+use spartan2::rs_shuffle::data_structures::{
+    ElGamalCiphertext, ElGamalCiphertextVar, PermutationWitnessTrace, PermutationWitnessTraceVar,
+};
 use spartan2::rs_shuffle::encryption::ElGamalEncryption;
 use spartan2::rs_shuffle::gadget::{rs_shuffle, rs_shuffle_with_reencryption};
 use spartan2::rs_shuffle::native::run_rs_shuffle_permutation;
@@ -33,6 +34,152 @@ type GrumpkinVar = ProjectiveVar<GrumpkinConfig, FpVar<BaseField>>;
 const N: usize = 52;
 /// Number of shuffle levels (log2(52) rounded up)
 const LEVELS: usize = 6;
+
+/// RS Shuffle circuit that implements ConstraintSynthesizer.
+/// This allows us to use `extract_witness_only` for fast witness generation.
+#[derive(Clone)]
+struct RsShuffleCircuit {
+    /// Seed for the shuffle (public input)
+    seed: BaseField,
+    /// Input ciphertexts (public input)
+    ct_input: [ElGamalCiphertext<GrumpkinProjective>; N],
+    /// Shuffled ciphertexts before re-encryption (witness)
+    ct_shuffled: [ElGamalCiphertext<GrumpkinProjective>; N],
+    /// Output ciphertexts after re-encryption (public input)
+    ct_output: [ElGamalCiphertext<GrumpkinProjective>; N],
+    /// Public key for re-encryption (public input)
+    pk: GrumpkinProjective,
+    /// Permutation witness trace
+    witness_trace: PermutationWitnessTrace<N, LEVELS>,
+    /// Re-randomization values for re-encryption
+    rerandomizations: [BaseField; N],
+    /// Challenge alpha (public input)
+    alpha: BaseField,
+    /// Challenge beta (public input)
+    beta: BaseField,
+    /// Precomputed generator powers for efficient scalar multiplication
+    generator_powers: Vec<GrumpkinProjective>,
+    /// Number of Poseidon samples needed
+    num_samples: usize,
+}
+
+impl RsShuffleCircuit {
+    fn new(
+        seed: BaseField,
+        ct_input: [ElGamalCiphertext<GrumpkinProjective>; N],
+        ct_shuffled: [ElGamalCiphertext<GrumpkinProjective>; N],
+        ct_output: [ElGamalCiphertext<GrumpkinProjective>; N],
+        pk: GrumpkinProjective,
+        witness_trace: PermutationWitnessTrace<N, LEVELS>,
+        rerandomizations: [BaseField; N],
+        alpha: BaseField,
+        beta: BaseField,
+        generator_powers: Vec<GrumpkinProjective>,
+        num_samples: usize,
+    ) -> Self {
+        Self {
+            seed,
+            ct_input,
+            ct_shuffled,
+            ct_output,
+            pk,
+            witness_trace,
+            rerandomizations,
+            alpha,
+            beta,
+            generator_powers,
+            num_samples,
+        }
+    }
+}
+
+impl ConstraintSynthesizer<BaseField> for RsShuffleCircuit {
+    fn generate_constraints(
+        self,
+        cs: ConstraintSystemRef<BaseField>,
+    ) -> Result<(), ark_relations::r1cs::SynthesisError> {
+        // Allocate seed
+        let seed_var =
+            FpVar::new_input(cs.clone(), || Ok(self.seed)).expect("Failed to allocate seed");
+
+        // Allocate input ciphertexts
+        let ct_input_vars: [ElGamalCiphertextVar<GrumpkinProjective, GrumpkinVar>; N] =
+            std::array::from_fn(|i| {
+                ElGamalCiphertextVar::new_variable(
+                    cs.clone(),
+                    || Ok(&self.ct_input[i]),
+                    AllocationMode::Input,
+                )
+                .expect("Failed to allocate input ciphertext")
+            });
+
+        // Allocate shuffled ciphertexts (intermediate - witness)
+        let ct_shuffled_vars: [ElGamalCiphertextVar<GrumpkinProjective, GrumpkinVar>; N] =
+            std::array::from_fn(|i| {
+                ElGamalCiphertextVar::new_variable(
+                    cs.clone(),
+                    || Ok(&self.ct_shuffled[i]),
+                    AllocationMode::Witness,
+                )
+                .expect("Failed to allocate shuffled ciphertext")
+            });
+
+        // Allocate output ciphertexts
+        let ct_output_vars: [ElGamalCiphertextVar<GrumpkinProjective, GrumpkinVar>; N] =
+            std::array::from_fn(|i| {
+                ElGamalCiphertextVar::new_variable(
+                    cs.clone(),
+                    || Ok(&self.ct_output[i]),
+                    AllocationMode::Input,
+                )
+                .expect("Failed to allocate output ciphertext")
+            });
+
+        // Allocate public key
+        let pk_var =
+            GrumpkinVar::new_variable(cs.clone(), || Ok(self.pk), AllocationMode::Input)
+                .expect("Failed to allocate public key");
+
+        // Allocate challenges
+        let alpha_var = FpVar::new_input(cs.clone(), || Ok(self.alpha))
+            .expect("Failed to allocate alpha");
+        let beta_var =
+            FpVar::new_input(cs.clone(), || Ok(self.beta)).expect("Failed to allocate beta");
+
+        // Allocate witness
+        let witness_var = PermutationWitnessTraceVar::new_variable(
+            cs.clone(),
+            || Ok(&self.witness_trace),
+            AllocationMode::Witness,
+        )
+        .expect("Failed to allocate witness");
+
+        // Allocate rerandomizations
+        let rerand_vars: [FpVar<BaseField>; N] = std::array::from_fn(|i| {
+            FpVar::new_witness(cs.clone(), || Ok(self.rerandomizations[i]))
+                .expect("Failed to allocate rerandomization")
+        });
+
+        // Run the full verification
+        rs_shuffle_with_reencryption::<GrumpkinProjective, GrumpkinVar, N, LEVELS>(
+            cs,
+            &seed_var,
+            &ct_input_vars,
+            &ct_shuffled_vars,
+            &ct_output_vars,
+            &pk_var,
+            &alpha_var,
+            &beta_var,
+            &witness_var,
+            &rerand_vars,
+            self.num_samples,
+            &self.generator_powers,
+        )
+        .expect("rs_shuffle_with_reencryption failed");
+
+        Ok(())
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "rs_shuffle_constraints")]
@@ -402,27 +549,90 @@ fn run_spartan_proof(
 }
 
 fn run_spartan_zk_proof(
-    cs_full: &ark_relations::r1cs::ConstraintSystemRef<BaseField>,
+    _cs_full: &ark_relations::r1cs::ConstraintSystemRef<BaseField>,
     total_constraints: usize,
 ) {
+    use ark_ff::{BigInteger, PrimeField};
     use spartan2::arkworks::{
-        convert_constraint_matrices, extract_assignments, ArkworksCircuitAdapter,
+        convert_constraint_matrices, extract_assignments, extract_witness_only,
+        ArkworksCircuitAdapter,
     };
     use spartan2::provider::Bn254Engine;
     use spartan2::spartan_zk::SpartanZkSNARK;
     use spartan2::traits::snark::R1CSSNARKTrait;
     use std::time::Instant;
 
-    println!("\n--- Spartan zkSNARK Proof ---");
+    println!("\n--- Spartan zkSNARK Proof (Correct Flow) ---");
+    println!("  Matrices extracted at SETUP, witnesses computed at PROVE time\n");
 
-    // Finalize the constraint system
-    cs_full.finalize();
+    let mut rng = ark_std::test_rng();
 
-    // Extract matrices and assignments
-    println!("  Extracting matrices and assignments...");
-    let matrices = cs_full.to_matrices().expect("Failed to get matrices");
+    // Generate keys
+    let sk = <GrumpkinConfig as CurveConfig>::ScalarField::rand(&mut rng);
+    let pk = GrumpkinProjective::generator() * sk;
+
+    // Precompute generator powers (shared across all proofs)
+    let generator_powers = ElGamalEncryption::<GrumpkinProjective>::precompute_generator_powers();
+
+    // ========================================================================
+    // SETUP PHASE: Extract matrices (done ONCE)
+    // ========================================================================
+    println!("  === SETUP PHASE (extract matrices once) ===");
+
+    // Create initial cards for setup
+    let ct_init_setup: [ElGamalCiphertext<GrumpkinProjective>; N] = std::array::from_fn(|i| {
+        let message = <GrumpkinConfig as CurveConfig>::ScalarField::from(i as u64);
+        let randomness = <GrumpkinConfig as CurveConfig>::ScalarField::rand(&mut rng);
+        ElGamalCiphertext::encrypt_scalar(message, randomness, pk)
+    });
+
+    // Run native shuffle for setup witness
+    let seed_setup = BaseField::from(42u64);
+    let rs_trace_setup =
+        run_rs_shuffle_permutation::<BaseField, _, N, LEVELS>(seed_setup, &ct_init_setup);
+
+    // Generate re-encryption data for setup
+    let rerandomizations_setup: [BaseField; N] =
+        std::array::from_fn(|_| BaseField::rand(&mut rng));
+    let ct_output_setup: [ElGamalCiphertext<GrumpkinProjective>; N] = std::array::from_fn(|i| {
+        let r_scalar = <GrumpkinConfig as CurveConfig>::ScalarField::from_le_bytes_mod_order(
+            &rerandomizations_setup[i].into_bigint().to_bytes_le(),
+        );
+        rs_trace_setup.permuted_output[i].add_encryption_layer(r_scalar, &pk)
+    });
+
+    let (_, num_samples) = derive_split_bits::<BaseField, N, LEVELS>(seed_setup);
+
+    // Create circuit for setup
+    let circuit_setup = RsShuffleCircuit::new(
+        seed_setup,
+        ct_init_setup.clone(),
+        rs_trace_setup.permuted_output.clone(),
+        ct_output_setup,
+        pk,
+        rs_trace_setup.witness_trace.clone(),
+        rerandomizations_setup,
+        BaseField::from(17u64),
+        BaseField::from(23u64),
+        generator_powers.clone(),
+        num_samples,
+    );
+
+    // Extract matrices (full synthesis)
+    println!("  Synthesizing circuit to extract matrices...");
+    let setup_synth_start = Instant::now();
+    let cs_setup = ConstraintSystem::<BaseField>::new_ref();
+    circuit_setup
+        .clone()
+        .generate_constraints(cs_setup.clone())
+        .expect("Setup synthesis failed");
+    cs_setup.finalize();
+    let setup_synth_time = setup_synth_start.elapsed();
+    println!("  Full synthesis time: {:?}", setup_synth_time);
+
+    let matrices = cs_setup.to_matrices().expect("Failed to get matrices");
     let (a, b, c) = convert_constraint_matrices::<BaseField, Bn256Fr>(&matrices);
-    let (w, x) = extract_assignments::<BaseField, Bn256Fr>(cs_full);
+    let (w_setup, x_setup) = extract_assignments::<BaseField, Bn256Fr>(&cs_setup);
 
     println!(
         "  Matrices: {} constraints, {} witness vars, {} public inputs",
@@ -431,29 +641,91 @@ fn run_spartan_zk_proof(
         matrices.num_instance_variables - 1
     );
 
-    // Create adapter
-    let adapter = ArkworksCircuitAdapter::new(
+    // Create adapter with setup witness (will be replaced at prove time)
+    let mut adapter = ArkworksCircuitAdapter::new(
         matrices.num_constraints,
         matrices.num_witness_variables,
         matrices.num_instance_variables - 1,
         a,
         b,
         c,
-        w,
-        x,
+        w_setup,
+        x_setup,
     );
 
-    // Setup
+    // Spartan setup
     println!("  Running Spartan setup...");
     let setup_start = Instant::now();
-    let (pk, vk) = SpartanZkSNARK::<Bn254Engine>::setup(adapter.clone()).expect("Setup failed");
+    let (prover_key, vk) =
+        SpartanZkSNARK::<Bn254Engine>::setup(adapter.clone()).expect("Setup failed");
     let setup_time = setup_start.elapsed();
-    println!("  Setup time: {:?}", setup_time);
+    println!("  Spartan setup time: {:?}", setup_time);
+
+    // ========================================================================
+    // PROVE PHASE: Generate witness with NEW inputs (done for EACH proof)
+    // ========================================================================
+    println!("\n  === PROVE PHASE (compute witness at prove time) ===");
+
+    // Create NEW cards with DIFFERENT randomness (simulating a new shuffle)
+    let ct_init_prove: [ElGamalCiphertext<GrumpkinProjective>; N] = std::array::from_fn(|i| {
+        let message = <GrumpkinConfig as CurveConfig>::ScalarField::from(i as u64);
+        let randomness = <GrumpkinConfig as CurveConfig>::ScalarField::rand(&mut rng);
+        ElGamalCiphertext::encrypt_scalar(message, randomness, pk)
+    });
+
+    // Use a DIFFERENT seed
+    let seed_prove = BaseField::from(999u64);
+
+    // Run native shuffle with new inputs
+    println!("  Running native shuffle with NEW inputs...");
+    let native_start = Instant::now();
+    let rs_trace_prove =
+        run_rs_shuffle_permutation::<BaseField, _, N, LEVELS>(seed_prove, &ct_init_prove);
+    let native_time = native_start.elapsed();
+    println!("  Native shuffle time: {:?}", native_time);
+
+    // Generate re-encryption data
+    let rerandomizations_prove: [BaseField; N] =
+        std::array::from_fn(|_| BaseField::rand(&mut rng));
+    let ct_output_prove: [ElGamalCiphertext<GrumpkinProjective>; N] = std::array::from_fn(|i| {
+        let r_scalar = <GrumpkinConfig as CurveConfig>::ScalarField::from_le_bytes_mod_order(
+            &rerandomizations_prove[i].into_bigint().to_bytes_le(),
+        );
+        rs_trace_prove.permuted_output[i].add_encryption_layer(r_scalar, &pk)
+    });
+
+    let (_, num_samples_prove) = derive_split_bits::<BaseField, N, LEVELS>(seed_prove);
+
+    // Create circuit with NEW inputs
+    let circuit_prove = RsShuffleCircuit::new(
+        seed_prove,
+        ct_init_prove,
+        rs_trace_prove.permuted_output,
+        ct_output_prove,
+        pk,
+        rs_trace_prove.witness_trace,
+        rerandomizations_prove,
+        BaseField::from(17u64),
+        BaseField::from(23u64),
+        generator_powers,
+        num_samples_prove,
+    );
+
+    // Extract witness ONLY (fast - no matrix construction!)
+    println!("  Extracting witness only (no matrix construction)...");
+    let witness_start = Instant::now();
+    let (w_prove, x_prove) =
+        extract_witness_only::<BaseField, Bn256Fr, _>(circuit_prove).expect("Witness extraction failed");
+    let witness_time = witness_start.elapsed();
+    println!("  >>> Witness extraction time: {:?} <<<", witness_time);
+
+    // Update adapter with fresh witness
+    adapter.update_witness(w_prove, x_prove);
 
     // Prep prove
     println!("  Running prep_prove...");
     let prep_start = Instant::now();
-    let prep = SpartanZkSNARK::<Bn254Engine>::prep_prove(&pk, adapter.clone(), false)
+    let prep = SpartanZkSNARK::<Bn254Engine>::prep_prove(&prover_key, adapter.clone(), false)
         .expect("Prep prove failed");
     let prep_time = prep_start.elapsed();
     println!("  Prep time: {:?}", prep_time);
@@ -461,7 +733,7 @@ fn run_spartan_zk_proof(
     // Prove
     println!("  Generating proof...");
     let prove_start = Instant::now();
-    let snark = SpartanZkSNARK::<Bn254Engine>::prove(&pk, adapter, &prep, false)
+    let snark = SpartanZkSNARK::<Bn254Engine>::prove(&prover_key, adapter, &prep, false)
         .expect("Proof generation failed");
     let prove_time = prove_start.elapsed();
     println!("  Prove time: {:?}", prove_time);
@@ -483,13 +755,45 @@ fn run_spartan_zk_proof(
         }
     }
 
-    print_spartan_summary(
-        "SPARTAN zkSNARK",
-        setup_time,
-        prep_time + prove_time,
-        verify_time,
-        total_constraints,
+    // Summary with timing breakdown
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║              SPARTAN zkSNARK TIMING BREAKDOWN               ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!(
+        "║  Setup (once):                                               ║"
     );
+    println!(
+        "║    Full synthesis:             {:>10.2?}                 ║",
+        setup_synth_time
+    );
+    println!(
+        "║    Spartan setup:              {:>10.2?}                 ║",
+        setup_time
+    );
+    println!(
+        "║  Prove (per proof):                                          ║"
+    );
+    println!(
+        "║    Native computation:         {:>10.2?}                 ║",
+        native_time
+    );
+    println!(
+        "║    >>> Witness extraction:     {:>10.2?} <<<             ║",
+        witness_time
+    );
+    println!(
+        "║    Prep + Prove:               {:>10.2?}                 ║",
+        prep_time + prove_time
+    );
+    println!(
+        "║  Verify:                       {:>10.2?}                 ║",
+        verify_time
+    );
+    println!(
+        "║  Total constraints:            {:>10}                   ║",
+        total_constraints
+    );
+    println!("╚══════════════════════════════════════════════════════════════╝");
 }
 
 fn print_spartan_summary(
