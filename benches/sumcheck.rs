@@ -11,9 +11,8 @@ use ff::Field;
 use rand::{SeedableRng, rngs::StdRng};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use spartan2::{
-  big_num::DelayedReduction,
   polys::multilinear::MultilinearPolynomial,
-  provider::{Bn254Engine, PallasHyraxEngine, T256HyraxEngine, VestaHyraxEngine},
+  provider::{Bn254HyraxEngine, PallasHyraxEngine, T256HyraxEngine, VestaHyraxEngine},
   sumcheck::SumcheckProof,
   traits::{Engine, transcript::TranscriptEngineTrait},
 };
@@ -30,10 +29,7 @@ criterion_group! {
 
 criterion_main!(sumcheck);
 
-fn bench_sumcheck_with_engine<E: Engine>(c: &mut Criterion, field_name: &str)
-where
-  E::Scalar: DelayedReduction<E::Scalar>,
-{
+fn bench_sumcheck_with_engine<E: Engine>(c: &mut Criterion, field_name: &str) {
   // Read sizes from env, default to 16..=26
   let sizes: Vec<usize> = std::env::var("BENCH_SIZES")
     .map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
@@ -123,7 +119,7 @@ fn bench_sumcheck_split_eq(c: &mut Criterion) {
   let field = std::env::var("BENCH_FIELD").unwrap_or_else(|_| "bn254".to_string());
 
   match field.to_lowercase().as_str() {
-    "bn254" => bench_sumcheck_with_engine::<Bn254Engine>(c, "bn254"),
+    "bn254" => bench_sumcheck_with_engine::<Bn254HyraxEngine>(c, "bn254"),
     "pallas" => bench_sumcheck_with_engine::<PallasHyraxEngine>(c, "pallas"),
     "vesta" => bench_sumcheck_with_engine::<VestaHyraxEngine>(c, "vesta"),
     "t256" => bench_sumcheck_with_engine::<T256HyraxEngine>(c, "t256"),
@@ -132,7 +128,7 @@ fn bench_sumcheck_split_eq(c: &mut Criterion) {
         "Unknown field '{}'. Options: bn254 (default), pallas, vesta, t256",
         field
       );
-      bench_sumcheck_with_engine::<Bn254Engine>(c, "bn254")
+      bench_sumcheck_with_engine::<Bn254HyraxEngine>(c, "bn254")
     }
   }
 }
