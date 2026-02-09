@@ -984,45 +984,65 @@ impl<E: Engine> SplitR1CSShape<E> {
     )
   }
 
-  /// Binds "row" variables of (A, B, C) matrices viewed as 2d multilinear polynomials
-  pub(crate) fn bind_row_vars(
-    &self,
-    rx: &[E::Scalar],
-  ) -> (Vec<E::Scalar>, Vec<E::Scalar>, Vec<E::Scalar>) {
+  /// Computes poly_ABC = A·rx + r·(B·rx) + r²·(C·rx) with full row parallelism.
+  ///
+  /// Uses thread-local buffers (one per thread) to enable parallel processing
+  /// of all rows while fusing the A + r·B + r²·C combination in a single pass.
+  pub(crate) fn bind_row_vars_combined(&self, rx: &[E::Scalar], r: E::Scalar) -> Vec<E::Scalar> {
     assert_eq!(rx.len(), self.num_cons);
 
-    let inner = |M: &SparseMatrix<E::Scalar>, M_evals: &mut Vec<E::Scalar>| {
-      for (row_idx, ptrs) in M.indptr.windows(2).enumerate() {
-        for (val, col_idx) in M.get_row_unchecked(ptrs.try_into().unwrap()) {
-          M_evals[*col_idx] += rx[row_idx] * val;
-        }
-      }
-    };
-
     let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
-    let (A_evals, (B_evals, C_evals)) = rayon::join(
-      || {
-        let mut A_evals: Vec<E::Scalar> = vec![E::Scalar::ZERO; 2 * num_vars];
-        inner(&self.A, &mut A_evals);
-        A_evals
-      },
-      || {
-        rayon::join(
-          || {
-            let mut B_evals: Vec<E::Scalar> = vec![E::Scalar::ZERO; 2 * num_vars];
-            inner(&self.B, &mut B_evals);
-            B_evals
-          },
-          || {
-            let mut C_evals: Vec<E::Scalar> = vec![E::Scalar::ZERO; 2 * num_vars];
-            inner(&self.C, &mut C_evals);
-            C_evals
-          },
-        )
-      },
-    );
+    let num_cols = 2 * num_vars;
+    let r_sq = r * r;
+    let num_threads = rayon::current_num_threads();
 
-    (A_evals, B_evals, C_evals)
+    // Pre-allocate exactly num_threads buffers (one per thread)
+    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
+      .map(|_| vec![E::Scalar::ZERO; num_cols])
+      .collect();
+
+    // Split rows into chunks, one chunk per thread
+    let chunk_size = (self.num_cons + num_threads - 1) / num_threads;
+
+    // Process chunks in parallel - each thread works on its own buffer
+    thread_buffers
+      .par_iter_mut()
+      .enumerate()
+      .for_each(|(thread_idx, buffer)| {
+        let start_row = thread_idx * chunk_size;
+        let end_row = ((thread_idx + 1) * chunk_size).min(self.num_cons);
+
+        for row_idx in start_row..end_row {
+          let rx_row = rx[row_idx];
+
+          // Get row bounds for each matrix
+          let a_ptrs = [self.A.indptr[row_idx], self.A.indptr[row_idx + 1]];
+          let b_ptrs = [self.B.indptr[row_idx], self.B.indptr[row_idx + 1]];
+          let c_ptrs = [self.C.indptr[row_idx], self.C.indptr[row_idx + 1]];
+
+          // Fused accumulation: A + r*B + r²*C
+          for (val, col) in self.A.get_row_unchecked(&a_ptrs) {
+            buffer[*col] += rx_row * val;
+          }
+          for (val, col) in self.B.get_row_unchecked(&b_ptrs) {
+            buffer[*col] += rx_row * r * val;
+          }
+          for (val, col) in self.C.get_row_unchecked(&c_ptrs) {
+            buffer[*col] += rx_row * r_sq * val;
+          }
+        }
+      });
+
+    // Reduce all thread buffers into the first one
+    let mut result = thread_buffers.swap_remove(0);
+    for buffer in thread_buffers {
+      result
+        .par_iter_mut()
+        .zip(buffer.par_iter())
+        .for_each(|(r, b)| *r += b);
+    }
+
+    result
   }
 }
 

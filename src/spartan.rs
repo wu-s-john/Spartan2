@@ -36,7 +36,6 @@ use crate::{
 use ff::Field;
 use num_traits::One;
 use once_cell::sync::OnceCell;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -320,18 +319,8 @@ impl<E: Engine> SpartanSNARK<E> {
     info!(elapsed_ms = %eval_rx_t.elapsed().as_millis(), "compute_eval_rx");
 
     let (_sparse_span, sparse_t) = start_span!("compute_eval_table_sparse");
-
-    let (evals_A, evals_B, evals_C) = pk.S.bind_row_vars(&evals_rx);
+    let poly_ABC = pk.S.bind_row_vars_combined(&evals_rx, r);
     info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
-
-    let (_abc_span, abc_t) = start_span!("prepare_poly_ABC");
-    assert_eq!(evals_A.len(), evals_B.len());
-    assert_eq!(evals_A.len(), evals_C.len());
-    let poly_ABC = (0..evals_A.len())
-      .into_par_iter()
-      .map(|i| evals_A[i] + r * evals_B[i] + r * r * evals_C[i])
-      .collect::<Vec<E::Scalar>>();
-    info!(elapsed_ms = %abc_t.elapsed().as_millis(), "prepare_poly_ABC");
 
     let (_z_span, z_t) = start_span!("prepare_poly_z");
     let poly_z = {
