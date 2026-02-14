@@ -74,6 +74,11 @@ pub mod sha256_circuits;
 #[allow(missing_docs)]
 pub mod rs_shuffle;
 
+/// RS (Rao-Sandelius) shuffle gadget for bellpepper R1CS.
+/// Implements stable-partition shuffle using bellpepper circuit primitives.
+#[allow(missing_docs)]
+pub mod rs_shuffle_bp;
+
 /// Start a span + timer, return `(Span, Instant)`.
 macro_rules! start_span {
     ($name:expr $(, $($fmt:tt)+)?) => {{

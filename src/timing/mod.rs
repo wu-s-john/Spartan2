@@ -203,6 +203,35 @@ pub const NEUTRONNOVA_PHASES: &[(&str, &str)] = &[
   ("end_to_end_total", "end_to_end"),
 ];
 
+// ============================================================================
+// Spartan ZK prove-phase constants
+// ============================================================================
+
+/// Spartan ZK prove phases: (tracing_name, short_display_name).
+pub const SPARTAN_ZK_PHASES: &[(&str, &str)] = &[
+  // Prep phases
+  ("shared_witness_synthesize", "shared_syn"),
+  ("commit_witness_shared", "commit_shared"),
+  ("precommitted_witness_synthesize", "precom_syn"),
+  ("commit_witness_precommitted", "commit_pre"),
+  // Prove phases
+  ("rerandomize_prep_state", "rerand"),
+  ("r1cs_instance_and_witness", "r1cs_inst"),
+  ("circuit_synthesize_rest", "synth_rest"),
+  ("commit_witness_rest", "commit_rest"),
+  ("sample_taus", "taus"),
+  ("matrix_vector_multiply", "mat_vec"),
+  ("prepare_multilinear_polys", "prep_mle"),
+  ("outer_sumcheck", "outer_sc"),
+  ("compute_eval_rx", "eval_rx"),
+  ("compute_eval_table_sparse", "eval_sparse"),
+  ("prepare_poly_z", "poly_z"),
+  ("inner_sumcheck", "inner_sc"),
+  ("finalize_and_nifs", "nifs"),
+  ("pcs_prove", "pcs"),
+  ("spartan_zk_prove", "prove_total"),
+];
+
 /// NeutronNova full ZkSNARK prove phases: (tracing_name, short_display_name).
 pub const NEUTRONNOVA_ZK_PROVE_PHASES: &[(&str, &str)] = &[
   // Prep phase breakdown (witness synthesis and commitment)

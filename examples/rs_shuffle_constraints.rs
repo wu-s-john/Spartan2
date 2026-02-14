@@ -559,11 +559,18 @@ fn run_spartan_zk_proof(
     };
     use spartan2::provider::Bn254Engine;
     use spartan2::spartan_zk::SpartanZkSNARK;
+    use spartan2::timing::{TimingLayer, SPARTAN_ZK_PHASES, clear_timings, snapshot_timings};
     use spartan2::traits::snark::R1CSSNARKTrait;
     use std::time::Instant;
+    use tracing_subscriber::prelude::*;
 
     println!("\n--- Spartan zkSNARK Proof (Correct Flow) ---");
     println!("  Matrices extracted at SETUP, witnesses computed at PROVE time\n");
+
+    // Setup tracing with TimingLayer to capture phase timings
+    let (timing_layer, timing_data, _constraints) = TimingLayer::new();
+    let subscriber = tracing_subscriber::registry().with(timing_layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
 
     let mut rng = ark_std::test_rng();
 
@@ -724,18 +731,22 @@ fn run_spartan_zk_proof(
 
     // Prep prove
     println!("  Running prep_prove...");
+    clear_timings(&timing_data);
     let prep_start = Instant::now();
     let prep = SpartanZkSNARK::<Bn254Engine>::prep_prove(&prover_key, adapter.clone(), false)
         .expect("Prep prove failed");
     let prep_time = prep_start.elapsed();
+    let prep_timings = snapshot_timings(&timing_data, SPARTAN_ZK_PHASES);
     println!("  Prep time: {:?}", prep_time);
 
     // Prove
     println!("  Generating proof...");
+    clear_timings(&timing_data);
     let prove_start = Instant::now();
     let snark = SpartanZkSNARK::<Bn254Engine>::prove(&prover_key, adapter, &prep, false)
         .expect("Proof generation failed");
     let prove_time = prove_start.elapsed();
+    let prove_timings = snapshot_timings(&timing_data, SPARTAN_ZK_PHASES);
     println!("  Prove time: {:?}", prove_time);
 
     // Verify
@@ -755,45 +766,109 @@ fn run_spartan_zk_proof(
         }
     }
 
-    // Summary with timing breakdown
-    println!("\n╔══════════════════════════════════════════════════════════════╗");
-    println!("║              SPARTAN zkSNARK TIMING BREAKDOWN               ║");
-    println!("╠══════════════════════════════════════════════════════════════╣");
-    println!(
-        "║  Setup (once):                                               ║"
+    // Summary with detailed timing breakdown
+    print_zk_timing_breakdown(
+        setup_synth_time,
+        setup_time,
+        native_time,
+        witness_time,
+        prep_time,
+        prove_time,
+        verify_time,
+        &prep_timings,
+        &prove_timings,
+        total_constraints,
     );
+}
+
+fn print_zk_timing_breakdown(
+    setup_synth_time: std::time::Duration,
+    setup_time: std::time::Duration,
+    native_time: std::time::Duration,
+    witness_time: std::time::Duration,
+    prep_time: std::time::Duration,
+    prove_time: std::time::Duration,
+    verify_time: std::time::Duration,
+    _prep_timings: &std::collections::HashMap<&str, u64>,
+    prove_timings: &std::collections::HashMap<&str, u64>,
+    total_constraints: usize,
+) {
+    // Helper to print a phase if it has non-zero timing
+    let print_phase = |name: &str, key: &str| {
+        let ms = prove_timings.get(key).copied().unwrap_or(0);
+        if ms > 0 {
+            println!(
+                "║      └─ {:<24}{:>8}ms                        ║",
+                format!("{}:", name),
+                ms
+            );
+        }
+    };
+
+    println!("\n╔══════════════════════════════════════════════════════════════════════════╗");
+    println!("║                   SPARTAN zkSNARK TIMING BREAKDOWN                       ║");
+    println!("╠══════════════════════════════════════════════════════════════════════════╣");
+    println!("║  SETUP (done once):                                                      ║");
     println!(
-        "║    Full synthesis:             {:>10.2?}                 ║",
+        "║    Full synthesis (Arkworks):     {:>12.2?}                         ║",
         setup_synth_time
     );
     println!(
-        "║    Spartan setup:              {:>10.2?}                 ║",
+        "║    Spartan setup (keys, VC):      {:>12.2?}                         ║",
         setup_time
     );
     println!(
-        "║  Prove (per proof):                                          ║"
+        "║    ─────────────────────────────────────────────                            ║"
     );
     println!(
-        "║    Native computation:         {:>10.2?}                 ║",
+        "║    TOTAL SETUP:                   {:>12.2?}                         ║",
+        setup_synth_time + setup_time
+    );
+    println!("╠══════════════════════════════════════════════════════════════════════════╣");
+    println!("║  PROVE (per proof):                                                      ║");
+    println!(
+        "║    Native RS shuffle:            {:>12.2?}                         ║",
         native_time
     );
     println!(
-        "║    >>> Witness extraction:     {:>10.2?} <<<             ║",
+        "║    Witness extraction:           {:>12.2?}                         ║",
         witness_time
     );
     println!(
-        "║    Prep + Prove:               {:>10.2?}                 ║",
-        prep_time + prove_time
+        "║    Prep:                         {:>12.2?}                         ║",
+        prep_time
     );
     println!(
-        "║  Verify:                       {:>10.2?}                 ║",
+        "║    ─────────────────────────────────────────────                            ║"
+    );
+    println!(
+        "║    Prove:                        {:>12.2?}                         ║",
+        prove_time
+    );
+    print_phase("r1cs_instance_witness", "r1cs_inst");
+    print_phase("matrix_vector_multiply", "mat_vec");
+    print_phase("outer_sumcheck", "outer_sc");
+    print_phase("inner_sumcheck", "inner_sc");
+    print_phase("finalize_and_nifs", "nifs");
+    print_phase("pcs_prove", "pcs");
+    println!(
+        "║    ─────────────────────────────────────────────                            ║"
+    );
+    println!(
+        "║    TOTAL PROVE (excl native):    {:>12.2?}                         ║",
+        witness_time + prep_time + prove_time
+    );
+    println!("╠══════════════════════════════════════════════════════════════════════════╣");
+    println!(
+        "║  VERIFY:                         {:>12.2?}                         ║",
         verify_time
     );
+    println!("╠══════════════════════════════════════════════════════════════════════════╣");
     println!(
-        "║  Total constraints:            {:>10}                   ║",
+        "║  Total constraints:              {:>12}                         ║",
         total_constraints
     );
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("╚══════════════════════════════════════════════════════════════════════════╝");
 }
 
 fn print_spartan_summary(
