@@ -9,9 +9,14 @@
 //! This module defines a custom implementation of CSR/CSC sparse matrices.
 //! Specifically, we implement sparse matrix / dense vector multiplication
 //! to compute the `A z`, `B z`, and `C z` in Spartan.
+//!
+//! The `SparseMatrix<C>` type is generic over coefficient type C, which can be:
+//! - Field elements (`PrimeField`) for standard Spartan
+//! - Native integers (`i32`, `i64`) for small-value optimization
 use crate::{
   errors::SpartanError,
   small_field::{DelayedReduction, ExtensionBound, SmallValueField, WideMul},
+  small_r1cs::{Accumulator, WideningMul, Witness},
 };
 use ff::PrimeField;
 use num_traits::{Bounded, One, Signed, Zero};
@@ -24,10 +29,17 @@ use std::{
 
 /// CSR format sparse matrix, We follow the names used by scipy.
 /// Detailed explanation here: https://stackoverflow.com/questions/52299420/scipy-csr-matrix-understand-indptr
+///
+/// Generic over coefficient type `C`, which can be:
+/// - `PrimeField` for standard field arithmetic
+/// - `i32`, `i64` for small-value optimization with widening multiplication
+///
+/// Note: No trait bounds on the struct itself - bounds are on impl blocks instead.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SparseMatrix<F: PrimeField> {
+#[serde(bound = "C: Serialize + for<'a> Deserialize<'a>")]
+pub struct SparseMatrix<C> {
   /// all non-zero values in the matrix
-  pub data: Vec<F>,
+  pub data: Vec<C>,
   /// column indices
   pub indices: Vec<usize>,
   /// row information
@@ -36,7 +48,11 @@ pub struct SparseMatrix<F: PrimeField> {
   pub cols: usize,
 }
 
-impl<F: PrimeField> SparseMatrix<F> {
+// =============================================================================
+// Methods for all coefficient types (minimal bounds)
+// =============================================================================
+
+impl<C: Copy> SparseMatrix<C> {
   /// 0x0 empty matrix
   pub fn empty() -> Self {
     SparseMatrix {
@@ -47,10 +63,10 @@ impl<F: PrimeField> SparseMatrix<F> {
     }
   }
 
-  /// Construct from the COO representation; Vec<usize(row), usize(col), F>.
+  /// Construct from the COO representation; Vec<usize(row), usize(col), C>.
   /// We assume that the rows are sorted during construction.
   #[cfg(test)]
-  pub fn new(matrix: &[(usize, usize, F)], rows: usize, cols: usize) -> Self {
+  pub fn new(matrix: &[(usize, usize, C)], rows: usize, cols: usize) -> Self {
     let mut new_matrix = vec![vec![]; rows];
     for (row, col, val) in matrix {
       new_matrix[*row].push((*col, *val));
@@ -84,12 +100,102 @@ impl<F: PrimeField> SparseMatrix<F> {
   /// Retrieves the data for row slice [i..j] from `ptrs`.
   /// We assume that `ptrs` is indexed from `indptrs` and do not check if the
   /// returned slice is actually a valid row.
-  pub fn get_row_unchecked(&self, ptrs: &[usize; 2]) -> impl Iterator<Item = (&F, &usize)> {
+  pub fn get_row_unchecked(&self, ptrs: &[usize; 2]) -> impl Iterator<Item = (&C, &usize)> {
     self.data[ptrs[0]..ptrs[1]]
       .iter()
       .zip(&self.indices[ptrs[0]..ptrs[1]])
   }
 
+  /// Number of rows in the matrix.
+  pub fn rows(&self) -> usize {
+    self.indptr.len().saturating_sub(1)
+  }
+
+  /// Number of non-zero elements.
+  pub fn nnz(&self) -> usize {
+    self.data.len()
+  }
+
+  /// Get a single row's coefficients and column indices.
+  pub fn get_row(&self, row: usize) -> Option<(&[C], &[usize])> {
+    if row >= self.rows() {
+      return None;
+    }
+    let start = self.indptr[row];
+    let end = self.indptr[row + 1];
+    Some((&self.data[start..end], &self.indices[start..end]))
+  }
+
+  /// Iterate over rows, yielding (row_index, coefficients, column_indices).
+  pub fn iter_rows(&self) -> impl Iterator<Item = (usize, &[C], &[usize])> {
+    self.indptr.windows(2).enumerate().map(|(i, ptrs)| {
+      let start = ptrs[0];
+      let end = ptrs[1];
+      (i, &self.data[start..end], &self.indices[start..end])
+    })
+  }
+
+  /// Matrix-vector multiply with widening arithmetic.
+  ///
+  /// For small-value optimization: C × W → Acc where Acc is wider than C and W.
+  /// Example: i32 × i32 → i64
+  ///
+  /// # Type Parameters
+  /// - `W`: Witness type (e.g., i32)
+  /// - `Acc`: Accumulator type, must be wider (e.g., i64)
+  ///
+  /// # Errors
+  /// Returns error if vector length doesn't match matrix dimensions.
+  pub fn multiply_vec_widening<W, Acc>(&self, z: &[W]) -> Result<Vec<Acc>, SpartanError>
+  where
+    W: Witness + Send + Sync,
+    C: WideningMul<W, Acc> + Send + Sync,
+    Acc: Accumulator + Send,
+  {
+    if self.cols != z.len() {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!(
+          "SparseMatrix multiply_vec_widening: Expected {} elements, got {}",
+          self.cols,
+          z.len()
+        ),
+      });
+    }
+    Ok(self.multiply_vec_widening_unchecked(z))
+  }
+
+  /// Matrix-vector multiply with widening arithmetic (unchecked).
+  ///
+  /// Does not verify that vector length matches matrix dimensions.
+  pub fn multiply_vec_widening_unchecked<W, Acc>(&self, z: &[W]) -> Vec<Acc>
+  where
+    W: Witness + Send + Sync,
+    C: WideningMul<W, Acc> + Send + Sync,
+    Acc: Accumulator + Send,
+  {
+    self
+      .indptr
+      .par_windows(2)
+      .map(|ptrs| {
+        let start = ptrs[0];
+        let end = ptrs[1];
+        let mut acc = Acc::zero();
+        for i in start..end {
+          let coeff = self.data[i];
+          let col = self.indices[i];
+          acc = acc + coeff.wide_mul(z[col]);
+        }
+        acc
+      })
+      .collect()
+  }
+}
+
+// =============================================================================
+// Methods specific to PrimeField coefficients
+// =============================================================================
+
+impl<F: PrimeField> SparseMatrix<F> {
   /// Multiply by a dense vector; uses rayon/gpu.
   ///
   /// # Errors
@@ -228,16 +334,20 @@ impl<F: PrimeField> SparseMatrix<F> {
   }
 }
 
+// =============================================================================
+// Iterator for sparse matrix (works with any Copy coefficient type)
+// =============================================================================
+
 /// Iterator for sparse matrix
-pub struct Iter<'a, F: PrimeField> {
-  matrix: &'a SparseMatrix<F>,
+pub struct Iter<'a, C: Copy> {
+  matrix: &'a SparseMatrix<C>,
   row: usize,
   i: usize,
   nnz: usize,
 }
 
-impl<'a, F: PrimeField> Iterator for Iter<'a, F> {
-  type Item = (usize, usize, F);
+impl<'a, C: Copy> Iterator for Iter<'a, C> {
+  type Item = (usize, usize, C);
 
   fn next(&mut self) -> Option<Self::Item> {
     // are we at the end?
@@ -264,6 +374,29 @@ impl<'a, F: PrimeField> Iterator for Iter<'a, F> {
     }
 
     Some(curr_item)
+  }
+}
+
+// Provide iter_entries() for all coefficient types
+impl<C: Copy> SparseMatrix<C> {
+  /// Returns a custom iterator over all non-zero elements.
+  /// Yields (row, col, value) tuples.
+  pub fn iter_entries(&self) -> Iter<'_, C> {
+    let mut row = 0;
+    while row + 1 < self.indptr.len() && self.indptr[row + 1] == 0 {
+      row += 1;
+    }
+    let nnz = if self.indptr.is_empty() {
+      0
+    } else {
+      self.indptr[self.indptr.len() - 1]
+    };
+    Iter {
+      matrix: self,
+      row,
+      i: 0,
+      nnz,
+    }
   }
 }
 

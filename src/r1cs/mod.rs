@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 mod folds;
-mod sparse;
-pub(crate) use sparse::SparseMatrix;
+pub mod sparse;
+pub use sparse::SparseMatrix;
 
 fn eq01<F: Field>(bit: u8, r: &F) -> F {
   if bit == 0 { F::ONE - *r } else { *r }

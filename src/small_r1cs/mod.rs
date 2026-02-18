@@ -106,11 +106,11 @@ impl<E: Engine, C: Coefficient> SmallR1CSShape<E, C> {
         Acc: Accumulator + Send,
     {
         let (az, (bz, cz)) = rayon::join(
-            || self.A.multiply_vec(z),
+            || self.A.multiply_vec_widening_unchecked(z),
             || {
                 rayon::join(
-                    || self.B.multiply_vec(z),
-                    || self.C_mat.multiply_vec(z),
+                    || self.B.multiply_vec_widening_unchecked(z),
+                    || self.C_mat.multiply_vec_widening_unchecked(z),
                 )
             },
         );

@@ -7,6 +7,13 @@
 //! This module provides a multi-scalar multiplication routine
 //! The generic implementation is adapted from halo2; we add an optimization to commit to bits more efficiently
 //! The specialized implementations are adapted from jolt, with additional optimizations and parallelization.
+//!
+//! # MsmScalar Trait
+//!
+//! The `MsmScalar` trait provides a unified interface for MSM scalars, allowing
+//! the same MSM algorithm to work with both small integers (i32, i64) and field elements.
+//! The key insight is that `MAX_BITS` is a compile-time constant, enabling algorithm
+//! selection without runtime overhead.
 use crate::{errors::SpartanError, start_span};
 use ff::{Field, PrimeField};
 use halo2curves::{CurveAffine, group::Group};
@@ -14,6 +21,424 @@ use num_integer::Integer;
 use num_traits::{ToPrimitive, Zero};
 use rayon::{current_num_threads, prelude::*};
 use tracing::info;
+
+/// Trait for MSM scalar types.
+///
+/// This trait abstracts over both small integers (i32, i64) and field elements,
+/// allowing a single MSM implementation to handle all cases efficiently.
+///
+/// The `MAX_BITS` constant enables compile-time algorithm selection:
+/// - 1 bit: binary MSM (just sum bases where scalar=1)
+/// - 2-10 bits: bucketed MSM (one bucket per scalar value)
+/// - 11+ bits: windowed Pippenger
+#[allow(dead_code)] // Will be used when PCS commit is updated
+pub trait MsmScalar: Copy + Sync + Send {
+  /// Maximum number of bits in this scalar type (compile-time constant).
+  const MAX_BITS: usize;
+
+  /// Check if the scalar is zero.
+  fn msm_is_zero(&self) -> bool;
+
+  /// Extract a window of bits [start, start+width) as a bucket index.
+  ///
+  /// Returns the bits as a usize for indexing into bucket arrays.
+  fn get_window(&self, start: usize, width: usize) -> usize;
+}
+
+// Implementations for unsigned integers
+impl MsmScalar for u8 {
+  const MAX_BITS: usize = 8;
+
+  #[inline]
+  fn msm_is_zero(&self) -> bool {
+    *self == 0
+  }
+
+  #[inline]
+  fn get_window(&self, start: usize, width: usize) -> usize {
+    ((*self as usize) >> start) & ((1 << width) - 1)
+  }
+}
+
+impl MsmScalar for u16 {
+  const MAX_BITS: usize = 16;
+
+  #[inline]
+  fn msm_is_zero(&self) -> bool {
+    *self == 0
+  }
+
+  #[inline]
+  fn get_window(&self, start: usize, width: usize) -> usize {
+    ((*self as usize) >> start) & ((1 << width) - 1)
+  }
+}
+
+impl MsmScalar for u32 {
+  const MAX_BITS: usize = 32;
+
+  #[inline]
+  fn msm_is_zero(&self) -> bool {
+    *self == 0
+  }
+
+  #[inline]
+  fn get_window(&self, start: usize, width: usize) -> usize {
+    ((*self as usize) >> start) & ((1 << width) - 1)
+  }
+}
+
+impl MsmScalar for u64 {
+  const MAX_BITS: usize = 64;
+
+  #[inline]
+  fn msm_is_zero(&self) -> bool {
+    *self == 0
+  }
+
+  #[inline]
+  fn get_window(&self, start: usize, width: usize) -> usize {
+    ((*self >> start) as usize) & ((1 << width) - 1)
+  }
+}
+
+// Implementations for signed integers (treat as unsigned for bit extraction)
+impl MsmScalar for i32 {
+  const MAX_BITS: usize = 32;
+
+  #[inline]
+  fn msm_is_zero(&self) -> bool {
+    *self == 0
+  }
+
+  #[inline]
+  fn get_window(&self, start: usize, width: usize) -> usize {
+    // Treat as unsigned for bit extraction
+    ((*self as u32 as usize) >> start) & ((1 << width) - 1)
+  }
+}
+
+impl MsmScalar for i64 {
+  const MAX_BITS: usize = 64;
+
+  #[inline]
+  fn msm_is_zero(&self) -> bool {
+    *self == 0
+  }
+
+  #[inline]
+  fn get_window(&self, start: usize, width: usize) -> usize {
+    // Treat as unsigned for bit extraction
+    ((*self as u64 >> start) as usize) & ((1 << width) - 1)
+  }
+}
+
+/// Wrapper type for field elements to implement MsmScalar.
+///
+/// This allows field elements to be used with the unified MSM function.
+/// The wrapper provides the `get_window` implementation that extracts bits
+/// from the field element's byte representation.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Will be used when PCS commit is updated
+pub struct FieldScalar<F: PrimeField>(pub F);
+
+impl<F: PrimeField> MsmScalar for FieldScalar<F> {
+  const MAX_BITS: usize = 256; // Conservative upper bound for most fields
+
+  #[inline]
+  fn msm_is_zero(&self) -> bool {
+    self.0.is_zero_vartime()
+  }
+
+  #[inline]
+  fn get_window(&self, start: usize, width: usize) -> usize {
+    // Extract bits from the field element's byte representation
+    let bytes = self.0.to_repr();
+    let bytes_ref = bytes.as_ref();
+
+    let skip_bytes = start / 8;
+    let bit_offset = start % 8;
+
+    if skip_bytes >= bytes_ref.len() {
+      return 0;
+    }
+
+    // Read up to 8 bytes starting at skip_bytes
+    let mut v = [0u8; 8];
+    let copy_len = (bytes_ref.len() - skip_bytes).min(8);
+    v[..copy_len].copy_from_slice(&bytes_ref[skip_bytes..skip_bytes + copy_len]);
+
+    let mut tmp = u64::from_le_bytes(v);
+    tmp >>= bit_offset;
+    tmp &= (1u64 << width) - 1;
+
+    tmp as usize
+  }
+}
+
+// ============================================================================
+// Unified MSM Implementation using MsmScalar trait
+// ============================================================================
+
+#[allow(dead_code)] // Will be used when PCS commit is updated
+/// Unified multi-scalar multiplication using the `MsmScalar` trait.
+///
+/// This function works with any scalar type that implements `MsmScalar`,
+/// including small integers (i32, i64) and field elements (via `FieldScalar`).
+/// Algorithm selection is based on `S::MAX_BITS` at compile time.
+///
+/// # Arguments
+/// * `scalars` - Slice of scalar values
+/// * `bases` - Slice of curve points (same length as scalars)
+/// * `use_parallelism_internally` - Whether to use parallel processing
+///
+/// # Returns
+/// The multi-scalar multiplication result, or an error if inputs have different lengths.
+pub fn msm_generic<C: CurveAffine, S: MsmScalar>(
+  scalars: &[S],
+  bases: &[C],
+  use_parallelism_internally: bool,
+) -> Result<C::Curve, SpartanError> {
+  let (_msm_span, msm_t) = start_span!("msm_generic", size = scalars.len(), max_bits = S::MAX_BITS);
+
+  if scalars.len() != bases.len() {
+    return Err(SpartanError::InvalidInputLength {
+      reason: "MSM: Scalars and bases must have the same length".to_string(),
+    });
+  }
+
+  if scalars.is_empty() {
+    return Ok(C::Curve::identity());
+  }
+
+  let result = match S::MAX_BITS {
+    0 => C::Curve::identity(),
+    1 => msm_binary_generic(scalars, bases, use_parallelism_internally),
+    2..=10 => msm_bucketed_generic(scalars, bases, S::MAX_BITS, use_parallelism_internally),
+    _ => msm_windowed_generic(scalars, bases, S::MAX_BITS, use_parallelism_internally),
+  };
+
+  if msm_t.elapsed().as_millis() > 10 {
+    info!(
+      elapsed_ms = %msm_t.elapsed().as_millis(),
+      size = scalars.len(),
+      max_bits = S::MAX_BITS,
+      "msm_generic"
+    );
+  }
+
+  Ok(result)
+}
+
+/// Binary MSM for 1-bit scalars using MsmScalar trait.
+#[allow(dead_code)]
+#[inline(always)]
+fn msm_binary_generic<C: CurveAffine, S: MsmScalar>(
+  scalars: &[S],
+  bases: &[C],
+  use_parallelism_internally: bool,
+) -> C::Curve {
+  let num_threads = if use_parallelism_internally {
+    current_num_threads()
+  } else {
+    1
+  };
+
+  let process_chunk = |scalars: &[S], bases: &[C]| {
+    let mut acc = C::Curve::identity();
+    scalars
+      .iter()
+      .zip(bases.iter())
+      .filter(|(scalar, _)| !scalar.msm_is_zero())
+      .for_each(|(_, base)| {
+        acc += *base;
+      });
+    acc
+  };
+
+  if scalars.len() > num_threads {
+    let chunk = scalars.len() / num_threads;
+    scalars
+      .par_chunks(chunk)
+      .zip(bases.par_chunks(chunk))
+      .map(|(scalars, bases)| process_chunk(scalars, bases))
+      .reduce(C::Curve::identity, |sum, evl| sum + evl)
+  } else {
+    process_chunk(scalars, bases)
+  }
+}
+
+/// Bucketed MSM for 2-10 bit scalars using MsmScalar trait.
+#[allow(dead_code)]
+#[inline(always)]
+fn msm_bucketed_generic<C: CurveAffine, S: MsmScalar>(
+  scalars: &[S],
+  bases: &[C],
+  max_bits: usize,
+  use_parallelism_internally: bool,
+) -> C::Curve {
+  fn msm_bucketed_serial<C: CurveAffine, S: MsmScalar>(
+    scalars: &[S],
+    bases: &[C],
+    max_bits: usize,
+  ) -> C::Curve {
+    let num_buckets: usize = 1 << max_bits;
+    let mut buckets = vec![BucketGeneric::<C>::None; num_buckets];
+
+    scalars
+      .iter()
+      .zip(bases.iter())
+      .filter(|(scalar, _)| !scalar.msm_is_zero())
+      .for_each(|(scalar, base)| {
+        // For small scalars, window 0 with full width gives the value
+        let bucket_index = scalar.get_window(0, max_bits);
+        buckets[bucket_index].add_assign(base);
+      });
+
+    let mut result = C::Curve::identity();
+    let mut running_sum = C::Curve::identity();
+    buckets.iter().skip(1).rev().for_each(|exp| {
+      running_sum = exp.add(running_sum);
+      result += &running_sum;
+    });
+    result
+  }
+
+  let num_threads = if use_parallelism_internally {
+    current_num_threads()
+  } else {
+    1
+  };
+
+  if scalars.len() > num_threads {
+    let chunk_size = scalars.len() / num_threads;
+    scalars
+      .par_chunks(chunk_size)
+      .zip(bases.par_chunks(chunk_size))
+      .map(|(s, b)| msm_bucketed_serial(s, b, max_bits))
+      .reduce(C::Curve::identity, |sum, evl| sum + evl)
+  } else {
+    msm_bucketed_serial(scalars, bases, max_bits)
+  }
+}
+
+/// Windowed Pippenger MSM for larger scalars using MsmScalar trait.
+#[allow(dead_code)]
+#[inline(always)]
+fn msm_windowed_generic<C: CurveAffine, S: MsmScalar>(
+  scalars: &[S],
+  bases: &[C],
+  max_bits: usize,
+  use_parallelism_internally: bool,
+) -> C::Curve {
+  fn msm_windowed_serial<C: CurveAffine, S: MsmScalar>(
+    scalars: &[S],
+    bases: &[C],
+    max_bits: usize,
+  ) -> C::Curve {
+    let c = if bases.len() < 32 {
+      3
+    } else {
+      compute_ln(bases.len()) + 2
+    };
+
+    let zero = C::Curve::identity();
+    let scalars_and_bases_iter = scalars.iter().zip(bases).filter(|(s, _)| !s.msm_is_zero());
+    let window_starts: Vec<usize> = (0..max_bits).step_by(c).collect();
+
+    let window_sums: Vec<_> = window_starts
+      .iter()
+      .map(|&w_start| {
+        let mut res = zero;
+        let mut buckets = vec![zero; (1 << c) - 1];
+
+        scalars_and_bases_iter.clone().for_each(|(scalar, base)| {
+          // Check if scalar is 1 (handle specially in first window)
+          let full_val = scalar.get_window(0, max_bits.min(64));
+          if full_val == 1 {
+            if w_start == 0 {
+              res += base;
+            }
+          } else {
+            let window_val = scalar.get_window(w_start, c);
+            if window_val != 0 {
+              buckets[window_val - 1] += base;
+            }
+          }
+        });
+
+        let mut running_sum = C::Curve::identity();
+        buckets.into_iter().rev().for_each(|b| {
+          running_sum += &b;
+          res += &running_sum;
+        });
+        res
+      })
+      .collect();
+
+    let lowest = window_sums.first().copied().unwrap_or(zero);
+
+    lowest
+      + window_sums[1..]
+        .iter()
+        .rev()
+        .fold(zero, |mut total, sum_i| {
+          total += sum_i;
+          for _ in 0..c {
+            total = total.double();
+          }
+          total
+        })
+  }
+
+  let num_threads = if use_parallelism_internally {
+    current_num_threads()
+  } else {
+    1
+  };
+
+  if scalars.len() > num_threads {
+    let chunk_size = scalars.len() / num_threads;
+    scalars
+      .par_chunks(chunk_size)
+      .zip(bases.par_chunks(chunk_size))
+      .map(|(s, b)| msm_windowed_serial(s, b, max_bits))
+      .reduce(C::Curve::identity, |sum, evl| sum + evl)
+  } else {
+    msm_windowed_serial(scalars, bases, max_bits)
+  }
+}
+
+/// Bucket type for generic MSM (same as original but with different name to avoid conflict)
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum BucketGeneric<C: CurveAffine> {
+  None,
+  Affine(C),
+  Projective(C::Curve),
+}
+
+impl<C: CurveAffine> BucketGeneric<C> {
+  fn add_assign(&mut self, other: &C) {
+    *self = match *self {
+      BucketGeneric::None => BucketGeneric::Affine(*other),
+      BucketGeneric::Affine(a) => BucketGeneric::Projective(a + *other),
+      BucketGeneric::Projective(a) => BucketGeneric::Projective(a + other),
+    }
+  }
+
+  fn add(self, other: C::Curve) -> C::Curve {
+    match self {
+      BucketGeneric::None => other,
+      BucketGeneric::Affine(a) => other + a,
+      BucketGeneric::Projective(a) => other + a,
+    }
+  }
+}
+
+// ============================================================================
+// Original MSM implementations (kept for backwards compatibility)
+// ============================================================================
 
 #[derive(Clone, Copy)]
 enum Bucket<C: CurveAffine> {
