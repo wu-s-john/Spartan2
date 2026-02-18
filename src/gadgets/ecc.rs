@@ -77,6 +77,8 @@ where
     let x_cube = self.x.mul(cs.namespace(|| "x_cube"), &x_square)?;
 
     let (a, b, _, _) = E::GE::group_params();
+    // Optimization: check if a == 0 (common for BN254, Grumpkin, Pallas, Vesta)
+    let a_is_zero = a == E::Base::ZERO;
 
     let rhs = AllocatedNum::alloc(cs.namespace(|| "rhs"), || {
       let is_inf = self
@@ -86,20 +88,34 @@ where
       if is_inf == E::Base::ONE {
         Ok(E::Base::ZERO)
       } else {
-        let x_val = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
         let x_cube_val = x_cube
           .get_value()
           .ok_or(SynthesisError::AssignmentMissing)?;
-        Ok(x_cube_val + x_val * a + b)
+        if a_is_zero {
+          Ok(x_cube_val + b)
+        } else {
+          let x_val = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+          Ok(x_cube_val + x_val * a + b)
+        }
       }
     })?;
 
-    cs.enforce(
-      || "rhs = (1-is_infinity) * (x^3 + Ax + B)",
-      |lc| lc + x_cube.get_variable() + (a, self.x.get_variable()) + (b, CS::one()),
-      |lc| lc + CS::one() - self.is_infinity.get_variable(),
-      |lc| lc + rhs.get_variable(),
-    );
+    // When a=0, use simpler constraint without the Ax term
+    if a_is_zero {
+      cs.enforce(
+        || "rhs = (1-is_infinity) * (x^3 + B)",
+        |lc| lc + x_cube.get_variable() + (b, CS::one()),
+        |lc| lc + CS::one() - self.is_infinity.get_variable(),
+        |lc| lc + rhs.get_variable(),
+      );
+    } else {
+      cs.enforce(
+        || "rhs = (1-is_infinity) * (x^3 + Ax + B)",
+        |lc| lc + x_cube.get_variable() + (a, self.x.get_variable()) + (b, CS::one()),
+        |lc| lc + CS::one() - self.is_infinity.get_variable(),
+        |lc| lc + rhs.get_variable(),
+      );
+    }
 
     // check that (1-infinity) * y_square = rhs
     cs.enforce(
@@ -379,6 +395,8 @@ where
     /*************************************************************/
 
     let (a, _, _, _) = E::GE::group_params();
+    // Optimization: check if a == 0 (common for BN254, Grumpkin, Pallas, Vesta)
+    let a_is_zero = a == E::Base::ZERO;
 
     // Compute tmp = (E::Base::ONE + E::Base::ONE)* self.y ? self != inf : 1
     let tmp_actual = AllocatedNum::alloc(cs.namespace(|| "tmp_actual"), || {
@@ -422,15 +440,29 @@ where
       };
 
       let prod_1_val = prod_1.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      Ok(tmp_inv * (prod_1_val + a))
+      if a_is_zero {
+        Ok(tmp_inv * prod_1_val)
+      } else {
+        Ok(tmp_inv * (prod_1_val + a))
+      }
     })?;
 
-    cs.enforce(
-      || "Check lambda",
-      |lc| lc + tmp.get_variable(),
-      |lc| lc + lambda.get_variable(),
-      |lc| lc + prod_1.get_variable() + (a, CS::one()),
-    );
+    // When a=0, use simpler constraint: tmp * lambda = 3x²
+    if a_is_zero {
+      cs.enforce(
+        || "Check lambda",
+        |lc| lc + tmp.get_variable(),
+        |lc| lc + lambda.get_variable(),
+        |lc| lc + prod_1.get_variable(),
+      );
+    } else {
+      cs.enforce(
+        || "Check lambda",
+        |lc| lc + tmp.get_variable(),
+        |lc| lc + lambda.get_variable(),
+        |lc| lc + prod_1.get_variable() + (a, CS::one()),
+      );
+    }
 
     /*************************************************************/
     //          x = lambda * lambda - self.x - self.x;
@@ -640,6 +672,145 @@ where
 
     Ok(())
   }
+
+  /// Add a constant point (known at circuit compile time) to this point.
+  /// This is more efficient than `add` because we don't need to allocate
+  /// variables for the constant point's coordinates.
+  ///
+  /// The constant point is assumed to not be at infinity.
+  /// Handles the case where self is at infinity (returns the constant).
+  /// Assumes self != constant and self != -constant when self is not infinity.
+  pub fn add_constant<CS: ConstraintSystem<E::Base>>(
+    &self,
+    mut cs: CS,
+    constant: (E::Base, E::Base), // (x, y) of constant point (not infinity)
+  ) -> Result<Self, SynthesisError> {
+    let (other_x, other_y) = constant;
+
+    // lambda = (other_y - self.y) / (other_x - self.x)
+    // When self.is_infinity = 1, we use bogus values (set denominator to 1)
+    let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
+      let is_inf = self
+        .is_infinity
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      if is_inf == E::Base::ONE {
+        Ok(E::Base::ONE) // bogus value when self is infinity
+      } else {
+        let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        Ok((other_y - self_y) * (other_x - self_x).invert().unwrap())
+      }
+    })?;
+
+    // x_diff = is_infinity ? 1 : (other_x - self.x)
+    let x_diff = AllocatedNum::alloc(cs.namespace(|| "x_diff"), || {
+      let is_inf = self
+        .is_infinity
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      if is_inf == E::Base::ONE {
+        Ok(E::Base::ONE)
+      } else {
+        let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        Ok(other_x - self_x)
+      }
+    })?;
+
+    // Constraint: x_diff = is_infinity * 1 + (1 - is_infinity) * (other_x - self.x)
+    //           = is_infinity + (other_x - self.x) - is_infinity * (other_x - self.x)
+    // Rearranged: x_diff - is_infinity - other_x + self.x = -is_infinity * (other_x - self.x - 1)
+    // Simpler: (1 - is_infinity) * (other_x - self.x) + is_infinity = x_diff
+    cs.enforce(
+      || "x_diff = is_infinity ? 1 : (other_x - self.x)",
+      |lc| lc + (other_x, CS::one()) - self.x.get_variable() - CS::one(),
+      |lc| lc + CS::one() - self.is_infinity.get_variable(),
+      |lc| lc + x_diff.get_variable() - CS::one(),
+    );
+
+    // Constraint: lambda * x_diff = other_y - self.y (when not infinity)
+    // But when is_infinity=1, x_diff=1 and lambda can be anything, so we need:
+    // lambda * x_diff = (1 - is_infinity) * (other_y - self.y)
+    let y_diff_if_not_inf = AllocatedNum::alloc(cs.namespace(|| "y_diff_if_not_inf"), || {
+      let is_inf = self
+        .is_infinity
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      if is_inf == E::Base::ONE {
+        Ok(E::Base::ZERO)
+      } else {
+        let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        Ok(other_y - self_y)
+      }
+    })?;
+
+    cs.enforce(
+      || "y_diff_if_not_inf = (1 - is_infinity) * (other_y - self.y)",
+      |lc| lc + CS::one() - self.is_infinity.get_variable(),
+      |lc| lc + (other_y, CS::one()) - self.y.get_variable(),
+      |lc| lc + y_diff_if_not_inf.get_variable(),
+    );
+
+    cs.enforce(
+      || "lambda * x_diff = y_diff_if_not_inf",
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + x_diff.get_variable(),
+      |lc| lc + y_diff_if_not_inf.get_variable(),
+    );
+
+    // x_result = lambda² - self.x - other_x
+    let x_computed = AllocatedNum::alloc(cs.namespace(|| "x_computed"), || {
+      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      Ok(lambda_val * lambda_val - self_x - other_x)
+    })?;
+    cs.enforce(
+      || "x_computed = lambda² - self.x - other_x",
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + x_computed.get_variable() + self.x.get_variable() + (other_x, CS::one()),
+    );
+
+    // y_computed = lambda * (self.x - x_computed) - self.y
+    let y_computed = AllocatedNum::alloc(cs.namespace(|| "y_computed"), || {
+      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let x_val = x_computed.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      Ok(lambda_val * (self_x - x_val) - self_y)
+    })?;
+
+    cs.enforce(
+      || "y_computed = lambda * (self.x - x_computed) - self.y",
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + self.x.get_variable() - x_computed.get_variable(),
+      |lc| lc + y_computed.get_variable() + self.y.get_variable(),
+    );
+
+    // Final result: if self.is_infinity, return constant, else return computed
+    // Allocate constants for the select
+    let other_x_var = AllocatedNum::alloc(cs.namespace(|| "other_x_alloc"), || Ok(other_x))?;
+    let other_y_var = AllocatedNum::alloc(cs.namespace(|| "other_y_alloc"), || Ok(other_y))?;
+
+    let x = conditionally_select2(
+      cs.namespace(|| "x = is_infinity ? other_x : x_computed"),
+      &other_x_var,
+      &x_computed,
+      &self.is_infinity,
+    )?;
+
+    let y = conditionally_select2(
+      cs.namespace(|| "y = is_infinity ? other_y : y_computed"),
+      &other_y_var,
+      &y_computed,
+      &self.is_infinity,
+    )?;
+
+    // Result is never infinity (constant is not infinity, and if self was infinity we return constant)
+    let is_infinity = alloc_zero(cs.namespace(|| "is_infinity = 0"));
+
+    Ok(Self { x, y, is_infinity })
+  }
 }
 
 #[derive(Clone)]
@@ -740,13 +911,19 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
   ) -> Result<Self, SynthesisError> {
     // lambda = (3 x^2 + a) / 2 * y
     let (a, _, _, _) = E::GE::group_params();
+    // Optimization: check if a == 0 (common for BN254, Grumpkin, Pallas, Vesta)
+    let a_is_zero = a == E::Base::ZERO;
 
     let x_sq = self.x.square(cs.namespace(|| "x_sq"))?;
 
     let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
       let x_sq_val = x_sq.get_value().ok_or(SynthesisError::AssignmentMissing)?;
       let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let n = E::Base::from(3) * x_sq_val + a;
+      let n = if a_is_zero {
+        E::Base::from(3) * x_sq_val
+      } else {
+        E::Base::from(3) * x_sq_val + a
+      };
       let d = E::Base::from(2) * self_y;
       if d == E::Base::ZERO {
         Ok(E::Base::ONE)
@@ -754,12 +931,23 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
         Ok(n * d.invert().unwrap())
       }
     })?;
-    cs.enforce(
-      || "Check that lambda is computed correctly",
-      |lc| lc + lambda.get_variable(),
-      |lc| lc + (E::Base::from(2), self.y.get_variable()),
-      |lc| lc + (E::Base::from(3), x_sq.get_variable()) + (a, CS::one()),
-    );
+
+    // When a=0, use simpler constraint: lambda * 2y = 3x²
+    if a_is_zero {
+      cs.enforce(
+        || "Check that lambda is computed correctly",
+        |lc| lc + lambda.get_variable(),
+        |lc| lc + (E::Base::from(2), self.y.get_variable()),
+        |lc| lc + (E::Base::from(3), x_sq.get_variable()),
+      );
+    } else {
+      cs.enforce(
+        || "Check that lambda is computed correctly",
+        |lc| lc + lambda.get_variable(),
+        |lc| lc + (E::Base::from(2), self.y.get_variable()),
+        |lc| lc + (E::Base::from(3), x_sq.get_variable()) + (a, CS::one()),
+      );
+    }
 
     let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
       let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
@@ -774,6 +962,71 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
       |lc| lc + x.get_variable() + (E::Base::from(2), self.x.get_variable()),
     );
 
+    let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
+      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let x_val = x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      Ok(lambda_val * (self_x - x_val) - self_y)
+    })?;
+
+    cs.enforce(
+      || "Check that y is correct",
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + self.x.get_variable() - x.get_variable(),
+      |lc| lc + y.get_variable() + self.y.get_variable(),
+    );
+
+    Ok(Self { x, y })
+  }
+
+  /// Add a constant point (known at circuit compile time) to this point.
+  /// This is more efficient than `add_incomplete` because we don't need to allocate
+  /// variables for the constant point's coordinates - they go directly into the
+  /// linear combinations.
+  ///
+  /// Assumes self != constant and self != -constant (incomplete addition).
+  pub fn add_constant<CS: ConstraintSystem<E::Base>>(
+    &self,
+    mut cs: CS,
+    constant: (E::Base, E::Base), // (x, y) of constant point
+  ) -> Result<Self, SynthesisError> {
+    let (other_x, other_y) = constant;
+
+    // lambda = (other_y - self.y) / (other_x - self.x)
+    let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
+      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      if other_x == self_x {
+        Ok(E::Base::ONE)
+      } else {
+        Ok((other_y - self_y) * (other_x - self_x).invert().unwrap())
+      }
+    })?;
+
+    // Constraint: lambda * (other_x - self.x) = other_y - self.y
+    // Using constants directly in the linear combination
+    cs.enforce(
+      || "Check that lambda is computed correctly",
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + (other_x, CS::one()) - self.x.get_variable(),
+      |lc| lc + (other_y, CS::one()) - self.y.get_variable(),
+    );
+
+    // x = lambda² - self.x - other_x
+    let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
+      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      Ok(lambda_val * lambda_val - self_x - other_x)
+    })?;
+    cs.enforce(
+      || "check that x is correct",
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + x.get_variable() + self.x.get_variable() + (other_x, CS::one()),
+    );
+
+    // y = lambda * (self.x - x) - self.y
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
       let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
       let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;

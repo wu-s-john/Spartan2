@@ -13,6 +13,8 @@ keywords = ["zkSNARKs", "cryptography", "proofs"]
 [dependencies]
 bellpepper-core = "0.4.0"
 bellpepper = "0.4.0"
+bellpepper-keccak = { git = "https://github.com/lurk-lab/bellpepper-gadgets", branch = "main" }
+bellpepper-uint64 = { git = "https://github.com/lurk-lab/bellpepper-gadgets", branch = "main" }
 ff = { version = "0.13.0", features = ["derive"] }
 digest = "0.10"
 sha3 = "0.10"

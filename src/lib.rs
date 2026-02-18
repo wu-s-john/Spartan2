@@ -69,6 +69,10 @@ pub mod cli;
 #[allow(missing_docs)]
 pub mod sha256_circuits;
 
+/// Keccak-256 circuits using bellpepper-keccak (already small-value compatible).
+#[allow(missing_docs)]
+pub mod keccak_circuits;
+
 /// RS (Rao-Sandelius) shuffle gadget for arkworks R1CS.
 /// Implements stable-partition shuffle with ElGamal re-encryption.
 #[allow(missing_docs)]
