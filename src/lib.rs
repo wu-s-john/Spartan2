@@ -68,6 +68,14 @@ pub mod cli;
 #[allow(missing_docs)]
 pub mod sha256_circuits;
 
+/// Small-value R1CS constraint system using native integers (i32/i64).
+#[allow(missing_docs)]
+pub mod small_r1cs;
+
+/// Small-value gadgets (Boolean, UInt32, SHA-256) for small_r1cs.
+#[allow(missing_docs)]
+pub mod small_gadgets;
+
 /// Start a span + timer, return `(Span, Instant)`.
 macro_rules! start_span {
     ($name:expr $(, $($fmt:tt)+)?) => {{
