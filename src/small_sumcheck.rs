@@ -511,9 +511,9 @@ mod tests {
     // Setup SpartanSNARK
     let (pk, _vk) = SpartanSNARK::<E>::setup(circuit.clone()).expect("setup should succeed");
 
-    // Prep prove (is_small=true to get small values in witness)
+    // Prep prove (small-value path to get small values in witness)
     let prep_snark =
-      SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), true).expect("prep_prove should succeed");
+      SpartanSNARK::<E>::prep_prove_small(&pk, circuit.clone()).expect("prep_prove_small should succeed");
 
     // Extract Az, Bz, Cz, tau from the circuit
     let (az_vals, bz_vals, cz_vals, taus) =
@@ -625,9 +625,9 @@ mod tests {
     // 1. Create SmallSha256Circuit
     let circuit = SmallSha256Circuit::<F>::new(vec![0u8; preimage_len], use_batching);
 
-    // 2. Setup and prep_prove
+    // 2. Setup and prep_prove (small-value path)
     let (pk, _vk) = SpartanSNARK::<E>::setup(circuit.clone()).expect("setup");
-    let prep_snark = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), true).expect("prep_prove");
+    let prep_snark = SpartanSNARK::<E>::prep_prove_small(&pk, circuit.clone()).expect("prep_prove_small");
 
     // 3. Extract Az, Bz, Cz, tau
     let (az_vals, bz_vals, cz_vals, taus) =

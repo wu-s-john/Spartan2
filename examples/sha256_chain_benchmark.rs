@@ -111,19 +111,36 @@ fn run_spartan_benchmark(
 
     clear_timings(timing_data);
 
-    // PREPARE
-    let t0 = Instant::now();
-    let prep_snark = SpartanSNARK::<E>::prep_prove(&pk, small_circuit.clone(), is_small)
-      .expect("prep_prove failed");
-    let prep_ms = t0.elapsed().as_millis();
-    info!(elapsed_ms = prep_ms, "prep_prove");
+    // PREPARE and PROVE (using appropriate method based on is_small)
+    let (prep_ms, prove_ms, proof) = if is_small {
+      let t0 = Instant::now();
+      let prep_snark = SpartanSNARK::<E>::prep_prove_small(&pk, small_circuit.clone())
+        .expect("prep_prove_small failed");
+      let prep_ms = t0.elapsed().as_millis();
+      info!(elapsed_ms = prep_ms, "prep_prove_small");
 
-    // PROVE
-    let t0 = Instant::now();
-    let proof = SpartanSNARK::<E>::prove(&pk, small_circuit.clone(), &prep_snark, is_small)
-      .expect("prove failed");
-    let prove_ms = t0.elapsed().as_millis();
-    info!(elapsed_ms = prove_ms, "prove");
+      let t0 = Instant::now();
+      let proof = SpartanSNARK::<E>::prove_small(&pk, small_circuit.clone(), &prep_snark)
+        .expect("prove_small failed");
+      let prove_ms = t0.elapsed().as_millis();
+      info!(elapsed_ms = prove_ms, "prove_small");
+
+      (prep_ms, prove_ms, proof)
+    } else {
+      let t0 = Instant::now();
+      let prep_snark = SpartanSNARK::<E>::prep_prove(&pk, small_circuit.clone())
+        .expect("prep_prove failed");
+      let prep_ms = t0.elapsed().as_millis();
+      info!(elapsed_ms = prep_ms, "prep_prove");
+
+      let t0 = Instant::now();
+      let proof = SpartanSNARK::<E>::prove(&pk, small_circuit.clone(), &prep_snark)
+        .expect("prove failed");
+      let prove_ms = t0.elapsed().as_millis();
+      info!(elapsed_ms = prove_ms, "prove");
+
+      (prep_ms, prove_ms, proof)
+    };
 
     let timings = snapshot_timings(timing_data, SPARTAN_PHASES);
     if is_small {
@@ -185,7 +202,7 @@ where
   info!(setup_ms, num_constraints, "setup");
 
   let (prep_snark, witness_ms) = timed(|| {
-    SpartanSNARK::<E>::prep_prove(&pk, small_circuit.clone(), true).expect("prep_prove failed")
+    SpartanSNARK::<E>::prep_prove_small(&pk, small_circuit.clone()).expect("prep_prove_small failed")
   });
   info!(witness_ms, "witness synthesis");
 

@@ -100,3 +100,6 @@ type VerifierKey<E> = <<E as traits::Engine>::PCS as PCSEngineTrait<E>>::Verifie
 type Commitment<E> = <<E as Engine>::PCS as PCSEngineTrait<E>>::Commitment;
 type PCS<E> = <E as Engine>::PCS;
 type Blind<E> = <<E as Engine>::PCS as PCSEngineTrait<E>>::Blind;
+
+/// Public type alias for commitment blinding factor.
+pub type CommitmentBlind<E> = <<E as Engine>::PCS as PCSEngineTrait<E>>::Blind;

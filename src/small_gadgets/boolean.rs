@@ -307,6 +307,70 @@ impl<W: Witness, C: Coefficient> Boolean<W, C> {
             }
         }
     }
+
+    /// Expose this boolean as a public input.
+    ///
+    /// Creates a new public input variable with the boolean's value
+    /// and adds an equality constraint between them.
+    pub fn inputize<CS: SmallConstraintSystem<W, C>>(
+        &self,
+        cs: &mut CS,
+    ) -> Result<(), SynthesisError> {
+        // Allocate a public input with the same value
+        let input_var = cs.alloc_input(|| {
+            if self.get_value().unwrap_or(false) {
+                W::one()
+            } else {
+                W::zero()
+            }
+        })?;
+
+        // Enforce equality: (self - input) * 1 = 0
+        // Which simplifies to: 1 * 1 = self - input (when rearranged) won't work
+        // Better: self * 1 = input
+        let one_var = CS::one();
+        match (self.var, self.negated) {
+            (None, false) if self.value == Some(true) => {
+                // Constant true: 1 * 1 = input
+                cs.enforce(|lc| lc + one_var, |lc| lc + one_var, |lc| lc + input_var);
+            }
+            (None, false) => {
+                // Constant false: 0 * 1 = input, i.e., 1 * input = 0
+                cs.enforce(
+                    |lc| lc + one_var,
+                    |lc| lc + input_var,
+                    |lc| lc, // zero
+                );
+            }
+            (None, true) if self.value == Some(false) => {
+                // NOT false = true: 1 * 1 = input
+                cs.enforce(|lc| lc + one_var, |lc| lc + one_var, |lc| lc + input_var);
+            }
+            (None, true) => {
+                // NOT true = false: 1 * input = 0
+                cs.enforce(
+                    |lc| lc + one_var,
+                    |lc| lc + input_var,
+                    |lc| lc, // zero
+                );
+            }
+            (Some(var), false) => {
+                // var * 1 = input
+                cs.enforce(|lc| lc + var, |lc| lc + one_var, |lc| lc + input_var);
+            }
+            (Some(var), true) => {
+                // (1 - var) * 1 = input
+                // Rearranged: 1 * 1 = var + input
+                cs.enforce(
+                    |lc| lc + one_var,
+                    |lc| lc + one_var,
+                    |lc| lc + var + input_var,
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -146,33 +146,38 @@ where
     Ok((pk, vk))
   }
 
-  /// Prepares the SNARK for proving
+  /// Prepares the SNARK for proving using standard field arithmetic.
   fn prep_prove<C: SpartanCircuit<E>>(
     pk: &Self::ProverKey,
     circuit: C,
-    is_small: bool, // do witness elements fit in machine words?
   ) -> Result<Self::PrepSNARK, SpartanError> {
-    let mut ps = SatisfyingAssignment::shared_witness(&pk.S, &pk.ck, &circuit, is_small)?;
-    SatisfyingAssignment::precommitted_witness(&mut ps, &pk.S, &pk.ck, &circuit, is_small)?;
-
-    Ok(SpartanPrepSNARK { ps })
+    Self::prep_prove_internal(pk, circuit, false)
   }
 
-  /// Produces a succinct proof of satisfiability of an R1CS instance.
-  ///
-  /// Dispatches to either `prove_small` (optimized for small witness values)
-  /// or `prove_regular` (standard field arithmetic) based on `is_small`.
+  /// Prepares the SNARK for proving using small-value optimization.
+  fn prep_prove_small<C: SpartanCircuit<E>>(
+    pk: &Self::ProverKey,
+    circuit: C,
+  ) -> Result<Self::PrepSNARK, SpartanError> {
+    Self::prep_prove_internal(pk, circuit, true)
+  }
+
+  /// Produces proof using standard field arithmetic.
   fn prove<C: SpartanCircuit<E>>(
     pk: &Self::ProverKey,
     circuit: C,
     prep_snark: &Self::PrepSNARK,
-    is_small: bool,
   ) -> Result<Self, SpartanError> {
-    if is_small {
-      Self::prove_small::<_, 3>(pk, circuit, prep_snark)
-    } else {
-      Self::prove_regular(pk, circuit, prep_snark)
-    }
+    Self::prove_regular(pk, circuit, prep_snark)
+  }
+
+  /// Produces proof using small-value optimization.
+  fn prove_small<C: SpartanCircuit<E>>(
+    pk: &Self::ProverKey,
+    circuit: C,
+    prep_snark: &Self::PrepSNARK,
+  ) -> Result<Self, SpartanError> {
+    Self::prove_small_internal::<_, 3>(pk, circuit, prep_snark)
   }
 
   /// verifies a proof of satisfiability of a `RelaxedR1CS` instance
@@ -271,7 +276,7 @@ where
 
     // verify
     let (_pcs_verify_span, pcs_verify_t) = start_span!("pcs_verify");
-    let comm_eval_W = E::PCS::commit(&vk.ck_s, &[self.eval_W], &self.blind_eval_W, false)?; // commitment to eval_W
+    let comm_eval_W = E::PCS::commit(&vk.ck_s, &[self.eval_W], &self.blind_eval_W)?; // commitment to eval_W
     E::PCS::verify(
       &vk.vk_ee,
       &vk.ck_s,
@@ -378,7 +383,7 @@ impl<E: Engine> SpartanSNARK<E> {
 
     let (_pcs_span, pcs_t) = start_span!("pcs_prove");
     let blind_eval_W = E::PCS::blind(&pk.ck_s, 1); // blind for committing to eval_W
-    let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W, false)?; // commitment to eval_W
+    let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W)?; // commitment to eval_W
     let eval_arg = E::PCS::prove(
       &pk.ck,
       &pk.ck_s,
@@ -433,6 +438,17 @@ impl<E: Engine> SpartanSNARK<E> {
     transcript.absorb(b"public_values", &public_values.as_slice());
 
     Ok(transcript)
+  }
+
+  /// Internal prep_prove implementation with is_small parameter.
+  fn prep_prove_internal<C: SpartanCircuit<E>>(
+    pk: &SpartanProverKey<E>,
+    circuit: C,
+    is_small: bool,
+  ) -> Result<SpartanPrepSNARK<E>, SpartanError> {
+    let mut ps = SatisfyingAssignment::shared_witness(&pk.S, &pk.ck, &circuit, is_small)?;
+    SatisfyingAssignment::precommitted_witness(&mut ps, &pk.S, &pk.ck, &circuit, is_small)?;
+    Ok(SpartanPrepSNARK { ps })
   }
 
   /// Proves satisfiability using standard field arithmetic (non-small-value path).
@@ -543,7 +559,7 @@ impl<E: Engine> SpartanSNARK<E> {
   /// # Errors
   /// Returns `SpartanError::SmallValueOverflow` if any witness or public value
   /// doesn't fit in i64.
-  fn prove_small<C: SpartanCircuit<E>, const LB: usize>(
+  fn prove_small_internal<C: SpartanCircuit<E>, const LB: usize>(
     pk: &SpartanProverKey<E>,
     circuit: C,
     prep_snark: &SpartanPrepSNARK<E>,
@@ -813,11 +829,11 @@ mod tests {
     // produce keys
     let (pk, vk) = S::setup(circuit.clone()).unwrap();
 
-    // generate pre-processed state for proving
-    let prep_snark = S::prep_prove(&pk, circuit.clone(), false).unwrap();
+    // generate pre-processed state for proving (field path)
+    let prep_snark = S::prep_prove(&pk, circuit.clone()).unwrap();
 
-    // generate a witness and proof (is_small=false for standard field path)
-    let res = S::prove(&pk, circuit.clone(), &prep_snark, false);
+    // generate a witness and proof (field path)
+    let res = S::prove(&pk, circuit.clone(), &prep_snark);
     assert!(res.is_ok());
     let snark = res.unwrap();
 
@@ -854,11 +870,11 @@ mod tests {
     // produce keys
     let (pk, vk) = SpartanSNARK::<E>::setup(circuit.clone()).unwrap();
 
-    // generate pre-processed state for proving (with is_small=true)
-    let prep_snark = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), true).unwrap();
+    // generate pre-processed state for proving (small-value path)
+    let prep_snark = SpartanSNARK::<E>::prep_prove_small(&pk, circuit.clone()).unwrap();
 
-    // generate a witness and proof using prove with is_small=true (small-value path)
-    let res = SpartanSNARK::<E>::prove(&pk, circuit.clone(), &prep_snark, true);
+    // generate a witness and proof using prove_small (small-value path)
+    let res = SpartanSNARK::<E>::prove_small(&pk, circuit.clone(), &prep_snark);
     assert!(res.is_ok());
     let snark = res.unwrap();
 
@@ -895,18 +911,17 @@ mod tests {
     // produce keys
     let (pk, vk) = SpartanSNARK::<E>::setup(circuit.clone()).unwrap();
 
-    // generate pre-processed state for proving
-    // Use is_small=true for prep since we'll test both paths
-    let prep_snark_small = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), true).unwrap();
-    let prep_snark_regular = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), false).unwrap();
+    // generate pre-processed state for proving (separate for each path)
+    let prep_snark_small = SpartanSNARK::<E>::prep_prove_small(&pk, circuit.clone()).unwrap();
+    let prep_snark_regular = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone()).unwrap();
 
-    // Run prove with is_small=false (field path)
+    // Run prove (field path)
     let snark_prove =
-      SpartanSNARK::<E>::prove(&pk, circuit.clone(), &prep_snark_regular, false).unwrap();
+      SpartanSNARK::<E>::prove(&pk, circuit.clone(), &prep_snark_regular).unwrap();
 
-    // Run prove with is_small=true (small-value path)
+    // Run prove_small (small-value path)
     let snark_small =
-      SpartanSNARK::<E>::prove(&pk, circuit.clone(), &prep_snark_small, true).unwrap();
+      SpartanSNARK::<E>::prove_small(&pk, circuit.clone(), &prep_snark_small).unwrap();
 
     // Note: We cannot compare claims_outer or eval_W directly because each prove call
     // generates fresh random blinding factors (via PCS::blind), which affects the
@@ -966,25 +981,34 @@ mod tests {
     // produce keys
     let (pk, vk) = SpartanSNARK::<E>::setup(circuit.clone()).unwrap();
 
-    // Prep once with is_small=true (can be shared between both prove paths)
-    let prep_snark = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), true).unwrap();
+    // Prep for both paths separately
+    let prep_snark_regular = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone()).unwrap();
+    let prep_snark_small = SpartanSNARK::<E>::prep_prove_small(&pk, circuit.clone()).unwrap();
 
-    // Helper to test prove and verify
-    let assert_prove_and_verify = |is_small: bool, path_name: &str| {
-      let snark = SpartanSNARK::<E>::prove(&pk, circuit.clone(), &prep_snark, is_small).unwrap();
-      let res = snark.verify(&vk);
-      assert!(
-        res.is_ok(),
-        "{path_name} should verify for num_rounds={num_rounds}"
-      );
-      assert_eq!(
-        res.unwrap(),
-        [expected_output],
-        "{path_name} output mismatch for num_rounds={num_rounds}"
-      );
-    };
+    // Test prove (field path)
+    let snark_regular = SpartanSNARK::<E>::prove(&pk, circuit.clone(), &prep_snark_regular).unwrap();
+    let res_regular = snark_regular.verify(&vk);
+    assert!(
+      res_regular.is_ok(),
+      "prove should verify for num_rounds={num_rounds}"
+    );
+    assert_eq!(
+      res_regular.unwrap(),
+      [expected_output],
+      "prove output mismatch for num_rounds={num_rounds}"
+    );
 
-    assert_prove_and_verify(false, "prove_regular");
-    assert_prove_and_verify(true, "prove_small");
+    // Test prove_small (small-value path)
+    let snark_small = SpartanSNARK::<E>::prove_small(&pk, circuit.clone(), &prep_snark_small).unwrap();
+    let res_small = snark_small.verify(&vk);
+    assert!(
+      res_small.is_ok(),
+      "prove_small should verify for num_rounds={num_rounds}"
+    );
+    assert_eq!(
+      res_small.unwrap(),
+      [expected_output],
+      "prove_small output mismatch for num_rounds={num_rounds}"
+    );
   }
 }

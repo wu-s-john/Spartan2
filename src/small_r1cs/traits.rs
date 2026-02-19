@@ -4,6 +4,7 @@
 //! allowing the constraint system to work with native integers (i32, i64)
 //! instead of field elements.
 
+use super::lc::LinearCombination;
 use num_traits::{One, Zero};
 use std::fmt::Debug;
 use std::ops::{Add, Mul, Neg, Sub};
@@ -168,6 +169,50 @@ impl WideningMul<i64, i64> for i64 {
     fn wide_mul(self, w: i64) -> i64 {
         self * w
     }
+}
+
+// Implementation for i32 × i64 → i64 (small coefficient × wider witness)
+impl WideningMul<i64, i64> for i32 {
+    #[inline]
+    fn wide_mul(self, w: i64) -> i64 {
+        (self as i64) * w
+    }
+}
+
+/// Trait for constraint systems that support batched equality constraints.
+///
+/// This trait extends the basic constraint system operations with the ability
+/// to enforce equality constraints (`lhs = rhs`) that may be batched together
+/// for reduced constraint count.
+///
+/// # Implementations
+///
+/// - `SmallCS<W, C>`: Direct enforcement (no batching)
+/// - `BatchingSmallCS<W, C, K>`: Batches up to K constraints into one
+///
+/// # Example
+///
+/// ```ignore
+/// fn my_gadget<W, C, CS>(cs: &mut CS, a: Variable, b: Variable)
+/// where
+///     CS: SmallMultiEqCS<W, C>,
+/// {
+///     let lhs = LinearCombination::from_variable(a);
+///     let rhs = LinearCombination::from_variable(b);
+///     cs.enforce_equal(&lhs, &rhs);  // May be batched
+/// }
+/// ```
+pub trait SmallMultiEqCS<W: Witness, C: Coefficient> {
+    /// Enforce an equality constraint: lhs = rhs.
+    ///
+    /// This may be batched with other equality constraints to reduce
+    /// the total number of R1CS constraints.
+    fn enforce_equal(&mut self, lhs: &LinearCombination<C>, rhs: &LinearCombination<C>);
+
+    /// Flush any pending batched constraints.
+    ///
+    /// For non-batching implementations, this is a no-op.
+    fn flush(&mut self);
 }
 
 #[cfg(test)]

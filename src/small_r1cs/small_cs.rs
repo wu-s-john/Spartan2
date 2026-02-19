@@ -7,7 +7,7 @@ use super::{
     cs::{SmallConstraintSystem, SynthesisError},
     lc::LinearCombination,
     sparse::SmallSparseMatrix,
-    traits::{Accumulator, Coefficient, WideningMul, Witness},
+    traits::{Accumulator, Coefficient, SmallMultiEqCS, WideningMul, Witness},
 };
 use bellpepper_core::{Index, Variable};
 
@@ -233,6 +233,22 @@ impl<W: Witness, C: Coefficient> SmallConstraintSystem<W, C> for SmallCS<W, C> {
 
     fn num_inputs(&self) -> usize {
         self.inputs.len()
+    }
+}
+
+/// SmallMultiEqCS implementation for SmallCS (non-batched).
+///
+/// Each equality constraint is directly enforced as `lhs × 1 = rhs`.
+impl<W: Witness, C: Coefficient> SmallMultiEqCS<W, C> for SmallCS<W, C> {
+    fn enforce_equal(&mut self, lhs: &LinearCombination<C>, rhs: &LinearCombination<C>) {
+        // Clone the LCs so we can move them into closures
+        let lhs = lhs.clone();
+        let rhs = rhs.clone();
+        self.enforce(|_| lhs, |lc| lc + Self::one(), |_| rhs);
+    }
+
+    fn flush(&mut self) {
+        // No-op for non-batching implementation
     }
 }
 

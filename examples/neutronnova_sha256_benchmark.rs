@@ -18,7 +18,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::{Parser, ValueEnum};
 use spartan2::{
   bellpepper::{
-    r1cs::{MultiRoundSpartanWitness, SpartanWitness},
+    r1cs::{MultiRoundSpartanShape, MultiRoundSpartanWitness, SpartanWitness},
+    shape_cs::ShapeCS,
     solver::SatisfyingAssignment,
   },
   cli::FieldChoice,
@@ -28,9 +29,10 @@ use spartan2::{
     NeutronNovaZkSNARK,
   },
   provider::{Bn254Engine, PallasHyraxEngine, VestaHyraxEngine},
-  r1cs::{R1CSInstance, R1CSWitness},
-  sha256_circuits::SmallSha256ChainCircuit,
-  small_field::{DelayedReduction, SmallValueField},
+  r1cs::{R1CSInstance, R1CSWitness, SplitR1CSShape},
+  sha256_circuits::{NativeSmallSha256ChainCircuit, SmallSha256ChainCircuit},
+  small_field::{DelayedReduction, SmallValueField, WideMul},
+  small_r1cs::{Accumulator, WideningMul, Witness},
   timing::{
     NEUTRONNOVA_PHASES, NEUTRONNOVA_ZK_PROVE_PHASES, TimingData, TimingLayer, clear_timings,
     normalize_parallel_timings, print_table, snapshot_timings,
@@ -50,6 +52,8 @@ enum BenchMode {
   Nifs,
   /// Benchmark full NeutronNovaZkSNARK::prove
   ZkProve,
+  /// Benchmark native i32 arithmetic path (SmallCS + prove_native)
+  Native,
 }
 
 #[derive(Parser)]
@@ -185,10 +189,13 @@ fn verify_snark<E: Engine>(
     + DelayedReduction<E::Scalar>,
 {
   let mode = if is_small { "small-value" } else { "large-value" };
-  let prep =
-    NeutronNovaZkSNARK::<E>::prep_prove(pk, circuits, core_circuit, is_small).expect("prep_prove");
-  let snark =
-    NeutronNovaZkSNARK::<E>::prove(pk, circuits, core_circuit, &prep, is_small).expect("prove");
+  let snark = if is_small {
+    let prep = NeutronNovaZkSNARK::<E>::prep_prove_small(pk, circuits, core_circuit).expect("prep_prove_small");
+    NeutronNovaZkSNARK::<E>::prove_small(pk, circuits, core_circuit, &prep).expect("prove_small")
+  } else {
+    let prep = NeutronNovaZkSNARK::<E>::prep_prove(pk, circuits, core_circuit).expect("prep_prove");
+    NeutronNovaZkSNARK::<E>::prove(pk, circuits, core_circuit, &prep).expect("prove")
+  };
   let res = snark.verify(vk, num_instances);
   assert!(res.is_ok(), "Verification failed: {:?}", res.err());
   eprintln!("  verified: yes ({})", mode);
@@ -237,13 +244,16 @@ fn benchmark_nifs_prove<E: Engine>(
 
     let t_total = Instant::now();
 
-    // Witness generation: prep_prove
-    let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, is_small)
-      .expect("prep_prove");
-
-    // Witness generation: synthesize instances
-    let (instances, witnesses) =
-      generate_instances_and_witnesses(&pk, &prep, &circuits, is_small);
+    // Witness generation: prep_prove and synthesize instances (using appropriate method based on is_small)
+    let (instances, witnesses) = if is_small {
+      let prep = NeutronNovaZkSNARK::<E>::prep_prove_small(&pk, &circuits, &core_circuit)
+        .expect("prep_prove_small");
+      generate_instances_and_witnesses(&pk, &prep, &circuits, is_small)
+    } else {
+      let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit)
+        .expect("prep_prove");
+      generate_instances_and_witnesses(&pk, &prep, &circuits, is_small)
+    };
 
     // NIFS prove
     nifs_prove_single(&pk, &instances, &witnesses, is_small);
@@ -311,11 +321,18 @@ fn benchmark_zk_prove<E: Engine>(
 
     let t_total = Instant::now();
 
-    // Full ZK prove
-    let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, is_small)
-      .expect("prep_prove");
-    let snark = NeutronNovaZkSNARK::<E>::prove(&pk, &circuits, &core_circuit, &prep, is_small)
-      .expect("prove");
+    // Full ZK prove (using appropriate method based on is_small)
+    let snark = if is_small {
+      let prep = NeutronNovaZkSNARK::<E>::prep_prove_small(&pk, &circuits, &core_circuit)
+        .expect("prep_prove_small");
+      NeutronNovaZkSNARK::<E>::prove_small(&pk, &circuits, &core_circuit, &prep)
+        .expect("prove_small")
+    } else {
+      let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit)
+        .expect("prep_prove");
+      NeutronNovaZkSNARK::<E>::prove(&pk, &circuits, &core_circuit, &prep)
+        .expect("prove")
+    };
 
     let total_ms = t_total.elapsed().as_millis();
     info!(elapsed_ms = total_ms as u64, "end_to_end_total");
@@ -347,6 +364,134 @@ fn benchmark_zk_prove<E: Engine>(
   );
 }
 
+/// Generate native SHA-256 circuits (using SmallCS + small_gadgets)
+fn make_native_circuits(
+  num_instances: usize,
+  chain_length: usize,
+) -> Vec<NativeSmallSha256ChainCircuit> {
+  (0..num_instances)
+    .map(|i| {
+      let mut input = [0u8; 32];
+      input[0] = i as u8;
+      input[1] = (i >> 8) as u8;
+      NativeSmallSha256ChainCircuit::new(input, chain_length)
+    })
+    .collect()
+}
+
+/// Benchmark native i32 arithmetic path using SmallCS + prove_native.
+///
+/// This path uses:
+/// - NativeSmallSha256ChainCircuit (SmallCS<i32, i32> + small_gadgets/sha256)
+/// - SplitR1CSShape<E, i32> (small coefficients)
+/// - R1CSWitness<E, i32> / R1CSInstance<E, i32> (small values)
+/// - NeutronNovaNIFS::prove_native with pure i32 × i32 → i64 arithmetic
+fn benchmark_native_prove<E: Engine>(
+  num_instances: usize,
+  chain_length: usize,
+  _timing_data: &TimingData,
+) where
+  E::PCS: FoldingEngineTrait<E>,
+  E::Scalar: SmallValueField<i32>
+    + SmallValueField<i64>
+    + DelayedReduction<i32>
+    + DelayedReduction<i64>
+    + DelayedReduction<i128>
+    + DelayedReduction<E::Scalar>,
+  i32: WideningMul<i32, i64>,
+  i64: Witness + WideMul + Accumulator,
+  <i64 as WideMul>::Product: Copy + Ord + num_traits::Signed
+    + std::ops::Div<Output = <i64 as WideMul>::Product>
+    + std::ops::Mul<Output = <i64 as WideMul>::Product>
+    + num_traits::One
+    + From<i32>,
+{
+  let num_cores = rayon::current_num_threads();
+
+  eprintln!(
+    "Setting up Native NeutronNova for {} instances, chain_length={}, cores={}...",
+    num_instances, chain_length, num_cores
+  );
+
+  // Create native circuits
+  let circuits = make_native_circuits(num_instances, chain_length);
+
+  // Get shape from first circuit
+  let t0 = Instant::now();
+  let shape: SplitR1CSShape<E, i32> = circuits[0].to_shape();
+
+  // Create commitment key from shape (need field version for CK setup)
+  let shape_field: SplitR1CSShape<E> = SplitR1CSShape::new_simple(
+    shape.num_cons_unpadded,
+    shape.num_rest_unpadded,
+    shape.num_public,
+    shape.A.map_coeffs(|c| <E as Engine>::Scalar::from(c as u64)),
+    shape.B.map_coeffs(|c| <E as Engine>::Scalar::from(c as u64)),
+    shape.C.map_coeffs(|c| <E as Engine>::Scalar::from(c as u64)),
+  );
+  let (ck, _vk_ee) = SplitR1CSShape::commitment_key(&[&shape_field]).expect("commitment_key");
+
+  // Set up VC infrastructure
+  let n_padded = num_instances.next_power_of_two();
+  let num_vars = shape.num_shared + shape.num_precommitted + shape.num_rest;
+  let num_rounds_b = n_padded.log_2();
+  let num_rounds_x = shape.num_cons.log_2();
+  let num_rounds_y = num_vars.log_2() + 1;
+
+  let vc_template = NeutronNovaVerifierCircuit::<E>::default(num_rounds_b, num_rounds_x, num_rounds_y);
+  let (vc_shape, vc_ck, _vk_mr) =
+    <ShapeCS<E> as MultiRoundSpartanShape<E>>::multiround_r1cs_shape(&vc_template).expect("vc shape");
+
+  let setup_ms = t0.elapsed().as_millis();
+  eprintln!("Setup done in {} ms (constraints: {})", setup_ms, shape.num_cons);
+
+  // Generate witnesses and instances (native i32)
+  let t_witness = Instant::now();
+  let (witnesses, instances): (Vec<R1CSWitness<E, i32>>, Vec<R1CSInstance<E, i32>>) = circuits
+    .iter()
+    .map(|c| c.to_witness_and_instance(&ck, shape.num_rest).expect("to_witness_and_instance"))
+    .unzip();
+  let witness_gen_ms = t_witness.elapsed().as_millis();
+  eprintln!("Witness generation done in {} ms", witness_gen_ms);
+
+  // Run prove_native
+  let t_prove = Instant::now();
+
+  let mut vc = NeutronNovaVerifierCircuit::<E>::default(num_rounds_b, num_rounds_x, num_rounds_y);
+  let mut vc_state =
+    SatisfyingAssignment::<E>::initialize_multiround_witness(&vc_shape).expect("init vc_state");
+  let mut transcript = <E as Engine>::TE::new(b"neutronnova_native_benchmark");
+
+  let result = NeutronNovaNIFS::<E>::prove_native::<i32, i64, i32>(
+    &shape,
+    &instances,
+    &witnesses,
+    &mut vc,
+    &mut vc_state,
+    &vc_shape,
+    &vc_ck,
+    &mut transcript,
+  );
+
+  let prove_ms = t_prove.elapsed().as_millis();
+
+  match &result {
+    Ok(_) => eprintln!("prove_native succeeded in {} ms", prove_ms),
+    Err(e) => eprintln!("prove_native failed: {:?}", e),
+  }
+
+  // Print summary
+  eprintln!("\n===== Native Path Summary =====");
+  eprintln!("  Instances:    {}", num_instances);
+  eprintln!("  Chain length: {}", chain_length);
+  eprintln!("  Constraints:  {}", shape.num_cons);
+  eprintln!("  Cores:        {}", num_cores);
+  eprintln!("  Setup:        {} ms", setup_ms);
+  eprintln!("  Witness gen:  {} ms", witness_gen_ms);
+  eprintln!("  prove_native: {} ms", prove_ms);
+  eprintln!("  Total:        {} ms", setup_ms + witness_gen_ms + prove_ms);
+}
+
 fn main() {
   let args = Args::parse();
 
@@ -370,17 +515,26 @@ fn main() {
     (FieldChoice::Bn254Fr, BenchMode::ZkProve) => {
       benchmark_zk_prove::<Bn254Engine>(args.instances, args.chain_length, &timing_data)
     }
+    (FieldChoice::Bn254Fr, BenchMode::Native) => {
+      benchmark_native_prove::<Bn254Engine>(args.instances, args.chain_length, &timing_data)
+    }
     (FieldChoice::PallasFq, BenchMode::Nifs) => {
       benchmark_nifs_prove::<PallasHyraxEngine>(args.instances, args.chain_length, &timing_data)
     }
     (FieldChoice::PallasFq, BenchMode::ZkProve) => {
       benchmark_zk_prove::<PallasHyraxEngine>(args.instances, args.chain_length, &timing_data)
     }
+    (FieldChoice::PallasFq, BenchMode::Native) => {
+      benchmark_native_prove::<PallasHyraxEngine>(args.instances, args.chain_length, &timing_data)
+    }
     (FieldChoice::VestaFp, BenchMode::Nifs) => {
       benchmark_nifs_prove::<VestaHyraxEngine>(args.instances, args.chain_length, &timing_data)
     }
     (FieldChoice::VestaFp, BenchMode::ZkProve) => {
       benchmark_zk_prove::<VestaHyraxEngine>(args.instances, args.chain_length, &timing_data)
+    }
+    (FieldChoice::VestaFp, BenchMode::Native) => {
+      benchmark_native_prove::<VestaHyraxEngine>(args.instances, args.chain_length, &timing_data)
     }
   }
 }

@@ -8,6 +8,7 @@
 //! We require the commitment engine to provide a commitment to vectors with a single group element
 use crate::{
   errors::SpartanError,
+  provider::msm::MsmScalar,
   traits::{Engine, TranscriptReprTrait},
 };
 use core::fmt::Debug;
@@ -55,12 +56,33 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
   /// Returns a blind to be used for commitment to a polynomial of size `n`
   fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind;
 
-  /// Commits to the provided vector using the provided ck and returns the commitment
+  /// Commits to the provided vector using the provided ck and returns the commitment.
+  /// This method uses field-element MSM (suitable for arbitrary field values).
   fn commit(
     ck: &Self::CommitmentKey,
     v: &[E::Scalar],
     r: &Self::Blind,
-    is_small: bool,
+  ) -> Result<Self::Commitment, SpartanError>;
+
+  /// Commits to small integer values using optimized small-value MSM.
+  /// This method is more efficient when the committed values fit in machine words.
+  /// The values are provided as field elements but internally converted to integers.
+  fn commit_small(
+    ck: &Self::CommitmentKey,
+    v: &[E::Scalar],
+    r: &Self::Blind,
+  ) -> Result<Self::Commitment, SpartanError>;
+
+  /// Commits to small integer values directly (without field element wrapping).
+  /// This is the most efficient path for small values as it avoids field conversion overhead.
+  ///
+  /// Supports both unsigned (u32, u64) and signed (i32, i64) integer types.
+  /// For signed types, negative values are handled correctly by negating the base point
+  /// in the MSM computation.
+  fn commit_small_direct<T: MsmScalar>(
+    ck: &Self::CommitmentKey,
+    v: &[T],
+    r: &Self::Blind,
   ) -> Result<Self::Commitment, SpartanError>;
 
   /// Checks if the provided commitment commits to a vector of the specified length

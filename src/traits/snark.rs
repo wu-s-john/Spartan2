@@ -29,19 +29,32 @@ pub trait R1CSSNARKTrait<E: Engine>:
     circuit: C,
   ) -> Result<(Self::ProverKey, Self::VerifierKey), SpartanError>;
 
-  /// Prepares the SNARK for proving, given a prover key and a circuit
+  /// Prepares the SNARK for proving using standard field arithmetic.
   fn prep_prove<C: SpartanCircuit<E>>(
     pk: &Self::ProverKey,
     circuit: C,
-    is_small: bool, // do witness elements fit in machine words?
   ) -> Result<Self::PrepSNARK, SpartanError>;
 
-  /// Produces witness and instance for a given circuit, and proves it
+  /// Prepares the SNARK for proving using small-value optimization.
+  /// Use this when witness elements fit in machine words (e.g., i64).
+  fn prep_prove_small<C: SpartanCircuit<E>>(
+    pk: &Self::ProverKey,
+    circuit: C,
+  ) -> Result<Self::PrepSNARK, SpartanError>;
+
+  /// Produces proof using standard field arithmetic.
   fn prove<C: SpartanCircuit<E>>(
     pk: &Self::ProverKey,
     circuit: C,
     prep_snark: &Self::PrepSNARK,
-    is_small: bool, // do witness elements fit in machine words?
+  ) -> Result<Self, SpartanError>;
+
+  /// Produces proof using small-value optimization.
+  /// Use this when witness elements fit in machine words (e.g., i64).
+  fn prove_small<C: SpartanCircuit<E>>(
+    pk: &Self::ProverKey,
+    circuit: C,
+    prep_snark: &Self::PrepSNARK,
   ) -> Result<Self, SpartanError>;
 
   /// Verifies a SNARK for a relaxed R1CS and returns the public IO

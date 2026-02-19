@@ -169,6 +169,62 @@ where
   Ok((Us, Ws, ell_b, tau, rhos))
 }
 
+/// Native NIFS setup: padding, transcript absorption (converting small to field inline), tau/rhos squeezing.
+///
+/// Unlike `prepare_nifs_inputs`, this takes small-value instances and returns them unchanged.
+/// Field conversion happens inline during transcript absorption only.
+fn prepare_nifs_inputs_native<E: Engine, W: Clone + Copy>(
+  Us: &[R1CSInstance<E, W>],
+  Ws: &[R1CSWitness<E, W>],
+  transcript: &mut E::TE,
+) -> Result<
+  (
+    Vec<R1CSInstance<E, W>>, // Padded Us (still small)
+    Vec<R1CSWitness<E, W>>,  // Padded Ws (still small)
+    usize,                   // ell_b
+    E::Scalar,               // tau
+    Vec<E::Scalar>,          // rhos
+  ),
+  SpartanError,
+>
+where
+  E::PCS: FoldingEngineTrait<E>,
+  E::Scalar: SmallValueField<W>,
+{
+  let n = Us.len();
+  let n_padded = n.next_power_of_two();
+  let ell_b = n_padded.log_2();
+
+  info!(
+    "NeutronNova NIFS prove_native for {} instances padded to {}",
+    n, n_padded
+  );
+
+  let mut Us = Us.to_vec();
+  let mut Ws = Ws.to_vec();
+  if Us.len() < n_padded {
+    Us.extend(vec![Us[0].clone(); n_padded - n]);
+    Ws.extend(vec![Ws[0].clone(); n_padded - n]);
+  }
+
+  // Absorb - convert to field inline for hashing only
+  for U in Us.iter() {
+    transcript.absorb(b"comm_W", &U.comm_W);
+    // Convert small X values to field for absorption
+    for x in U.X.iter() {
+      transcript.absorb(b"x", &E::Scalar::small_to_field(*x));
+    }
+  }
+  transcript.absorb(b"T", &E::Scalar::ZERO);
+
+  let tau = transcript.squeeze(b"tau")?;
+  let rhos: Vec<_> = (0..ell_b)
+    .map(|_| transcript.squeeze(b"rho"))
+    .collect::<Result<_, _>>()?;
+
+  Ok((Us, Ws, ell_b, tau, rhos)) // Returns SMALL instances
+}
+
 /// Fold witnesses and instances, update VC with T_out and eq values.
 fn fold_and_update_vc<E: Engine>(
   r_bs: &[E::Scalar],
@@ -268,7 +324,6 @@ where
   let folded_W = R1CSWitness {
     W: folded_W_vec,
     r_W: folded_r_W,
-    is_small: false, // After folding with random challenges, no longer small
   };
   info!(elapsed_ms = %fold_t.elapsed().as_millis(), "fold_witnesses");
 
@@ -279,10 +334,7 @@ where
     &Us.iter().map(|u| u.comm_W.clone()).collect::<Vec<_>>(),
     &w,
   )?;
-  let folded_U = R1CSInstance {
-    X: folded_X,
-    comm_W: comm_W_acc,
-  };
+  let folded_U = R1CSInstance::new_unchecked(comm_W_acc, folded_X)?;
   info!(elapsed_ms = %fold_t.elapsed().as_millis(), "fold_instances");
 
   Ok((folded_W, folded_U))
@@ -320,6 +372,68 @@ where
       <E::Scalar as DelayedReduction<SV>>::reduce(&acc)
     })
     .collect()
+}
+
+/// Fold native small-value witnesses and instances, update VC.
+///
+/// Takes i32 witnesses/instances directly (from SmallCS synthesis).
+/// Converts to field only at the end for the folded output.
+fn fold_and_update_vc_native<E, W>(
+  r_bs: &[E::Scalar],
+  T_cur: E::Scalar,
+  acc_eq: E::Scalar,
+  ws_small: &[Vec<W>],           // i32 witnesses
+  xs_small: &[Vec<W>],           // i32 inputs
+  Us: &[R1CSInstance<E, W>],     // i32 instances (for commitments)
+  Ws: &[R1CSWitness<E, W>],      // i32 witnesses (for blinding)
+  ell_b: usize,
+  vc: &mut NeutronNovaVerifierCircuit<E>,
+  vc_state: &mut <SatisfyingAssignment<E> as MultiRoundSpartanWitness<E>>::MultiRoundState,
+  vc_shape: &SplitMultiRoundR1CSShape<E>,
+  vc_ck: &CommitmentKey<E>,
+  transcript: &mut E::TE,
+) -> Result<(R1CSWitness<E>, R1CSInstance<E>), SpartanError>
+where
+  E: Engine,
+  E::Scalar: DelayedReduction<W>,
+  E::PCS: FoldingEngineTrait<E>,
+  W: Clone + Send + Sync,
+{
+  use crate::r1cs::weights_from_r;
+
+  // T_out = poly_last(r_last) / eq(r_b, rho)
+  let T_out = T_cur * acc_eq.invert().into_option().ok_or(SpartanError::ProofVerifyError {
+    reason: "acc_eq is zero".to_string(),
+  })?;
+  vc.t_out_step = T_out;
+  vc.eq_rho_at_rb = acc_eq;
+  SatisfyingAssignment::<E>::process_round(vc_state, vc_shape, vc_ck, vc, ell_b, transcript)?;
+
+  // Compute weights once for all folding operations
+  let w = weights_from_r::<E::Scalar>(r_bs, Us.len());
+
+  // Fold witnesses using small-value optimization (i32 → field)
+  let (_fold_span, fold_t) = start_span!("fold_witnesses");
+  let r_Ws: Vec<_> = Ws.iter().map(|w| w.r_W.clone()).collect();
+  let folded_W_vec = fold_small_value_vectors(&w, ws_small);
+  let folded_r_W = <E::PCS as FoldingEngineTrait<E>>::fold_blinds(&r_Ws, &w)?;
+  let folded_W = R1CSWitness {
+    W: folded_W_vec,
+    r_W: folded_r_W,
+  };
+  info!(elapsed_ms = %fold_t.elapsed().as_millis(), "fold_witnesses");
+
+  // Fold instances using small-value optimization for X (i32 → field), group ops for commitments
+  let (_fold_span, fold_t) = start_span!("fold_instances");
+  let folded_X = fold_small_value_vectors(&w, xs_small);
+  let comm_W_acc = <E::PCS as FoldingEngineTrait<E>>::fold_commitments(
+    &Us.iter().map(|u| u.comm_W.clone()).collect::<Vec<_>>(),
+    &w,
+  )?;
+  let folded_U = R1CSInstance::new_unchecked(comm_W_acc, folded_X)?;
+  info!(elapsed_ms = %fold_t.elapsed().as_millis(), "fold_instances");
+
+  Ok((folded_W, folded_U))
 }
 
 impl<E: Engine> NeutronNovaNIFS<E>
@@ -675,6 +789,150 @@ where
     Ok((E_eq, az_folded, bz_folded, cz_folded, folded_W, folded_U))
   }
 
+  /// Pure native arithmetic NIFS prove.
+  ///
+  /// Takes small witnesses/instances directly from SmallCS synthesis.
+  /// Uses pure native i32 × i32 → i64 for matrix-vector multiply.
+  /// Field conversion only at final fold output.
+  ///
+  /// # Type Parameters
+  /// - `W`: Witness value type (typically i32)
+  /// - `Acc`: Accumulator type for linear combinations (typically i64)
+  /// - `C`: Coefficient type in the shape matrix (typically i32)
+  ///
+  /// # Arguments
+  /// - `S`: R1CS shape with small coefficients
+  /// - `Us`: Small-value instances (public inputs as i32)
+  /// - `Ws`: Small-value witnesses (witness values as i32)
+  ///
+  /// # Returns
+  /// (E_eq, Az folded, Bz folded, Cz folded, folded witness, folded instance)
+  pub fn prove_native<W, Acc, C>(
+    S: &SplitR1CSShape<E, C>,
+    Us: &[R1CSInstance<E, W>],
+    Ws: &[R1CSWitness<E, W>],
+    vc: &mut NeutronNovaVerifierCircuit<E>,
+    vc_state: &mut <SatisfyingAssignment<E> as MultiRoundSpartanWitness<E>>::MultiRoundState,
+    vc_shape: &SplitMultiRoundR1CSShape<E>,
+    vc_ck: &CommitmentKey<E>,
+    transcript: &mut E::TE,
+  ) -> Result<
+    (
+      Vec<E::Scalar>,  // E_eq (split evals, length left+right)
+      Vec<E::Scalar>,  // Az folded
+      Vec<E::Scalar>,  // Bz folded
+      Vec<E::Scalar>,  // Cz folded
+      R1CSWitness<E>,  // folded witness (field)
+      R1CSInstance<E>, // folded instance (field)
+    ),
+    SpartanError,
+  >
+  where
+    W: crate::small_r1cs::Witness + Copy + Clone + Send + Sync,
+    Acc: crate::small_r1cs::Accumulator + WideMul + Copy + Clone + Send + Sync,
+    <Acc as WideMul>::Product: Copy + Ord + num_traits::Signed
+      + std::ops::Div<Output = <Acc as WideMul>::Product>
+      + std::ops::Mul<Output = <Acc as WideMul>::Product>
+      + num_traits::One + From<i32>,
+    C: crate::small_r1cs::WideningMul<W, Acc> + Copy + Clone + Send + Sync,
+    E::Scalar: SmallValueField<W> + SmallValueField<Acc>
+      + DelayedReduction<W> + DelayedReduction<Acc>
+      + DelayedReduction<<Acc as WideMul>::Product> + DelayedReduction<E::Scalar>,
+  {
+    let (_nifs_total_span, _nifs_total_t) = start_span!("nifs_prove_native");
+
+    // === NATIVE SETUP (keeps small types) ===
+    let (Us, Ws, ell_b, tau, rhos) = prepare_nifs_inputs_native::<E, W>(Us, Ws, transcript)?;
+    let n_padded = Us.len();
+
+    // === EXTRACT SMALL VECTORS (already i32, no conversion) ===
+    let ws_small: Vec<Vec<W>> = Ws.iter().map(|w| w.W.clone()).collect();
+    let xs_small: Vec<Vec<W>> = Us.iter().map(|u| u.X.clone()).collect();
+
+    // === TENSOR DECOMPOSITION ===
+    let (ell_cons, left, right) = compute_tensor_decomp(S.num_cons);
+    let E_eq = PowPolynomial::split_evals(tau, ell_cons, left, right);
+
+    // === MATRIX-VECTOR MULTIPLY (pure native: i32 × i32 → i64) ===
+    let (_matrix_span, matrix_t) =
+      start_span!("matrix_vector_multiply_native", instances = n_padded);
+
+    let smalls: Vec<(Vec<Acc>, Vec<Acc>, Vec<Acc>)> = (0..n_padded)
+      .into_par_iter()
+      .map(|i| {
+        let z_small = build_z_small(&ws_small[i], &xs_small[i]);
+        let (mut az, mut bz, mut cz) = S.multiply_vec_widening::<W, Acc>(&z_small)?;
+        // Pad to num_cons (power of two) - sumcheck expects padded vectors
+        az.resize(S.num_cons, Acc::zero());
+        bz.resize(S.num_cons, Acc::zero());
+        cz.resize(S.num_cons, Acc::zero());
+        Ok((az, bz, cz))
+      })
+      .collect::<Result<Vec<_>, SpartanError>>()?;
+
+    // Unzip into separate layer vectors
+    let (a_small, b_small, c_small): (Vec<Vec<Acc>>, Vec<Vec<Acc>>, Vec<Vec<Acc>>) =
+      smalls.into_iter().fold(
+        (
+          Vec::with_capacity(n_padded),
+          Vec::with_capacity(n_padded),
+          Vec::with_capacity(n_padded),
+        ),
+        |(mut a, mut b, mut c), (az, bz, cz)| {
+          a.push(az);
+          b.push(bz);
+          c.push(cz);
+          (a, b, c)
+        },
+      );
+    info!(
+      elapsed_ms = %matrix_t.elapsed().as_millis(),
+      instances = n_padded,
+      "matrix_vector_multiply_native"
+    );
+
+    // === SMALL-VALUE SUMCHECK (with pre-computed E_eq) ===
+    let (_nifs_rounds_span, nifs_rounds_t) = start_span!("nifs_folding_rounds", rounds = ell_b);
+    let (_polys, r_bs, T_cur, acc_eq) = Self::prove_neutronnova_small_value_sumcheck(
+      &a_small, &b_small, &E_eq, left, right, &rhos, vc, vc_state, vc_shape, vc_ck, transcript,
+    )?;
+    info!(
+      elapsed_ms = %nifs_rounds_t.elapsed().as_millis(),
+      rounds = ell_b,
+      "nifs_folding_rounds"
+    );
+
+    // === EQ-WEIGHTED FOLD (in i64 land) ===
+    let (_fold_span, fold_t) = start_span!("nifs_eq_fold");
+    let r_bs_rev: Vec<_> = r_bs.iter().rev().cloned().collect();
+    let eq_evals = EqPolynomial::evals_from_points(&r_bs_rev);
+    let num_cons = a_small[0].len();
+
+    let (az_folded, (bz_folded, cz_folded)) = rayon::join(
+      || small_value_eq_weighted_fold::<E, Acc>(&eq_evals, &a_small, num_cons),
+      || {
+        rayon::join(
+          || small_value_eq_weighted_fold::<E, Acc>(&eq_evals, &b_small, num_cons),
+          || small_value_eq_weighted_fold::<E, Acc>(&eq_evals, &c_small, num_cons),
+        )
+      },
+    );
+    info!(elapsed_ms = %fold_t.elapsed().as_millis(), "nifs_eq_fold");
+
+    // === FOLD WITNESSES/INSTANCES (i32 → field at the end) ===
+    let (folded_W, folded_U) = fold_and_update_vc_native::<E, W>(
+      &r_bs, T_cur, acc_eq, &ws_small, &xs_small, &Us, &Ws, ell_b, vc, vc_state, vc_shape, vc_ck,
+      transcript,
+    )?;
+
+    info!(
+      elapsed_ms = %_nifs_total_t.elapsed().as_millis(),
+      "nifs_prove_native"
+    );
+
+    Ok((E_eq, az_folded, bz_folded, cz_folded, folded_W, folded_U))
+  }
+
   /// Field-based NIFS prove (vanilla path).
   ///
   /// Performs NIFS folding using standard field arithmetic.
@@ -903,20 +1161,24 @@ where
 }
 
 /// A type that represents the prover's key
+///
+/// Generic over coefficient type `C`, which defaults to `E::Scalar` for backwards compatibility.
+/// - `NeutronNovaProverKey<E>` uses field coefficients (standard path)
+/// - `NeutronNovaProverKey<E, i32>` uses small coefficients (pure native arithmetic path)
 #[derive(Serialize, Deserialize)]
-#[serde(bound = "")]
-pub struct NeutronNovaProverKey<E: Engine> {
+#[serde(bound = "C: Clone + std::fmt::Debug + PartialEq + Eq + Serialize + for<'a> Deserialize<'a>")]
+pub struct NeutronNovaProverKey<E: Engine, C: Clone = <E as Engine>::Scalar> {
   /// Commitment key
   pub ck: CommitmentKey<E>,
-  /// Step circuit R1CS shape
-  pub S_step: SplitR1CSShape<E>,
-  /// Core circuit R1CS shape
-  pub S_core: SplitR1CSShape<E>,
+  /// Step circuit R1CS shape (generic over coefficient type)
+  pub S_step: SplitR1CSShape<E, C>,
+  /// Core circuit R1CS shape (generic over coefficient type)
+  pub S_core: SplitR1CSShape<E, C>,
   /// Digest of the verifier's key
   pub vk_digest: SpartanDigest,
-  /// Verifier circuit multi-round shape
+  /// Verifier circuit multi-round shape (always uses field coefficients)
   pub vc_shape: SplitMultiRoundR1CSShape<E>,
-  /// Verifier circuit regular shape
+  /// Verifier circuit regular shape (always uses field coefficients)
   pub vc_shape_regular: R1CSShape<E>,
   /// Verifier circuit commitment key
   pub vc_ck: CommitmentKey<E>,
@@ -1058,12 +1320,30 @@ where
     Ok((pk, vk))
   }
 
-  /// Prepares the pre-processed state for proving
+  /// Prepares the pre-processed state for proving using standard field arithmetic.
   pub fn prep_prove<C1: SpartanCircuit<E>, C2: SpartanCircuit<E>>(
     pk: &NeutronNovaProverKey<E>,
     step_circuits: &[C1],
     core_circuit: &C2,
-    is_small: bool, // do witness elements fit in machine words?
+  ) -> Result<NeutronNovaPrepZkSNARK<E>, SpartanError> {
+    Self::prep_prove_internal(pk, step_circuits, core_circuit, false)
+  }
+
+  /// Prepares the pre-processed state for proving using small-value optimization.
+  pub fn prep_prove_small<C1: SpartanCircuit<E>, C2: SpartanCircuit<E>>(
+    pk: &NeutronNovaProverKey<E>,
+    step_circuits: &[C1],
+    core_circuit: &C2,
+  ) -> Result<NeutronNovaPrepZkSNARK<E>, SpartanError> {
+    Self::prep_prove_internal(pk, step_circuits, core_circuit, true)
+  }
+
+  /// Internal prep_prove implementation with is_small parameter.
+  fn prep_prove_internal<C1: SpartanCircuit<E>, C2: SpartanCircuit<E>>(
+    pk: &NeutronNovaProverKey<E>,
+    step_circuits: &[C1],
+    core_circuit: &C2,
+    is_small: bool,
   ) -> Result<NeutronNovaPrepZkSNARK<E>, SpartanError> {
     let (_prep_span, prep_t) = start_span!("neutronnova_prep_prove");
 
@@ -1110,13 +1390,45 @@ where
     })
   }
 
-  /// Prove the folding of a batch of R1CS instances and a core circuit that connects them together
+  /// Prove the folding of a batch of R1CS instances using standard field arithmetic.
   pub fn prove<C1: SpartanCircuit<E>, C2: SpartanCircuit<E>>(
     pk: &NeutronNovaProverKey<E>,
     step_circuits: &[C1],
     core_circuit: &C2,
     prep_snark: &NeutronNovaPrepZkSNARK<E>,
-    is_small: bool, // do witness elements fit in machine words?
+  ) -> Result<Self, SpartanError>
+  where
+    E::Scalar: SmallValueField<i64>
+      + DelayedReduction<i64>
+      + DelayedReduction<i128>
+      + DelayedReduction<E::Scalar>,
+  {
+    Self::prove_internal(pk, step_circuits, core_circuit, prep_snark, false)
+  }
+
+  /// Prove the folding of a batch of R1CS instances using small-value optimization.
+  pub fn prove_small<C1: SpartanCircuit<E>, C2: SpartanCircuit<E>>(
+    pk: &NeutronNovaProverKey<E>,
+    step_circuits: &[C1],
+    core_circuit: &C2,
+    prep_snark: &NeutronNovaPrepZkSNARK<E>,
+  ) -> Result<Self, SpartanError>
+  where
+    E::Scalar: SmallValueField<i64>
+      + DelayedReduction<i64>
+      + DelayedReduction<i128>
+      + DelayedReduction<E::Scalar>,
+  {
+    Self::prove_internal(pk, step_circuits, core_circuit, prep_snark, true)
+  }
+
+  /// Internal prove implementation with is_small parameter.
+  fn prove_internal<C1: SpartanCircuit<E>, C2: SpartanCircuit<E>>(
+    pk: &NeutronNovaProverKey<E>,
+    step_circuits: &[C1],
+    core_circuit: &C2,
+    prep_snark: &NeutronNovaPrepZkSNARK<E>,
+    is_small: bool,
   ) -> Result<Self, SpartanError>
   where
     E::Scalar: SmallValueField<i64>
@@ -1903,8 +2215,13 @@ mod tests {
       step_circuits.len()
     );
 
-    let ps = NeutronNovaZkSNARK::<E>::prep_prove(pk, step_circuits, core_circuit, true).unwrap();
-    let res = NeutronNovaZkSNARK::prove(pk, step_circuits, core_circuit, &ps, is_small);
+    let res = if is_small {
+      let ps = NeutronNovaZkSNARK::<E>::prep_prove_small(pk, step_circuits, core_circuit).unwrap();
+      NeutronNovaZkSNARK::prove_small(pk, step_circuits, core_circuit, &ps)
+    } else {
+      let ps = NeutronNovaZkSNARK::<E>::prep_prove(pk, step_circuits, core_circuit).unwrap();
+      NeutronNovaZkSNARK::prove(pk, step_circuits, core_circuit, &ps)
+    };
     assert!(res.is_ok());
 
     let snark = res.unwrap();
@@ -2034,12 +2351,10 @@ mod tests {
       })
       .collect();
 
-    // Prep once with is_small=true (can be shared between both prove paths)
-    let ps = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &circuits[0], true).unwrap();
-
     // Verify vanilla path works
     {
-      let snark_v = NeutronNovaZkSNARK::prove(&pk, &circuits, &circuits[0], &ps, false)
+      let ps = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &circuits[0]).unwrap();
+      let snark_v = NeutronNovaZkSNARK::prove(&pk, &circuits, &circuits[0], &ps)
         .expect("vanilla prove should succeed");
       let res_v = snark_v.verify(&vk, circuits.len());
       assert!(
@@ -2051,7 +2366,8 @@ mod tests {
 
     // Verify small-value path works
     {
-      let snark_s = NeutronNovaZkSNARK::prove(&pk, &circuits, &circuits[0], &ps, true)
+      let ps = NeutronNovaZkSNARK::<E>::prep_prove_small(&pk, &circuits, &circuits[0]).unwrap();
+      let snark_s = NeutronNovaZkSNARK::prove_small(&pk, &circuits, &circuits[0], &ps)
         .expect("small-value prove should succeed");
       let res_s = snark_s.verify(&vk, circuits.len());
       assert!(
@@ -2101,19 +2417,17 @@ mod tests {
     // Create circuit instances (all identical for this test)
     let circuits: Vec<_> = (0..num_circuits).map(|_| circuit.clone()).collect();
 
-    // Prep once with is_small=true (can be shared between both prove paths)
-    let ps = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &circuits[0], true).unwrap();
-
     // Helper to test prove and verify
     #[allow(clippy::expect_fun_call)]
-    let assert_prove_and_verify = |is_small: bool, path_name: &str| {
-      let snark = NeutronNovaZkSNARK::prove(&pk, &circuits, &circuits[0], &ps, is_small).expect(
-        &format!("{path_name} prove should succeed for num_circuits={num_circuits}"),
+    let assert_prove_and_verify_regular = || {
+      let ps = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &circuits[0]).unwrap();
+      let snark = NeutronNovaZkSNARK::prove(&pk, &circuits, &circuits[0], &ps).expect(
+        &format!("regular prove should succeed for num_circuits={num_circuits}"),
       );
       let res = snark.verify(&vk, circuits.len());
       assert!(
         res.is_ok(),
-        "{path_name} proof should verify for num_circuits={num_circuits}: {:?}",
+        "regular proof should verify for num_circuits={num_circuits}: {:?}",
         res.err()
       );
       let (public_values, _) = res.unwrap();
@@ -2126,13 +2440,40 @@ mod tests {
         assert_eq!(
           pv,
           &[expected_output],
-          "{path_name} path: circuit {i} output mismatch for num_circuits={num_circuits}"
+          "regular path: circuit {i} output mismatch for num_circuits={num_circuits}"
         );
       }
     };
 
-    assert_prove_and_verify(false, "regular");
-    assert_prove_and_verify(true, "small-value");
+    #[allow(clippy::expect_fun_call)]
+    let assert_prove_and_verify_small = || {
+      let ps = NeutronNovaZkSNARK::<E>::prep_prove_small(&pk, &circuits, &circuits[0]).unwrap();
+      let snark = NeutronNovaZkSNARK::prove_small(&pk, &circuits, &circuits[0], &ps).expect(
+        &format!("small-value prove should succeed for num_circuits={num_circuits}"),
+      );
+      let res = snark.verify(&vk, circuits.len());
+      assert!(
+        res.is_ok(),
+        "small-value proof should verify for num_circuits={num_circuits}: {:?}",
+        res.err()
+      );
+      let (public_values, _) = res.unwrap();
+      assert_eq!(
+        public_values.len(),
+        num_circuits,
+        "should have {num_circuits} public values"
+      );
+      for (i, pv) in public_values.iter().enumerate() {
+        assert_eq!(
+          pv,
+          &[expected_output],
+          "small-value path: circuit {i} output mismatch for num_circuits={num_circuits}"
+        );
+      }
+    };
+
+    assert_prove_and_verify_regular();
+    assert_prove_and_verify_small();
   }
 
   /// Test that NIFS sumcheck polynomial generation produces identical results
@@ -2153,8 +2494,8 @@ mod tests {
     let (pk, _vk) = NeutronNovaZkSNARK::<E>::setup(&circuit, &circuit, num_instances).unwrap();
     let circuits: Vec<_> = (0..num_instances).map(|_| circuit.clone()).collect();
 
-    // 2. Generate witnesses using prep_prove
-    let ps = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &circuits[0], true).unwrap();
+    // 2. Generate witnesses using prep_prove_small (for small-value optimization test)
+    let ps = NeutronNovaZkSNARK::<E>::prep_prove_small(&pk, &circuits, &circuits[0]).unwrap();
 
     // 3. Synthesize full instances and witnesses
     let mut instances_witnesses: Vec<(R1CSInstance<E>, R1CSWitness<E>)> = Vec::new();
@@ -2385,5 +2726,174 @@ mod tests {
     for num_instances in [2, 3, 4, 5, 7, 8, 16] {
       run_nifs_sumcheck_polynomial_equivalence_test::<E>(num_instances);
     }
+  }
+
+  /// Test that prove_native produces valid output with small-value types.
+  ///
+  /// This test:
+  /// 1. Uses a simple SmallCS circuit (multiplication)
+  /// 2. Creates SplitR1CSShape<E, i32> from it
+  /// 3. Creates small-value witnesses and instances
+  /// 4. Sets up the VC infrastructure
+  /// 5. Calls prove_native and verifies the output
+  #[test]
+  fn test_prove_native_basic() {
+    use crate::math::Math;
+    use crate::small_field::SmallValueField;
+    use crate::small_r1cs::{SmallCS, SmallConstraintSystem};
+
+    let _ = tracing_subscriber::fmt()
+      .with_target(false)
+      .with_ansi(true)
+      .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+      .try_init();
+
+    type E = T256HyraxEngine;
+
+    // Create a simple circuit using SmallCS: x * y = z
+    // We'll create 4 instances with different values
+    let num_instances: usize = 4;
+
+    // Helper to create a circuit with SmallCS
+    fn create_mul_circuit(x: i32, y: i32, z: i32) -> SmallCS<i32, i32> {
+      let mut cs = SmallCS::<i32, i32>::new();
+
+      let x_var = cs.alloc(|| x).unwrap();
+      let y_var = cs.alloc(|| y).unwrap();
+      let z_var = cs.alloc(|| z).unwrap();
+
+      // Constraint: x * y = z
+      cs.enforce(|lc| lc + x_var, |lc| lc + y_var, |lc| lc + z_var);
+
+      // Expose z as public input (so we have 1 public input)
+      let z_pub = cs.alloc_input(|| z).unwrap();
+      cs.enforce(
+        |lc| lc + z_var,
+        |lc| lc + SmallCS::<i32, i32>::one(),
+        |lc| lc + z_pub,
+      );
+
+      cs
+    }
+
+    // Create the shape from the first circuit
+    let template_cs = create_mul_circuit(2, 3, 6);
+    let shape: SplitR1CSShape<E, i32> = template_cs.to_split_r1cs_shape();
+
+    // Create commitment key using SplitR1CSShape::commitment_key
+    // We need a field-based shape for this, so convert from the small shape
+    let shape_field: SplitR1CSShape<E> = SplitR1CSShape::new_simple(
+      shape.num_cons_unpadded,
+      shape.num_rest_unpadded,
+      shape.num_public,
+      shape.A.map_coeffs(|c| <E as Engine>::Scalar::from(c as u64)),
+      shape.B.map_coeffs(|c| <E as Engine>::Scalar::from(c as u64)),
+      shape.C.map_coeffs(|c| <E as Engine>::Scalar::from(c as u64)),
+    );
+    let (ck, _vk_ee) = SplitR1CSShape::commitment_key(&[&shape_field]).unwrap();
+
+    // Create instances with different values
+    let circuits_data = [(2, 3, 6), (3, 4, 12), (5, 6, 30), (7, 8, 56)];
+    let mut witnesses: Vec<R1CSWitness<E, i32>> = Vec::new();
+    let mut instances: Vec<R1CSInstance<E, i32>> = Vec::new();
+
+    for (x, y, z) in circuits_data {
+      let cs = create_mul_circuit(x, y, z);
+
+      let mut W: Vec<i32> = cs.witness_values();
+      let X: Vec<i32> = cs.public_values();
+
+      // Pad witness to match shape.num_rest (power of two)
+      W.resize(shape.num_rest, 0);
+
+      // Convert to field elements for commitment
+      let W_field: Vec<<E as Engine>::Scalar> = W
+        .iter()
+        .map(|&v| <E as Engine>::Scalar::small_to_field(v))
+        .collect();
+
+      // Create blind and commit
+      let r_W = <<E as Engine>::PCS as PCSEngineTrait<E>>::blind(&ck, W_field.len());
+      let comm_W = <<E as Engine>::PCS as PCSEngineTrait<E>>::commit_small(&ck, &W_field, &r_W).unwrap();
+
+      witnesses.push(R1CSWitness { W, r_W });
+      instances.push(R1CSInstance::new_unchecked_generic(comm_W, X));
+    }
+
+    // Set up VC infrastructure
+    let n_padded = num_instances.next_power_of_two();
+    let num_vars = shape.num_shared + shape.num_precommitted + shape.num_rest;
+    let num_rounds_b = n_padded.log_2();
+    let num_rounds_x = shape.num_cons.log_2();
+    let num_rounds_y = num_vars.log_2() + 1;
+
+    let mut vc = NeutronNovaVerifierCircuit::<E>::default(num_rounds_b, num_rounds_x, num_rounds_y);
+    let (vc_shape, vc_ck, _vk_mr) =
+      <ShapeCS<E> as MultiRoundSpartanShape<E>>::multiround_r1cs_shape(&vc).unwrap();
+    let mut vc_state =
+      SatisfyingAssignment::<E>::initialize_multiround_witness(&vc_shape).unwrap();
+
+    // Create transcript
+    let mut transcript = <E as Engine>::TE::new(b"test_prove_native");
+
+    // Call prove_native
+    let result = NeutronNovaNIFS::<E>::prove_native::<i32, i64, i32>(
+      &shape,
+      &instances,
+      &witnesses,
+      &mut vc,
+      &mut vc_state,
+      &vc_shape,
+      &vc_ck,
+      &mut transcript,
+    );
+
+    // Verify the result is Ok
+    assert!(
+      result.is_ok(),
+      "prove_native should succeed: {:?}",
+      result.err()
+    );
+
+    let (E_eq, Az_folded, Bz_folded, Cz_folded, folded_W, folded_U) = result.unwrap();
+
+    // Verify output dimensions
+    let (_ell_cons, left, right) = compute_tensor_decomp(shape.num_cons);
+    assert_eq!(
+      E_eq.len(),
+      left + right,
+      "E_eq should have left+right elements"
+    );
+    assert_eq!(
+      Az_folded.len(),
+      shape.num_cons,
+      "Az should have num_cons elements"
+    );
+    assert_eq!(
+      Bz_folded.len(),
+      shape.num_cons,
+      "Bz should have num_cons elements"
+    );
+    assert_eq!(
+      Cz_folded.len(),
+      shape.num_cons,
+      "Cz should have num_cons elements"
+    );
+
+    // Verify folded witness has correct dimensions
+    assert_eq!(
+      folded_W.W.len(),
+      shape.num_shared + shape.num_precommitted + shape.num_rest,
+      "Folded witness should have num_vars elements"
+    );
+
+    // Verify folded instance has correct dimensions
+    assert_eq!(
+      folded_U.X.len(),
+      shape.num_public,
+      "Folded instance should have num_public elements"
+    );
+
+    println!("prove_native test passed!");
   }
 }

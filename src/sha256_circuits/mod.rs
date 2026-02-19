@@ -8,13 +8,16 @@
 //!
 //! This module provides reusable SHA-256 circuit implementations:
 //! - [`SmallSha256Circuit`]: Single SHA-256 hash (small-value compatible)
-//! - [`SmallSha256ChainCircuit`]: Chains multiple small_sha256 calls
+//! - [`SmallSha256ChainCircuit`]: Chains multiple small_sha256 calls (bellpepper)
+//! - [`NativeSmallSha256ChainCircuit`]: Native i32 synthesis with SmallCS + small_gadgets
 
+mod native_small;
 mod small;
 mod small_chain;
 
-pub use small_chain::SmallSha256ChainCircuit;
+pub use native_small::NativeSmallSha256ChainCircuit;
 pub use small::SmallSha256Circuit;
+pub use small_chain::SmallSha256ChainCircuit;
 
 use bellpepper_core::{
   ConstraintSystem, SynthesisError,

@@ -4,7 +4,10 @@
 //! and i32 witnesses, using the 2-limb addition technique to keep coefficients bounded.
 
 use super::{boolean::Boolean, uint32::UInt32};
-use crate::small_r1cs::{Coefficient, SmallConstraintSystem, SynthesisError, Witness};
+use crate::small_r1cs::{
+    BatchingSmallCS, Coefficient, SmallConstraintSystem, SmallMultiEqCS, SmallCS, SynthesisError,
+    Witness,
+};
 
 /// SHA-256 round constants (first 32 bits of fractional parts of cube roots of first 64 primes).
 const K: [u32; 64] = [
@@ -141,6 +144,145 @@ where
     Ok(())
 }
 
+// ========================================
+// Batched SHA-256 (uses BatchingSmallCS<17>)
+// ========================================
+
+/// Compute SHA-256 hash with batching for reduced constraint count.
+///
+/// Uses `BatchingSmallCS<12>` internally with 2-limb addition for optimal
+/// i32 coefficient bounds. This achieves significant constraint reduction
+/// compared to the non-batched version.
+///
+/// # Coefficient Bounds
+///
+/// For 5 operands: ceil(log2(5)) + 1 = 4 carry bits
+/// - 2-limb addition: max coefficient 2^(16+3) = 2^19
+/// - With BatchingSmallCS<12>: 2^19 × 2^11 = 2^30 < 2^31 ✓
+///
+/// # Efficiency
+///
+/// - Non-batched: 2 equality constraints per addition
+/// - Batched (K=12): 2/12 ≈ 0.167 equality constraints per addition
+/// - Savings: ~83% reduction in equality constraints
+pub fn small_sha256_batched<W, C>(
+    cs: &mut SmallCS<W, C>,
+    input: &[Boolean<W, C>],
+) -> Result<Vec<Boolean<W, C>>, SynthesisError>
+where
+    W: Witness,
+    C: Coefficient + From<i32>,
+{
+    // Pad the input
+    let padded = sha256_padding(input);
+    let num_blocks = padded.len() / 512;
+
+    // Initialize hash state with IV
+    let mut h: [UInt32<W, C>; 8] = IV.map(UInt32::constant);
+
+    // Process each 512-bit block with batching
+    {
+        let mut batched = BatchingSmallCS::<W, C, 12>::new(cs);
+
+        for block_idx in 0..num_blocks {
+            let block_start = block_idx * 512;
+            let block_bits = &padded[block_start..block_start + 512];
+            sha256_compression_batched(&mut batched, &mut h, block_bits)?;
+        }
+    } // Drop flushes pending constraints
+
+    // Collect output bits (big-endian)
+    let mut output = Vec::with_capacity(256);
+    for h_i in h {
+        let be_bits = h_i.into_bits_be();
+        output.extend(be_bits);
+    }
+
+    Ok(output)
+}
+
+/// SHA-256 compression function with batching.
+///
+/// Uses `add_many_batched` which requires a CS implementing `SmallMultiEqCS`.
+/// This allows the equality constraints from addition to be batched together.
+pub fn sha256_compression_batched<W, C, CS>(
+    cs: &mut CS,
+    h: &mut [UInt32<W, C>; 8],
+    block: &[Boolean<W, C>],
+) -> Result<(), SynthesisError>
+where
+    W: Witness,
+    C: Coefficient + From<i32>,
+    CS: SmallConstraintSystem<W, C> + SmallMultiEqCS<W, C>,
+{
+    assert_eq!(block.len(), 512, "Block must be 512 bits");
+
+    // Parse block into 16 32-bit words
+    let mut w: Vec<UInt32<W, C>> = Vec::with_capacity(64);
+    for i in 0..16 {
+        let bits: [Boolean<W, C>; 32] = std::array::from_fn(|j| {
+            // Big-endian: first bit of word is MSB
+            block[i * 32 + (31 - j)].clone()
+        });
+        w.push(UInt32::from_bits_le(bits));
+    }
+
+    // Extend to 64 words using message schedule
+    for i in 16..64 {
+        // w[i] = σ1(w[i-2]) + w[i-7] + σ0(w[i-15]) + w[i-16]
+        let s0 = w[i - 15].sha256_sigma0(cs)?;
+        let s1 = w[i - 2].sha256_sigma1(cs)?;
+        let wi = UInt32::add_many_batched(cs, &[s1, w[i - 7].clone(), s0, w[i - 16].clone()])?;
+        w.push(wi);
+    }
+
+    // Initialize working variables
+    let mut a = h[0].clone();
+    let mut b = h[1].clone();
+    let mut c = h[2].clone();
+    let mut d = h[3].clone();
+    let mut e = h[4].clone();
+    let mut f = h[5].clone();
+    let mut g = h[6].clone();
+    let mut hh = h[7].clone();
+
+    // 64 rounds
+    for i in 0..64 {
+        // T1 = h + Σ1(e) + Ch(e,f,g) + K[i] + W[i]
+        let sum1_e = e.sha256_sum1(cs)?;
+        let ch_efg = UInt32::sha256_ch(cs, &e, &f, &g)?;
+        let k_i = UInt32::constant(K[i]);
+        let t1 = UInt32::add_many_batched(cs, &[hh.clone(), sum1_e, ch_efg, k_i, w[i].clone()])?;
+
+        // T2 = Σ0(a) + Maj(a,b,c)
+        let sum0_a = a.sha256_sum0(cs)?;
+        let maj_abc = UInt32::sha256_maj(cs, &a, &b, &c)?;
+        let t2 = UInt32::add_many_batched(cs, &[sum0_a, maj_abc])?;
+
+        // Update working variables
+        hh = g;
+        g = f;
+        f = e;
+        e = UInt32::add_many_batched(cs, &[d.clone(), t1.clone()])?;
+        d = c;
+        c = b;
+        b = a;
+        a = UInt32::add_many_batched(cs, &[t1, t2])?;
+    }
+
+    // Add working variables to hash state
+    h[0] = UInt32::add_many_batched(cs, &[h[0].clone(), a])?;
+    h[1] = UInt32::add_many_batched(cs, &[h[1].clone(), b])?;
+    h[2] = UInt32::add_many_batched(cs, &[h[2].clone(), c])?;
+    h[3] = UInt32::add_many_batched(cs, &[h[3].clone(), d])?;
+    h[4] = UInt32::add_many_batched(cs, &[h[4].clone(), e])?;
+    h[5] = UInt32::add_many_batched(cs, &[h[5].clone(), f])?;
+    h[6] = UInt32::add_many_batched(cs, &[h[6].clone(), g])?;
+    h[7] = UInt32::add_many_batched(cs, &[h[7].clone(), hh])?;
+
+    Ok(())
+}
+
 /// Apply SHA-256 padding to input bits.
 ///
 /// Padding: append 1 bit, then 0s, then 64-bit length (big-endian).
@@ -215,7 +357,6 @@ pub fn bits_to_bytes<W: Witness, C: Coefficient>(bits: &[Boolean<W, C>]) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::small_r1cs::SmallCS;
     use sha2::{Digest, Sha256};
 
     #[test]
@@ -305,5 +446,88 @@ mod tests {
         let fifty_six_bytes = vec![Boolean::<i32, i32>::constant(false); 448];
         let padded = sha256_padding(&fifty_six_bytes);
         assert_eq!(padded.len(), 1024);
+    }
+
+    // ========================================
+    // Tests for batched SHA-256
+    // ========================================
+
+    #[test]
+    fn test_sha256_batched_empty() {
+        let mut cs = SmallCS::<i32, i32>::new();
+
+        let input: Vec<Boolean<i32, i32>> = vec![];
+        let output = small_sha256_batched(&mut cs, &input).unwrap();
+
+        let output_bytes = bits_to_bytes(&output);
+
+        // Compare with native SHA-256
+        let expected = Sha256::digest(b"");
+        assert_eq!(&output_bytes[..], &expected[..]);
+        assert!(cs.is_satisfied::<i64>());
+    }
+
+    #[test]
+    fn test_sha256_batched_abc() {
+        let mut cs = SmallCS::<i32, i32>::new();
+
+        let input = bytes_to_bits::<i32, i32>(b"abc");
+        let output = small_sha256_batched(&mut cs, &input).unwrap();
+
+        let output_bytes = bits_to_bytes(&output);
+
+        // Compare with native SHA-256
+        let expected = Sha256::digest(b"abc");
+        assert_eq!(&output_bytes[..], &expected[..]);
+        assert!(cs.is_satisfied::<i64>());
+
+        println!("Batched SHA-256 constraints: {}", cs.num_constraints());
+    }
+
+    #[test]
+    fn test_sha256_batched_longer() {
+        let mut cs = SmallCS::<i32, i32>::new();
+
+        let msg = b"The quick brown fox jumps over the lazy dog";
+        let input = bytes_to_bits::<i32, i32>(msg);
+        let output = small_sha256_batched(&mut cs, &input).unwrap();
+
+        let output_bytes = bits_to_bytes(&output);
+
+        // Compare with native SHA-256
+        let expected = Sha256::digest(msg);
+        assert_eq!(&output_bytes[..], &expected[..]);
+        assert!(cs.is_satisfied::<i64>());
+    }
+
+    #[test]
+    fn test_sha256_constraint_count_comparison() {
+        // Compare constraint counts between non-batched and batched
+        let mut cs_nobatch = SmallCS::<i32, i32>::new();
+        let mut cs_batched = SmallCS::<i32, i32>::new();
+
+        let input_nobatch = bytes_to_bits::<i32, i32>(b"abc");
+        let input_batched = bytes_to_bits::<i32, i32>(b"abc");
+
+        let _output_nobatch = small_sha256(&mut cs_nobatch, &input_nobatch).unwrap();
+        let _output_batched = small_sha256_batched(&mut cs_batched, &input_batched).unwrap();
+
+        let constraints_nobatch = cs_nobatch.num_constraints();
+        let constraints_batched = cs_batched.num_constraints();
+
+        println!("Non-batched SHA-256 constraints: {}", constraints_nobatch);
+        println!("Batched SHA-256 constraints:     {}", constraints_batched);
+        println!(
+            "Reduction: {:.1}%",
+            100.0 * (1.0 - constraints_batched as f64 / constraints_nobatch as f64)
+        );
+
+        // Batched should have significantly fewer constraints
+        assert!(
+            constraints_batched < constraints_nobatch,
+            "Batched should have fewer constraints"
+        );
+        assert!(cs_nobatch.is_satisfied::<i64>());
+        assert!(cs_batched.is_satisfied::<i64>());
     }
 }

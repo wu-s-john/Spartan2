@@ -309,7 +309,10 @@ macro_rules! impl_traits {
         bases: &[Self::AffineGroupElement],
         use_parallelism_internally: bool,
       ) -> Result<Self, $crate::errors::SpartanError> {
-        msm_small(scalars, bases, use_parallelism_internally)
+        // Use msm_generic with u64 scalars for compile-time MAX_BITS algorithm selection.
+        // First convert T to u64, then use msm_generic which avoids runtime bit scanning.
+        let scalars_u64: Vec<u64> = scalars.iter().map(|s| (*s).into()).collect();
+        msm_generic(&scalars_u64, bases, use_parallelism_internally)
       }
     }
   };

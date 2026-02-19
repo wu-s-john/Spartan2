@@ -80,7 +80,11 @@ impl<E: Engine> TestSpartanWitness<E> for SatisfyingAssignment<E> {
     is_small: bool,
   ) -> Result<(R1CSInstance<E>, R1CSWitness<E>), SpartanError> {
     let (_witness_span, witness_t) = start_span!("create_r1cs_witness");
-    let (W, comm_W) = R1CSWitness::<E>::new(ck, shape, &mut self.aux_assignment, is_small)?;
+    let (W, comm_W) = if is_small {
+      R1CSWitness::<E>::new_small(ck, shape, &mut self.aux_assignment)?
+    } else {
+      R1CSWitness::<E>::new(ck, shape, &mut self.aux_assignment)?
+    };
     info!(elapsed_ms = %witness_t.elapsed().as_millis(), "create_r1cs_witness");
 
     let (_instance_span, instance_t) = start_span!("create_r1cs_instance");

@@ -15,5 +15,8 @@ mod sha256;
 mod uint32;
 
 pub use boolean::Boolean;
-pub use sha256::{bits_to_bytes, bytes_to_bits, sha256_compression, sha256_padding, small_sha256};
+pub use sha256::{
+    bits_to_bytes, bytes_to_bits, sha256_compression, sha256_compression_batched, sha256_padding,
+    small_sha256, small_sha256_batched,
+};
 pub use uint32::UInt32;

@@ -135,6 +135,19 @@ impl<C: Copy> SparseMatrix<C> {
     })
   }
 
+  /// Map coefficients to a new type using the given function.
+  ///
+  /// Creates a new `SparseMatrix<D>` with transformed coefficients.
+  /// Structure (indices, indptr, cols) is preserved.
+  pub fn map_coeffs<D: Copy, F: Fn(C) -> D>(&self, f: F) -> SparseMatrix<D> {
+    SparseMatrix {
+      data: self.data.iter().map(|&c| f(c)).collect(),
+      indices: self.indices.clone(),
+      indptr: self.indptr.clone(),
+      cols: self.cols,
+    }
+  }
+
   /// Matrix-vector multiply with widening arithmetic.
   ///
   /// For small-value optimization: C × W → Acc where Acc is wider than C and W.

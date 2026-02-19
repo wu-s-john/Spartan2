@@ -33,206 +33,76 @@
 //! assert!(cs.is_satisfied::<i64>());
 //! ```
 
+mod batching;
 mod cs;
 mod lc;
 mod small_cs;
 mod sparse;
 mod traits;
 
+pub use batching::BatchingSmallCS;
 pub use cs::{SmallConstraintSystem, SynthesisError};
 pub use lc::LinearCombination;
 pub use small_cs::SmallCS;
 pub use sparse::SmallSparseMatrix;
-pub use traits::{Accumulator, Coefficient, WideningMul, Witness};
+pub use traits::{Accumulator, Coefficient, SmallMultiEqCS, WideningMul, Witness};
 
-use serde::{Deserialize, Serialize};
-use std::marker::PhantomData;
-
+use crate::r1cs::{R1CSShape, SplitR1CSShape};
 use crate::traits::Engine;
 
-/// R1CS shape with coefficient type C (i32 for SHA-256).
-///
-/// This stores the structure of the R1CS constraint system (the A, B, C matrices)
-/// with coefficients of type C instead of field elements.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound = "C: Serialize + for<'a> Deserialize<'a>")]
-pub struct SmallR1CSShape<E: Engine, C: Coefficient> {
-    /// Number of constraints.
-    pub num_cons: usize,
-    /// Number of auxiliary variables.
-    pub num_vars: usize,
-    /// Number of public inputs/outputs.
-    pub num_io: usize,
-    /// Matrix A with C coefficients.
-    pub A: SmallSparseMatrix<C>,
-    /// Matrix B with C coefficients.
-    pub B: SmallSparseMatrix<C>,
-    /// Matrix C with C coefficients.
-    #[serde(rename = "C_matrix")]
-    pub C_mat: SmallSparseMatrix<C>,
-    #[serde(skip)]
-    _phantom: PhantomData<E>,
-}
-
-impl<E: Engine, C: Coefficient> SmallR1CSShape<E, C> {
-    /// Create a new R1CS shape from matrices.
-    pub fn new(
-        num_cons: usize,
-        num_vars: usize,
-        num_io: usize,
-        A: SmallSparseMatrix<C>,
-        B: SmallSparseMatrix<C>,
-        C_mat: SmallSparseMatrix<C>,
-    ) -> Self {
-        Self {
-            num_cons,
-            num_vars,
-            num_io,
-            A,
-            B,
-            C_mat,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Multiply all matrices by witness vector z.
-    ///
-    /// Input: z is Vec<W> (e.g., i32 witnesses)
-    /// Output: (Az, Bz, Cz) each Vec<Acc> (e.g., i64 accumulators)
-    pub fn multiply_vec<W, Acc>(&self, z: &[W]) -> (Vec<Acc>, Vec<Acc>, Vec<Acc>)
-    where
-        W: Witness + Send + Sync,
-        C: WideningMul<W, Acc> + Send + Sync,
-        Acc: Accumulator + Send,
-    {
-        let (az, (bz, cz)) = rayon::join(
-            || self.A.multiply_vec_widening_unchecked(z),
-            || {
-                rayon::join(
-                    || self.B.multiply_vec_widening_unchecked(z),
-                    || self.C_mat.multiply_vec_widening_unchecked(z),
-                )
-            },
-        );
-        (az, bz, cz)
-    }
-
-    /// Check constraint satisfaction: Az × Bz = Cz.
-    ///
-    /// Uses i128 for the product to avoid overflow.
-    pub fn is_sat<W, Acc>(&self, z: &[W]) -> bool
-    where
-        W: Witness + Send + Sync,
-        C: WideningMul<W, Acc> + Send + Sync,
-        Acc: Accumulator + Send + Into<i128>,
-    {
-        let (az, bz, cz) = self.multiply_vec::<W, Acc>(z);
-        az.iter().zip(&bz).zip(&cz).all(|((a, b), c)| {
-            let a128: i128 = (*a).into();
-            let b128: i128 = (*b).into();
-            let c128: i128 = (*c).into();
-            a128 * b128 == c128
-        })
-    }
-
-    /// Find the first unsatisfied constraint (for debugging).
-    pub fn which_is_unsatisfied<W, Acc>(&self, z: &[W]) -> Option<usize>
-    where
-        W: Witness + Send + Sync,
-        C: WideningMul<W, Acc> + Send + Sync,
-        Acc: Accumulator + Send + Into<i128>,
-    {
-        let (az, bz, cz) = self.multiply_vec::<W, Acc>(z);
-        az.iter()
-            .zip(&bz)
-            .zip(&cz)
-            .enumerate()
-            .find(|(_, ((a, b), c))| {
-                let a128: i128 = (**a).into();
-                let b128: i128 = (**b).into();
-                let c128: i128 = (**c).into();
-                a128 * b128 != c128
-            })
-            .map(|(i, _)| i)
-    }
-}
-
-/// R1CS witness with witness type W (i32 for SHA-256).
-///
-/// This stores the witness values as native integers,
-/// deferring field conversion until commitment time.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound = "W: Serialize + for<'a> Deserialize<'a>")]
-pub struct SmallR1CSWitness<E: Engine, W: Witness> {
-    /// Witness values (auxiliary variables).
-    pub W: Vec<W>,
-    #[serde(skip)]
-    _phantom: PhantomData<E>,
-}
-
-impl<E: Engine, W: Witness> SmallR1CSWitness<E, W> {
-    /// Create a new witness from values.
-    pub fn new(witness: Vec<W>) -> Self {
-        Self {
-            W: witness,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Number of witness elements.
-    pub fn len(&self) -> usize {
-        self.W.len()
-    }
-
-    /// Check if witness is empty.
-    pub fn is_empty(&self) -> bool {
-        self.W.is_empty()
-    }
-}
-
-/// R1CS instance (public interface) with witness type W.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound = "W: Serialize + for<'a> Deserialize<'a>")]
-pub struct SmallR1CSInstance<E: Engine, W: Witness> {
-    /// Public input/output values.
-    pub X: Vec<W>,
-    #[serde(skip)]
-    _phantom: PhantomData<E>,
-}
-
-impl<E: Engine, W: Witness> SmallR1CSInstance<E, W> {
-    /// Create a new instance from public values.
-    pub fn new(public_values: Vec<W>) -> Self {
-        Self {
-            X: public_values,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-/// Helper to convert SmallCS to SmallR1CSShape.
+/// Helper to convert SmallCS to R1CS shapes with small coefficients.
 impl<W: Witness, C: Coefficient> SmallCS<W, C> {
-    /// Convert to SmallR1CSShape.
-    pub fn to_shape<E: Engine>(&self) -> SmallR1CSShape<E, C> {
+    /// Convert to R1CSShape with coefficient type C.
+    ///
+    /// Returns `R1CSShape<E, C>` where C is typically i32 for small-value circuits.
+    /// Use `multiply_vec_widening` and `is_sat_widening` methods on the resulting shape.
+    pub fn to_r1cs_shape<E: Engine>(&self) -> R1CSShape<E, C> {
         let (a, b, c) = self.build_matrices();
-        SmallR1CSShape::new(
+        R1CSShape::new_generic(
             self.num_constraints(),
             self.num_aux(),
             self.num_inputs() - 1, // -1 for implicit ONE
-            a,
-            b,
-            c,
+            a.into(),
+            b.into(),
+            c.into(),
         )
     }
 
-    /// Convert to SmallR1CSWitness.
-    pub fn to_witness<E: Engine>(&self) -> SmallR1CSWitness<E, W> {
-        SmallR1CSWitness::new(self.aux.clone())
+    /// Convert to SplitR1CSShape with coefficient type C.
+    ///
+    /// Creates a simple shape with all variables in the "rest" segment
+    /// (no shared or precommitted variables).
+    pub fn to_split_r1cs_shape<E: Engine>(&self) -> SplitR1CSShape<E, C>
+    where
+        C: Copy + Send + Sync,
+    {
+        let (a, b, c) = self.build_matrices();
+        let num_cons_unpadded = self.num_constraints();
+        let num_vars_unpadded = self.num_aux();
+        let num_public = self.num_inputs() - 1; // -1 for implicit ONE
+
+        SplitR1CSShape::new_simple(
+            num_cons_unpadded,
+            num_vars_unpadded,
+            num_public,
+            a.into(),
+            b.into(),
+            c.into(),
+        )
     }
 
-    /// Convert to SmallR1CSInstance (public values).
-    pub fn to_instance<E: Engine>(&self) -> SmallR1CSInstance<E, W> {
-        SmallR1CSInstance::new(self.inputs[1..].to_vec())
+    /// Get the witness values (auxiliary variables).
+    ///
+    /// Returns the raw witness values as Vec<W> for use in small-value proving.
+    pub fn witness_values(&self) -> Vec<W> {
+        self.aux.clone()
+    }
+
+    /// Get the public input values (excluding the implicit ONE).
+    ///
+    /// Returns the public inputs as Vec<W> for use in small-value proving.
+    pub fn public_values(&self) -> Vec<W> {
+        self.inputs[1..].to_vec()
     }
 }
 
@@ -253,10 +123,10 @@ mod tests {
 
         cs.enforce(|lc| lc + x, |lc| lc + y, |lc| lc + z);
 
-        let shape: SmallR1CSShape<E, i32> = cs.to_shape();
+        let shape: R1CSShape<E, i32> = cs.to_r1cs_shape();
         let z_vec = cs.z();
 
-        assert!(shape.is_sat::<i32, i64>(&z_vec));
+        assert!(shape.is_sat_widening::<i32, i64>(&z_vec).unwrap());
     }
 
     #[test]
@@ -269,10 +139,10 @@ mod tests {
 
         cs.enforce(|lc| lc + x, |lc| lc + y, |lc| lc + z);
 
-        let shape: SmallR1CSShape<E, i32> = cs.to_shape();
+        let shape: R1CSShape<E, i32> = cs.to_r1cs_shape();
         let z_vec = cs.z();
 
-        let (az, bz, cz) = shape.multiply_vec::<i32, i64>(&z_vec);
+        let (az, bz, cz) = shape.multiply_vec_widening::<i32, i64>(&z_vec).unwrap();
 
         // az[0] should be x = 2
         // bz[0] should be y = 3
@@ -283,5 +153,75 @@ mod tests {
 
         // Check: az * bz = cz
         assert_eq!(az[0] * bz[0], cz[0]);
+    }
+
+    #[test]
+    fn test_split_shape_multiply_vec_widening() {
+        // Create a simple circuit: x * y = z where x=5, y=7, z=35
+        let mut cs = SmallCS::<i32, i32>::new();
+
+        let x = cs.alloc(|| 5).unwrap();
+        let y = cs.alloc(|| 7).unwrap();
+        let z = cs.alloc(|| 35).unwrap();
+
+        cs.enforce(|lc| lc + x, |lc| lc + y, |lc| lc + z);
+
+        // Convert to SplitR1CSShape<E, i32>
+        let split_shape: SplitR1CSShape<E, i32> = cs.to_split_r1cs_shape();
+
+        // Build z vector with padding for split shape
+        // z = [W (padded) | 1 | X]
+        let num_rest = split_shape.num_rest;
+        let mut z_vec: Vec<i32> = vec![0; num_rest];
+        z_vec[0] = 5;  // x
+        z_vec[1] = 7;  // y
+        z_vec[2] = 35; // z
+        z_vec.push(1); // constant ONE
+        // No public inputs in this circuit
+
+        let (az, bz, cz) = split_shape.multiply_vec_widening::<i32, i64>(&z_vec).unwrap();
+
+        // First constraint: x * y = z
+        // az[0] should be x = 5
+        // bz[0] should be y = 7
+        // cz[0] should be z = 35
+        assert_eq!(az[0], 5);
+        assert_eq!(bz[0], 7);
+        assert_eq!(cz[0], 35);
+
+        // Verify A·z × B·z = C·z
+        assert_eq!(az[0] * bz[0], cz[0]);
+    }
+
+    #[test]
+    fn test_split_shape_with_public_inputs() {
+        // Create a circuit with public inputs
+        // Constraint: x * y = z (witness multiplication)
+        // Plus: expose x as public input
+        let mut cs = SmallCS::<i32, i32>::new();
+
+        let x = cs.alloc(|| 3).unwrap();
+        let y = cs.alloc(|| 4).unwrap();
+        let z = cs.alloc(|| 12).unwrap();
+
+        // Constraint: x * y = z
+        cs.enforce(|lc| lc + x, |lc| lc + y, |lc| lc + z);
+
+        // Expose x as public input
+        let x_pub = cs.alloc_input(|| 3).unwrap();
+        cs.enforce(
+            |lc| lc + x,
+            |lc| lc + SmallCS::<i32, i32>::one(),
+            |lc| lc + x_pub,
+        );
+
+        assert!(cs.is_satisfied::<i64>());
+
+        // Convert to split shape
+        let split_shape: SplitR1CSShape<E, i32> = cs.to_split_r1cs_shape();
+
+        // Verify structure
+        assert_eq!(split_shape.num_public, 1, "Should have 1 public input");
+        assert_eq!(split_shape.num_cons_unpadded, 2, "Should have 2 constraints");
     }
 }

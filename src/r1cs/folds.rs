@@ -62,7 +62,7 @@ impl<E: Engine> R1CSShape<E> {
       .map(|(((az, bz), cz), e)| *az * *bz - u * *cz - *e)
       .collect();
 
-    let comm_T = PCS::<E>::commit(ck, &T, r_T, false)?;
+    let comm_T = PCS::<E>::commit(ck, &T, r_T)?;
     Ok((T, comm_T))
   }
 }
@@ -232,10 +232,6 @@ where
       &[<E::Scalar as Field>::ONE - *r_b, *r_b],
     )?;
 
-    Ok(Self {
-      W: new_w,
-      r_W: r_w,
-      is_small: false, // after folding, witnesses are not small
-    })
+    Ok(Self { W: new_w, r_W: r_w })
   }
 }

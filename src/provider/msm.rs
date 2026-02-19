@@ -45,6 +45,12 @@ pub trait MsmScalar: Copy + Sync + Send {
   fn get_window(&self, start: usize, width: usize) -> usize;
 }
 
+/// Creates a bit mask of `width` bits (handles width >= usize bits).
+#[inline]
+fn make_mask(width: usize) -> usize {
+  1usize.checked_shl(width as u32).map_or(!0, |v| v - 1)
+}
+
 // Implementations for unsigned integers
 impl MsmScalar for u8 {
   const MAX_BITS: usize = 8;
@@ -56,7 +62,7 @@ impl MsmScalar for u8 {
 
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
-    ((*self as usize) >> start) & ((1 << width) - 1)
+    ((*self as usize) >> start) & make_mask(width)
   }
 }
 
@@ -70,7 +76,7 @@ impl MsmScalar for u16 {
 
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
-    ((*self as usize) >> start) & ((1 << width) - 1)
+    ((*self as usize) >> start) & make_mask(width)
   }
 }
 
@@ -84,7 +90,7 @@ impl MsmScalar for u32 {
 
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
-    ((*self as usize) >> start) & ((1 << width) - 1)
+    ((*self as usize) >> start) & make_mask(width)
   }
 }
 
@@ -98,11 +104,40 @@ impl MsmScalar for u64 {
 
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
-    ((*self >> start) as usize) & ((1 << width) - 1)
+    let shifted = if start >= 64 { 0 } else { *self >> start };
+    (shifted as usize) & make_mask(width)
   }
 }
 
 // Implementations for signed integers (treat as unsigned for bit extraction)
+impl MsmScalar for i8 {
+  const MAX_BITS: usize = 8;
+
+  #[inline]
+  fn msm_is_zero(&self) -> bool {
+    *self == 0
+  }
+
+  #[inline]
+  fn get_window(&self, start: usize, width: usize) -> usize {
+    ((*self as u8 as usize) >> start) & make_mask(width)
+  }
+}
+
+impl MsmScalar for i16 {
+  const MAX_BITS: usize = 16;
+
+  #[inline]
+  fn msm_is_zero(&self) -> bool {
+    *self == 0
+  }
+
+  #[inline]
+  fn get_window(&self, start: usize, width: usize) -> usize {
+    ((*self as u16 as usize) >> start) & make_mask(width)
+  }
+}
+
 impl MsmScalar for i32 {
   const MAX_BITS: usize = 32;
 
@@ -113,8 +148,7 @@ impl MsmScalar for i32 {
 
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
-    // Treat as unsigned for bit extraction
-    ((*self as u32 as usize) >> start) & ((1 << width) - 1)
+    ((*self as u32 as usize) >> start) & make_mask(width)
   }
 }
 
@@ -128,8 +162,8 @@ impl MsmScalar for i64 {
 
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
-    // Treat as unsigned for bit extraction
-    ((*self as u64 >> start) as usize) & ((1 << width) - 1)
+    let shifted = if start >= 64 { 0 } else { (*self as u64) >> start };
+    (shifted as usize) & make_mask(width)
   }
 }
 
@@ -180,7 +214,6 @@ impl<F: PrimeField> MsmScalar for FieldScalar<F> {
 // Unified MSM Implementation using MsmScalar trait
 // ============================================================================
 
-#[allow(dead_code)] // Will be used when PCS commit is updated
 /// Unified multi-scalar multiplication using the `MsmScalar` trait.
 ///
 /// This function works with any scalar type that implements `MsmScalar`,
@@ -231,7 +264,6 @@ pub fn msm_generic<C: CurveAffine, S: MsmScalar>(
 }
 
 /// Binary MSM for 1-bit scalars using MsmScalar trait.
-#[allow(dead_code)]
 #[inline(always)]
 fn msm_binary_generic<C: CurveAffine, S: MsmScalar>(
   scalars: &[S],
@@ -269,7 +301,6 @@ fn msm_binary_generic<C: CurveAffine, S: MsmScalar>(
 }
 
 /// Bucketed MSM for 2-10 bit scalars using MsmScalar trait.
-#[allow(dead_code)]
 #[inline(always)]
 fn msm_bucketed_generic<C: CurveAffine, S: MsmScalar>(
   scalars: &[S],
@@ -323,7 +354,6 @@ fn msm_bucketed_generic<C: CurveAffine, S: MsmScalar>(
 }
 
 /// Windowed Pippenger MSM for larger scalars using MsmScalar trait.
-#[allow(dead_code)]
 #[inline(always)]
 fn msm_windowed_generic<C: CurveAffine, S: MsmScalar>(
   scalars: &[S],
@@ -410,7 +440,6 @@ fn msm_windowed_generic<C: CurveAffine, S: MsmScalar>(
 }
 
 /// Bucket type for generic MSM (same as original but with different name to avoid conflict)
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum BucketGeneric<C: CurveAffine> {
   None,
@@ -590,6 +619,7 @@ pub fn msm<C: CurveAffine>(
   Ok(result)
 }
 
+#[allow(dead_code)]
 fn num_bits(n: usize) -> usize {
   if n == 0 { 0 } else { (n.ilog2() + 1) as usize }
 }
@@ -599,6 +629,10 @@ fn num_bits(n: usize) -> usize {
 /// # Errors
 /// Returns `SpartanError::InvalidInputLength` if bases and scalars have different lengths.
 /// Returns `SpartanError::InternalError` if scalars contain values that cannot be processed.
+///
+/// Note: This function uses runtime bit-width scanning. For compile-time optimization,
+/// prefer `msm_generic` with a specific scalar type that implements `MsmScalar`.
+#[allow(dead_code)]
 pub fn msm_small<C: CurveAffine, T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
   scalars: &[T],
   bases: &[C],
@@ -649,6 +683,7 @@ pub fn msm_small<C: CurveAffine, T: Integer + Into<u64> + Copy + Sync + ToPrimit
   Ok(result)
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 fn msm_binary<C: CurveAffine, T: Integer + Sync>(
   scalars: &[T],
@@ -686,6 +721,7 @@ fn msm_binary<C: CurveAffine, T: Integer + Sync>(
 }
 
 /// MSM optimized for up to 10-bit scalars
+#[allow(dead_code)]
 #[inline(always)]
 fn msm_10<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
   scalars: &[T],
@@ -736,6 +772,7 @@ fn msm_10<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
   }
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
   scalars: &[T],

@@ -186,23 +186,177 @@ where
     Ok((pk, vk))
   }
 
-  /// Prepares the SNARK for proving
+  /// Prepares the SNARK for proving using standard field arithmetic.
   fn prep_prove<C: SpartanCircuit<E>>(
     pk: &Self::ProverKey,
     circuit: C,
-    is_small: bool, // do witness elements fit in machine words?
   ) -> Result<Self::PrepSNARK, SpartanError> {
-    let mut ps = SatisfyingAssignment::shared_witness(&pk.S, &pk.ck, &circuit, is_small)?;
-    SatisfyingAssignment::precommitted_witness(&mut ps, &pk.S, &pk.ck, &circuit, is_small)?;
-
-    Ok(SpartanPrepZkSNARK { ps })
+    Self::prep_prove_internal(pk, circuit, false)
   }
 
-  /// produces a succinct proof of satisfiability of an R1CS instance
+  /// Prepares the SNARK for proving using small-value optimization.
+  fn prep_prove_small<C: SpartanCircuit<E>>(
+    pk: &Self::ProverKey,
+    circuit: C,
+  ) -> Result<Self::PrepSNARK, SpartanError> {
+    Self::prep_prove_internal(pk, circuit, true)
+  }
+
+  /// Produces proof using standard field arithmetic.
   fn prove<C: SpartanCircuit<E>>(
     pk: &Self::ProverKey,
     circuit: C,
     prep_snark: &Self::PrepSNARK,
+  ) -> Result<Self, SpartanError> {
+    Self::prove_internal(pk, circuit, prep_snark, false)
+  }
+
+  /// Produces proof using small-value optimization.
+  fn prove_small<C: SpartanCircuit<E>>(
+    pk: &Self::ProverKey,
+    circuit: C,
+    prep_snark: &Self::PrepSNARK,
+  ) -> Result<Self, SpartanError> {
+    Self::prove_internal(pk, circuit, prep_snark, true)
+  }
+
+  /// verifies a proof of satisfiability of a `RelaxedR1CS` instance
+  fn verify(&self, vk: &Self::VerifierKey) -> Result<Vec<E::Scalar>, SpartanError> {
+    // Verify by checking the multi-round verifier instance via NIFS folding
+    let (_verify_span, verify_t) = start_span!("spartan_zk_verify");
+    let ck_verifier = &vk.vc_ck;
+    let mut transcript = E::TE::new(b"SpartanZkSNARK");
+    transcript.absorb(b"vk", &vk.digest()?);
+    transcript.absorb(b"public_values", &self.U.public_values.as_slice());
+
+    // Validate the provided split R1CS instance and advance the transcript
+    self.U.validate(&vk.S, &mut transcript)?;
+
+    // Recreate tau polynomial coefficients via Fiat-Shamir and advance transcript
+    let (_tau_span, tau_t) = start_span!("compute_tau_verify");
+    let num_rounds_x = vk.S.num_cons.log_2();
+    let tau = (0..num_rounds_x)
+      .map(|_| transcript.squeeze(b"t"))
+      .collect::<Result<EqPolynomial<_>, SpartanError>>()?;
+    info!(elapsed_ms = %tau_t.elapsed().as_millis(), "compute_tau_verify");
+
+    // validate the provided multi-round verifier instance and advance transcript
+    self.U_verifier.validate(&vk.vc_shape, &mut transcript)?;
+
+    // Derive expected challenge counts from the original shape sizes
+    let num_vars = vk.S.num_shared + vk.S.num_precommitted + vk.S.num_rest;
+    let num_rounds_x = vk.S.num_cons.log_2();
+    let num_rounds_y = num_vars.log_2() + 1;
+
+    let U_verifier_regular = self.U_verifier.to_regular_instance()?;
+
+    let num_public_values = 3usize;
+    let num_challenges = num_rounds_x + 1 + num_rounds_y;
+
+    if U_verifier_regular.X.len() != num_challenges + num_public_values {
+      return Err(SpartanError::ProofVerifyError {
+        reason: format!(
+          "Verifier instance has incorrect number of public IO: expected {}, got {}",
+          num_challenges + num_public_values,
+          U_verifier_regular.X.len()
+        ),
+      });
+    }
+    let challenges = &U_verifier_regular.X[0..num_challenges];
+    let public_values = &U_verifier_regular.X[num_challenges..num_challenges + 3];
+
+    let r_x = challenges[0..num_rounds_x].to_vec();
+    let r = challenges[num_rounds_x]; // r for combining inner claims
+    let r_y = challenges[num_rounds_x + 1..].to_vec();
+
+    // compute eval_A, eval_B, eval_C at (r_x, r_y)
+    let (_matrix_eval_span, matrix_eval_t) = start_span!("matrix_evaluations");
+    let T_x = EqPolynomial::evals_from_points(&r_x);
+    let T_y = EqPolynomial::evals_from_points(&r_y);
+    let (eval_A, eval_B, eval_C) = vk.S.evaluate_with_tables(&T_x, &T_y);
+    let quotient = eval_A + r * eval_B + r * r * eval_C;
+    info!(elapsed_ms = %matrix_eval_t.elapsed().as_millis(), "matrix_evaluations");
+
+    // Recompute eval_X from original circuit public IO at r_y[1..]
+    let U_regular = self.U.to_regular_instance()?;
+
+    let eval_X = {
+      let X = vec![E::Scalar::ONE]
+        .into_iter()
+        .chain(U_regular.X.iter().cloned())
+        .collect::<Vec<E::Scalar>>();
+      let num_vars = vk.S.num_shared + vk.S.num_precommitted + vk.S.num_rest;
+      SparsePolynomial::new(num_vars.log_2(), X).evaluate(&r_y[1..])
+    };
+
+    // Recompute tau(r_x) using the same tau polynomial challenges
+    let tau_at_rx = tau.evaluate(&r_x);
+
+    // Compare against the instance's public inputs [tau_at_rx, eval_X, quotient]
+    if public_values[0] != tau_at_rx || public_values[1] != eval_X || public_values[2] != quotient {
+      return Err(SpartanError::ProofVerifyError {
+        reason:
+          "Verifier instance public values do not match recomputed evaluations (tau_at_rx, eval_X, quotient)"
+            .to_string(),
+      });
+    }
+
+    // Finally, run NIFS verification using the same transcript
+    let (_nifs_verify_span, nifs_verify_t) = start_span!("nifs_verify");
+    let folded_U = self
+      .nifs
+      .verify(&mut transcript, &self.random_U, &U_verifier_regular)?;
+
+    // Check satisfiability of the folded relaxed instance with the folded witness
+    vk.vc_shape_regular
+      .is_sat_relaxed(ck_verifier, &folded_U, &self.folded_W)
+      .map_err(|e| SpartanError::ProofVerifyError {
+        reason: format!("Folded instance not satisfiable: {e}"),
+      })?;
+    info!(elapsed_ms = %nifs_verify_t.elapsed().as_millis(), "nifs_verify");
+
+    // Continue with PCS verification on the same transcript
+    // Use the commitment from the dedicated eval_W commit-only last round
+    let (_pcs_verify_span, pcs_verify_t) = start_span!("pcs_verify");
+    let eval_w_commit_round = num_rounds_x + 1 + num_rounds_y + 1;
+    E::PCS::verify(
+      &vk.vk_ee,
+      &vk.vc_ck,
+      &mut transcript,
+      &U_regular.comm_W,
+      &r_y[1..],
+      &self.U_verifier.comm_w_per_round[eval_w_commit_round],
+      &self.eval_arg,
+    )?;
+    info!(elapsed_ms = %pcs_verify_t.elapsed().as_millis(), "pcs_verify");
+
+    info!(elapsed_ms = %verify_t.elapsed().as_millis(), "spartan_zk_verify");
+    // Return original circuit public IO carried in the proof
+    Ok(self.U.public_values.clone())
+  }
+}
+
+/// Internal implementation methods for SpartanZkSNARK.
+impl<E: Engine> SpartanZkSNARK<E>
+where
+  E::PCS: FoldingEngineTrait<E>,
+{
+  /// Internal prep_prove implementation with is_small parameter.
+  fn prep_prove_internal<C: SpartanCircuit<E>>(
+    pk: &SpartanProverKey<E>,
+    circuit: C,
+    is_small: bool,
+  ) -> Result<SpartanPrepZkSNARK<E>, SpartanError> {
+    let mut ps = SatisfyingAssignment::shared_witness(&pk.S, &pk.ck, &circuit, is_small)?;
+    SatisfyingAssignment::precommitted_witness(&mut ps, &pk.S, &pk.ck, &circuit, is_small)?;
+    Ok(SpartanPrepZkSNARK { ps })
+  }
+
+  /// Internal prove implementation with is_small parameter.
+  fn prove_internal<C: SpartanCircuit<E>>(
+    pk: &SpartanProverKey<E>,
+    circuit: C,
+    prep_snark: &SpartanPrepZkSNARK<E>,
     is_small: bool,
   ) -> Result<Self, SpartanError> {
     let (_prove_span, prove_t) = start_span!("spartan_zk_prove");
@@ -427,121 +581,6 @@ where
       U,
     })
   }
-
-  /// verifies a proof of satisfiability of a `RelaxedR1CS` instance
-  fn verify(&self, vk: &Self::VerifierKey) -> Result<Vec<E::Scalar>, SpartanError> {
-    // Verify by checking the multi-round verifier instance via NIFS folding
-    let (_verify_span, verify_t) = start_span!("spartan_zk_verify");
-    let ck_verifier = &vk.vc_ck;
-    let mut transcript = E::TE::new(b"SpartanZkSNARK");
-    transcript.absorb(b"vk", &vk.digest()?);
-    transcript.absorb(b"public_values", &self.U.public_values.as_slice());
-
-    // Validate the provided split R1CS instance and advance the transcript
-    self.U.validate(&vk.S, &mut transcript)?;
-
-    // Recreate tau polynomial coefficients via Fiat-Shamir and advance transcript
-    let (_tau_span, tau_t) = start_span!("compute_tau_verify");
-    let num_rounds_x = vk.S.num_cons.log_2();
-    let tau = (0..num_rounds_x)
-      .map(|_| transcript.squeeze(b"t"))
-      .collect::<Result<EqPolynomial<_>, SpartanError>>()?;
-    info!(elapsed_ms = %tau_t.elapsed().as_millis(), "compute_tau_verify");
-
-    // validate the provided multi-round verifier instance and advance transcript
-    self.U_verifier.validate(&vk.vc_shape, &mut transcript)?;
-
-    // Derive expected challenge counts from the original shape sizes
-    let num_vars = vk.S.num_shared + vk.S.num_precommitted + vk.S.num_rest;
-    let num_rounds_x = vk.S.num_cons.log_2();
-    let num_rounds_y = num_vars.log_2() + 1;
-
-    let U_verifier_regular = self.U_verifier.to_regular_instance()?;
-
-    let num_public_values = 3usize;
-    let num_challenges = num_rounds_x + 1 + num_rounds_y;
-
-    if U_verifier_regular.X.len() != num_challenges + num_public_values {
-      return Err(SpartanError::ProofVerifyError {
-        reason: format!(
-          "Verifier instance has incorrect number of public IO: expected {}, got {}",
-          num_challenges + num_public_values,
-          U_verifier_regular.X.len()
-        ),
-      });
-    }
-    let challenges = &U_verifier_regular.X[0..num_challenges];
-    let public_values = &U_verifier_regular.X[num_challenges..num_challenges + 3];
-
-    let r_x = challenges[0..num_rounds_x].to_vec();
-    let r = challenges[num_rounds_x]; // r for combining inner claims
-    let r_y = challenges[num_rounds_x + 1..].to_vec();
-
-    // compute eval_A, eval_B, eval_C at (r_x, r_y)
-    let (_matrix_eval_span, matrix_eval_t) = start_span!("matrix_evaluations");
-    let T_x = EqPolynomial::evals_from_points(&r_x);
-    let T_y = EqPolynomial::evals_from_points(&r_y);
-    let (eval_A, eval_B, eval_C) = vk.S.evaluate_with_tables(&T_x, &T_y);
-    let quotient = eval_A + r * eval_B + r * r * eval_C;
-    info!(elapsed_ms = %matrix_eval_t.elapsed().as_millis(), "matrix_evaluations");
-
-    // Recompute eval_X from original circuit public IO at r_y[1..]
-    let U_regular = self.U.to_regular_instance()?;
-
-    let eval_X = {
-      let X = vec![E::Scalar::ONE]
-        .into_iter()
-        .chain(U_regular.X.iter().cloned())
-        .collect::<Vec<E::Scalar>>();
-      let num_vars = vk.S.num_shared + vk.S.num_precommitted + vk.S.num_rest;
-      SparsePolynomial::new(num_vars.log_2(), X).evaluate(&r_y[1..])
-    };
-
-    // Recompute tau(r_x) using the same tau polynomial challenges
-    let tau_at_rx = tau.evaluate(&r_x);
-
-    // Compare against the instance's public inputs [tau_at_rx, eval_X, quotient]
-    if public_values[0] != tau_at_rx || public_values[1] != eval_X || public_values[2] != quotient {
-      return Err(SpartanError::ProofVerifyError {
-        reason:
-          "Verifier instance public values do not match recomputed evaluations (tau_at_rx, eval_X, quotient)"
-            .to_string(),
-      });
-    }
-
-    // Finally, run NIFS verification using the same transcript
-    let (_nifs_verify_span, nifs_verify_t) = start_span!("nifs_verify");
-    let folded_U = self
-      .nifs
-      .verify(&mut transcript, &self.random_U, &U_verifier_regular)?;
-
-    // Check satisfiability of the folded relaxed instance with the folded witness
-    vk.vc_shape_regular
-      .is_sat_relaxed(ck_verifier, &folded_U, &self.folded_W)
-      .map_err(|e| SpartanError::ProofVerifyError {
-        reason: format!("Folded instance not satisfiable: {e}"),
-      })?;
-    info!(elapsed_ms = %nifs_verify_t.elapsed().as_millis(), "nifs_verify");
-
-    // Continue with PCS verification on the same transcript
-    // Use the commitment from the dedicated eval_W commit-only last round
-    let (_pcs_verify_span, pcs_verify_t) = start_span!("pcs_verify");
-    let eval_w_commit_round = num_rounds_x + 1 + num_rounds_y + 1;
-    E::PCS::verify(
-      &vk.vk_ee,
-      &vk.vc_ck,
-      &mut transcript,
-      &U_regular.comm_W,
-      &r_y[1..],
-      &self.U_verifier.comm_w_per_round[eval_w_commit_round],
-      &self.eval_arg,
-    )?;
-    info!(elapsed_ms = %pcs_verify_t.elapsed().as_millis(), "pcs_verify");
-
-    info!(elapsed_ms = %verify_t.elapsed().as_millis(), "spartan_zk_verify");
-    // Return original circuit public IO carried in the proof
-    Ok(self.U.public_values.clone())
-  }
 }
 
 #[cfg(test)]
@@ -643,11 +682,11 @@ mod tests {
     // produce keys
     let (pk, vk) = S::setup(circuit.clone()).unwrap();
 
-    // generate pre-processed state for proving
-    let prep_snark = S::prep_prove(&pk, circuit.clone(), false).unwrap();
+    // generate pre-processed state for proving (field path)
+    let prep_snark = S::prep_prove(&pk, circuit.clone()).unwrap();
 
-    // generate a witness and proof
-    let res = S::prove(&pk, circuit.clone(), &prep_snark, false);
+    // generate a witness and proof (field path)
+    let res = S::prove(&pk, circuit.clone(), &prep_snark);
     assert!(res.is_ok());
     let snark = res.unwrap();
 

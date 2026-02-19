@@ -95,6 +95,20 @@ impl<C: Coefficient> LinearCombination<C> {
     pub fn is_empty(&self) -> bool {
         self.terms.is_empty()
     }
+
+    /// Scale all coefficients by a factor.
+    ///
+    /// Returns a new LC where each term's coefficient is multiplied by `factor`.
+    /// Used by BatchingSmallCS to scale LCs before combining them.
+    pub fn scale(&self, factor: C) -> Self {
+        LinearCombination {
+            terms: self
+                .terms
+                .iter()
+                .map(|(var, coeff)| (*var, *coeff * factor))
+                .collect(),
+        }
+    }
 }
 
 // Operator overloads for ergonomic constraint building

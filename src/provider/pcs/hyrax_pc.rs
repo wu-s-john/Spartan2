@@ -22,7 +22,8 @@ use crate::{
 };
 use core::marker::PhantomData;
 use ff::{Field, PrimeField};
-use num_integer::div_ceil;
+use num_integer::{Integer, div_ceil};
+use num_traits::ToPrimitive;
 use rand_core::OsRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -130,7 +131,6 @@ where
     ck: &Self::CommitmentKey,
     v: &[E::Scalar],
     r: &Self::Blind,
-    is_small: bool,
   ) -> Result<Self::Commitment, SpartanError> {
     let n = v.len();
 
@@ -149,23 +149,84 @@ where
           &v[lower..upper]
         };
 
-        let msm_result = if !is_small {
-          E::GE::vartime_multiscalar_mul(scalars, &ck.ck[..scalars.len()], false)?
+        let msm_result = E::GE::vartime_multiscalar_mul(scalars, &ck.ck[..scalars.len()], false)?;
+        Ok(msm_result + ck.h * r.blind[i])
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(HyraxCommitment { comm })
+  }
+
+  fn commit_small(
+    ck: &Self::CommitmentKey,
+    v: &[E::Scalar],
+    r: &Self::Blind,
+  ) -> Result<Self::Commitment, SpartanError> {
+    let n = v.len();
+
+    // compute the expected number of columns
+    let num_cols = ck.num_cols;
+    let num_rows = div_ceil(n, num_cols);
+
+    let comm = (0..num_rows)
+      .into_par_iter()
+      .map(|i| {
+        let upper = i.saturating_mul(num_cols).saturating_add(num_cols);
+        let lower = i.saturating_mul(num_cols);
+        let scalars = if upper > n {
+          &v[lower..]
         } else {
-          let scalars_small = scalars
-            .par_iter()
-            .map(|s| {
-              let bytes = s.to_repr();
-              let bytes = bytes.as_ref();
-              u64::from_le_bytes(bytes[..8].try_into().unwrap())
-            })
-            .collect::<Vec<_>>();
-          E::GE::vartime_multiscalar_mul_small(
-            &scalars_small,
-            &ck.ck[..scalars_small.len()],
-            false,
-          )?
+          &v[lower..upper]
         };
+
+        // Convert field elements to u64 for small-value MSM.
+        // vartime_multiscalar_mul_small internally uses msm_generic with u64
+        // scalars, leveraging compile-time MAX_BITS to select the optimal
+        // algorithm without runtime bit-width scanning.
+        let scalars_small: Vec<u64> = scalars
+          .par_iter()
+          .map(|s| {
+            let bytes = s.to_repr();
+            let bytes = bytes.as_ref();
+            u64::from_le_bytes(bytes[..8].try_into().unwrap())
+          })
+          .collect();
+        let msm_result = E::GE::vartime_multiscalar_mul_small(
+          &scalars_small,
+          &ck.ck[..scalars_small.len()],
+          false,
+        )?;
+        Ok(msm_result + ck.h * r.blind[i])
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(HyraxCommitment { comm })
+  }
+
+  fn commit_small_direct<T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
+    ck: &Self::CommitmentKey,
+    v: &[T],
+    r: &Self::Blind,
+  ) -> Result<Self::Commitment, SpartanError> {
+    let n = v.len();
+
+    // compute the expected number of columns
+    let num_cols = ck.num_cols;
+    let num_rows = div_ceil(n, num_cols);
+
+    let comm = (0..num_rows)
+      .into_par_iter()
+      .map(|i| {
+        let upper = i.saturating_mul(num_cols).saturating_add(num_cols);
+        let lower = i.saturating_mul(num_cols);
+        let scalars = if upper > n {
+          &v[lower..]
+        } else {
+          &v[lower..upper]
+        };
+
+        let msm_result =
+          E::GE::vartime_multiscalar_mul_small(scalars, &ck.ck[..scalars.len()], false)?;
         Ok(msm_result + ck.h * r.blind[i])
       })
       .collect::<Result<Vec<_>, _>>()?;

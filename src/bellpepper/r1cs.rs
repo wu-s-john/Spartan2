@@ -336,7 +336,11 @@ impl<E: Engine> SpartanWitness<E> for SatisfyingAssignment<E> {
     let (_commit_span, commit_t) = start_span!("commit_witness_shared");
     let (comm_W_shared, r_W_shared) = if S.num_shared_unpadded > 0 {
       let r_W_shared = PCS::<E>::blind(ck, S.num_shared);
-      let comm_W_shared = PCS::<E>::commit(ck, &W[0..S.num_shared], &r_W_shared, is_small)?;
+      let comm_W_shared = if is_small {
+        PCS::<E>::commit_small(ck, &W[0..S.num_shared], &r_W_shared)?
+      } else {
+        PCS::<E>::commit(ck, &W[0..S.num_shared], &r_W_shared)?
+      };
       (Some(comm_W_shared), Some(r_W_shared))
     } else {
       (None, None)
@@ -388,12 +392,19 @@ impl<E: Engine> SpartanWitness<E> for SatisfyingAssignment<E> {
       start_span!("commit_witness_precommitted");
     let (comm_W_precommitted, r_W_precommitted) = if S.num_precommitted_unpadded > 0 {
       let r_W_precommitted = PCS::<E>::blind(ck, S.num_precommitted);
-      let comm_W_precommitted = PCS::<E>::commit(
-        ck,
-        &ps.W[S.num_shared..S.num_shared + S.num_precommitted],
-        &r_W_precommitted,
-        is_small,
-      )?;
+      let comm_W_precommitted = if is_small {
+        PCS::<E>::commit_small(
+          ck,
+          &ps.W[S.num_shared..S.num_shared + S.num_precommitted],
+          &r_W_precommitted,
+        )?
+      } else {
+        PCS::<E>::commit(
+          ck,
+          &ps.W[S.num_shared..S.num_shared + S.num_precommitted],
+          &r_W_precommitted,
+        )?
+      };
       (Some(comm_W_precommitted), Some(r_W_precommitted))
     } else {
       (None, None)
@@ -446,12 +457,19 @@ impl<E: Engine> SpartanWitness<E> for SatisfyingAssignment<E> {
     // commit to the rest with partial commitment
     let (_commit_rest_span, commit_rest_t) = start_span!("commit_witness_rest");
     let r_W_rest = PCS::<E>::blind(ck, S.num_rest);
-    let comm_W_rest = PCS::<E>::commit(
-      ck,
-      &ps.W[S.num_shared + S.num_precommitted..S.num_shared + S.num_precommitted + S.num_rest],
-      &r_W_rest,
-      is_small,
-    )?;
+    let comm_W_rest = if is_small {
+      PCS::<E>::commit_small(
+        ck,
+        &ps.W[S.num_shared + S.num_precommitted..S.num_shared + S.num_precommitted + S.num_rest],
+        &r_W_rest,
+      )?
+    } else {
+      PCS::<E>::commit(
+        ck,
+        &ps.W[S.num_shared + S.num_precommitted..S.num_shared + S.num_precommitted + S.num_rest],
+        &r_W_rest,
+      )?
+    };
     info!(elapsed_ms = %commit_rest_t.elapsed().as_millis(), "commit_witness_rest");
     transcript.absorb(b"comm_W_rest", &comm_W_rest); // add commitment to transcript
 
@@ -476,7 +494,7 @@ impl<E: Engine> SpartanWitness<E> for SatisfyingAssignment<E> {
 
     let r_W = PCS::<E>::combine_blinds(&blinds)?;
 
-    let W = R1CSWitness::<E>::new_unchecked(ps.W.clone(), r_W, is_small)?;
+    let W = R1CSWitness::<E>::new_unchecked(ps.W.clone(), r_W)?;
 
     info!(elapsed_ms = %synth_t.elapsed().as_millis(), "circuit_synthesize_rest");
 
@@ -749,7 +767,6 @@ impl<E: Engine> MultiRoundSpartanWitness<E> for SatisfyingAssignment<E> {
       ck,
       &state.w[start_padded..start_padded + s.num_vars_per_round[round_index]],
       &r_w_per_round,
-      false,
     )?;
 
     // absorb commitment to this round's variables
@@ -797,7 +814,7 @@ impl<E: Engine> MultiRoundSpartanWitness<E> for SatisfyingAssignment<E> {
     )?;
 
     let r_w = PCS::<E>::combine_blinds(&state.r_w_per_round)?;
-    let w = R1CSWitness::<E>::new_unchecked(state.w.clone(), r_w, false)?;
+    let w = R1CSWitness::<E>::new_unchecked(state.w.clone(), r_w)?;
 
     Ok((u, w))
   }
