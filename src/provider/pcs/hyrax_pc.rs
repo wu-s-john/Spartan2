@@ -10,6 +10,7 @@ use crate::{
   math::Math,
   polys::{eq::EqPolynomial, multilinear::MultilinearPolynomial},
   provider::{
+    msm::MsmScalar,
     pcs::ipa::{InnerProductArgumentLinear, InnerProductInstance, InnerProductWitness},
     traits::{DlogGroup, DlogGroupExt},
   },
@@ -22,8 +23,7 @@ use crate::{
 };
 use core::marker::PhantomData;
 use ff::{Field, PrimeField};
-use num_integer::{Integer, div_ceil};
-use num_traits::ToPrimitive;
+use num_integer::div_ceil;
 use rand_core::OsRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -203,7 +203,7 @@ where
     Ok(HyraxCommitment { comm })
   }
 
-  fn commit_small_direct<T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
+  fn commit_small_direct<T: MsmScalar>(
     ck: &Self::CommitmentKey,
     v: &[T],
     r: &Self::Blind,
@@ -225,6 +225,8 @@ where
           &v[lower..upper]
         };
 
+        // Use vartime_multiscalar_mul_small which now handles all MsmScalar types
+        // including signed integers (i32, i64) with proper point negation
         let msm_result =
           E::GE::vartime_multiscalar_mul_small(scalars, &ck.ck[..scalars.len()], false)?;
         Ok(msm_result + ck.h * r.blind[i])

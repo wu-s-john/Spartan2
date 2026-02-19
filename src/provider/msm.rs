@@ -31,18 +31,42 @@ use tracing::info;
 /// - 1 bit: binary MSM (just sum bases where scalar=1)
 /// - 2-10 bits: bucketed MSM (one bucket per scalar value)
 /// - 11+ bits: windowed Pippenger
-#[allow(dead_code)] // Will be used when PCS commit is updated
-pub trait MsmScalar: Copy + Sync + Send {
+///
+/// For signed types, the `IS_SIGNED` constant and associated `Unsigned` type
+/// enable proper handling of negative scalars by negating the base point
+/// and using the absolute value for bucket indexing.
+#[allow(dead_code)] // Sign handling will be used when windowed MSM is updated
+pub trait MsmScalar: Copy + Sync + Send + Sized {
   /// Maximum number of bits in this scalar type (compile-time constant).
+  /// For signed types, this is the number of bits in the magnitude (e.g., 31 for i32).
   const MAX_BITS: usize;
+
+  /// Whether this scalar type is signed.
+  const IS_SIGNED: bool;
+
+  /// The unsigned counterpart type for this scalar.
+  /// For unsigned types, this is Self. For signed types (i32, i64),
+  /// this is the corresponding unsigned type (u32, u64).
+  type Unsigned: MsmScalar;
 
   /// Check if the scalar is zero.
   fn msm_is_zero(&self) -> bool;
 
   /// Extract a window of bits [start, start+width) as a bucket index.
   ///
+  /// For signed types, this should be called on the absolute value,
+  /// not directly on the signed scalar.
+  ///
   /// Returns the bits as a usize for indexing into bucket arrays.
   fn get_window(&self, start: usize, width: usize) -> usize;
+
+  /// Check if the scalar is negative.
+  /// Always returns false for unsigned types.
+  fn is_negative(&self) -> bool;
+
+  /// Get the absolute value as the unsigned counterpart type.
+  /// For unsigned types, this just returns self.
+  fn abs_value(&self) -> Self::Unsigned;
 }
 
 /// Creates a bit mask of `width` bits (handles width >= usize bits).
@@ -54,6 +78,8 @@ fn make_mask(width: usize) -> usize {
 // Implementations for unsigned integers
 impl MsmScalar for u8 {
   const MAX_BITS: usize = 8;
+  const IS_SIGNED: bool = false;
+  type Unsigned = u8;
 
   #[inline]
   fn msm_is_zero(&self) -> bool {
@@ -63,11 +89,23 @@ impl MsmScalar for u8 {
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
     ((*self as usize) >> start) & make_mask(width)
+  }
+
+  #[inline]
+  fn is_negative(&self) -> bool {
+    false
+  }
+
+  #[inline]
+  fn abs_value(&self) -> Self::Unsigned {
+    *self
   }
 }
 
 impl MsmScalar for u16 {
   const MAX_BITS: usize = 16;
+  const IS_SIGNED: bool = false;
+  type Unsigned = u16;
 
   #[inline]
   fn msm_is_zero(&self) -> bool {
@@ -77,11 +115,23 @@ impl MsmScalar for u16 {
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
     ((*self as usize) >> start) & make_mask(width)
+  }
+
+  #[inline]
+  fn is_negative(&self) -> bool {
+    false
+  }
+
+  #[inline]
+  fn abs_value(&self) -> Self::Unsigned {
+    *self
   }
 }
 
 impl MsmScalar for u32 {
   const MAX_BITS: usize = 32;
+  const IS_SIGNED: bool = false;
+  type Unsigned = u32;
 
   #[inline]
   fn msm_is_zero(&self) -> bool {
@@ -92,10 +142,22 @@ impl MsmScalar for u32 {
   fn get_window(&self, start: usize, width: usize) -> usize {
     ((*self as usize) >> start) & make_mask(width)
   }
+
+  #[inline]
+  fn is_negative(&self) -> bool {
+    false
+  }
+
+  #[inline]
+  fn abs_value(&self) -> Self::Unsigned {
+    *self
+  }
 }
 
 impl MsmScalar for u64 {
   const MAX_BITS: usize = 64;
+  const IS_SIGNED: bool = false;
+  type Unsigned = u64;
 
   #[inline]
   fn msm_is_zero(&self) -> bool {
@@ -107,11 +169,27 @@ impl MsmScalar for u64 {
     let shifted = if start >= 64 { 0 } else { *self >> start };
     (shifted as usize) & make_mask(width)
   }
+
+  #[inline]
+  fn is_negative(&self) -> bool {
+    false
+  }
+
+  #[inline]
+  fn abs_value(&self) -> Self::Unsigned {
+    *self
+  }
 }
 
-// Implementations for signed integers (treat as unsigned for bit extraction)
+// Implementations for signed integers
+// For signed types:
+// - MAX_BITS is reduced by 1 (sign bit is handled separately)
+// - get_window operates on the absolute value's bits
+// - is_negative and abs_value enable proper sign handling in MSM
 impl MsmScalar for i8 {
-  const MAX_BITS: usize = 8;
+  const MAX_BITS: usize = 7; // 7 bits for magnitude
+  const IS_SIGNED: bool = true;
+  type Unsigned = u8;
 
   #[inline]
   fn msm_is_zero(&self) -> bool {
@@ -120,12 +198,26 @@ impl MsmScalar for i8 {
 
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
-    ((*self as u8 as usize) >> start) & make_mask(width)
+    // get_window should be called on abs_value() result, not directly
+    // But for compatibility, we extract from the absolute value
+    ((self.unsigned_abs() as usize) >> start) & make_mask(width)
+  }
+
+  #[inline]
+  fn is_negative(&self) -> bool {
+    *self < 0
+  }
+
+  #[inline]
+  fn abs_value(&self) -> Self::Unsigned {
+    self.unsigned_abs()
   }
 }
 
 impl MsmScalar for i16 {
-  const MAX_BITS: usize = 16;
+  const MAX_BITS: usize = 15; // 15 bits for magnitude
+  const IS_SIGNED: bool = true;
+  type Unsigned = u16;
 
   #[inline]
   fn msm_is_zero(&self) -> bool {
@@ -134,12 +226,24 @@ impl MsmScalar for i16 {
 
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
-    ((*self as u16 as usize) >> start) & make_mask(width)
+    ((self.unsigned_abs() as usize) >> start) & make_mask(width)
+  }
+
+  #[inline]
+  fn is_negative(&self) -> bool {
+    *self < 0
+  }
+
+  #[inline]
+  fn abs_value(&self) -> Self::Unsigned {
+    self.unsigned_abs()
   }
 }
 
 impl MsmScalar for i32 {
-  const MAX_BITS: usize = 32;
+  const MAX_BITS: usize = 31; // 31 bits for magnitude
+  const IS_SIGNED: bool = true;
+  type Unsigned = u32;
 
   #[inline]
   fn msm_is_zero(&self) -> bool {
@@ -148,12 +252,24 @@ impl MsmScalar for i32 {
 
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
-    ((*self as u32 as usize) >> start) & make_mask(width)
+    ((self.unsigned_abs() as usize) >> start) & make_mask(width)
+  }
+
+  #[inline]
+  fn is_negative(&self) -> bool {
+    *self < 0
+  }
+
+  #[inline]
+  fn abs_value(&self) -> Self::Unsigned {
+    self.unsigned_abs()
   }
 }
 
 impl MsmScalar for i64 {
-  const MAX_BITS: usize = 64;
+  const MAX_BITS: usize = 63; // 63 bits for magnitude
+  const IS_SIGNED: bool = true;
+  type Unsigned = u64;
 
   #[inline]
   fn msm_is_zero(&self) -> bool {
@@ -162,8 +278,19 @@ impl MsmScalar for i64 {
 
   #[inline]
   fn get_window(&self, start: usize, width: usize) -> usize {
-    let shifted = if start >= 64 { 0 } else { (*self as u64) >> start };
+    let abs_val = self.unsigned_abs();
+    let shifted = if start >= 64 { 0 } else { abs_val >> start };
     (shifted as usize) & make_mask(width)
+  }
+
+  #[inline]
+  fn is_negative(&self) -> bool {
+    *self < 0
+  }
+
+  #[inline]
+  fn abs_value(&self) -> Self::Unsigned {
+    self.unsigned_abs()
   }
 }
 
@@ -178,6 +305,8 @@ pub struct FieldScalar<F: PrimeField>(pub F);
 
 impl<F: PrimeField> MsmScalar for FieldScalar<F> {
   const MAX_BITS: usize = 256; // Conservative upper bound for most fields
+  const IS_SIGNED: bool = false; // Field elements are always non-negative
+  type Unsigned = Self; // Field elements are their own "unsigned" type
 
   #[inline]
   fn msm_is_zero(&self) -> bool {
@@ -207,6 +336,16 @@ impl<F: PrimeField> MsmScalar for FieldScalar<F> {
     tmp &= (1u64 << width) - 1;
 
     tmp as usize
+  }
+
+  #[inline]
+  fn is_negative(&self) -> bool {
+    false // Field elements are always non-negative
+  }
+
+  #[inline]
+  fn abs_value(&self) -> Self::Unsigned {
+    *self // Field elements are their own absolute value
   }
 }
 
@@ -301,6 +440,9 @@ fn msm_binary_generic<C: CurveAffine, S: MsmScalar>(
 }
 
 /// Bucketed MSM for 2-10 bit scalars using MsmScalar trait.
+///
+/// For signed scalar types, this function handles negative scalars
+/// by negating the base point and using the absolute value for bucket indexing.
 #[inline(always)]
 fn msm_bucketed_generic<C: CurveAffine, S: MsmScalar>(
   scalars: &[S],
@@ -321,9 +463,17 @@ fn msm_bucketed_generic<C: CurveAffine, S: MsmScalar>(
       .zip(bases.iter())
       .filter(|(scalar, _)| !scalar.msm_is_zero())
       .for_each(|(scalar, base)| {
+        // Handle sign: for negative scalars, negate the base point
+        let base_to_use = if S::IS_SIGNED && scalar.is_negative() {
+          -(*base)
+        } else {
+          *base
+        };
+
         // For small scalars, window 0 with full width gives the value
+        // For signed types, get_window already operates on absolute value
         let bucket_index = scalar.get_window(0, max_bits);
-        buckets[bucket_index].add_assign(base);
+        buckets[bucket_index].add_assign(&base_to_use);
       });
 
     let mut result = C::Curve::identity();
@@ -354,6 +504,10 @@ fn msm_bucketed_generic<C: CurveAffine, S: MsmScalar>(
 }
 
 /// Windowed Pippenger MSM for larger scalars using MsmScalar trait.
+///
+/// For signed scalar types (i32, i64), this function handles negative scalars
+/// by negating the base point and using the absolute value for bucket indexing.
+/// This is mathematically correct: (-s) × G = -(s × G) = s × (-G)
 #[inline(always)]
 fn msm_windowed_generic<C: CurveAffine, S: MsmScalar>(
   scalars: &[S],
@@ -383,16 +537,30 @@ fn msm_windowed_generic<C: CurveAffine, S: MsmScalar>(
         let mut buckets = vec![zero; (1 << c) - 1];
 
         scalars_and_bases_iter.clone().for_each(|(scalar, base)| {
-          // Check if scalar is 1 (handle specially in first window)
+          // Handle sign: for negative scalars, negate the base point
+          // This works because: (-s) × G = s × (-G)
+          let (base_to_use, is_neg) = if S::IS_SIGNED && scalar.is_negative() {
+            // Negate the affine point (just negates y-coordinate, O(1))
+            (-*base, true)
+          } else {
+            (*base, false)
+          };
+
+          // Check if scalar is 1 (or -1 for signed) - handle specially in first window
+          // For signed types, get_window already operates on absolute value
           let full_val = scalar.get_window(0, max_bits.min(64));
           if full_val == 1 {
             if w_start == 0 {
-              res += base;
+              if is_neg {
+                res += base_to_use; // base_to_use is already negated
+              } else {
+                res += base;
+              }
             }
           } else {
             let window_val = scalar.get_window(w_start, c);
             if window_val != 0 {
-              buckets[window_val - 1] += base;
+              buckets[window_val - 1] += base_to_use;
             }
           }
         });
@@ -965,5 +1133,113 @@ mod tests {
   fn test_msm_ux() {
     test_msm_ux_with::<pallas::Scalar, pallas::Affine>();
     test_msm_ux_with::<vesta::Scalar, vesta::Affine>();
+  }
+
+  /// Test MSM with signed integers (i32, i64)
+  /// Verifies that negative scalars are handled correctly: (-s) × G = -(s × G)
+  fn test_msm_signed_with<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
+    let n = 16;
+    let bases = (0..n)
+      .map(|_| A::from(A::generator() * F::random(OsRng)))
+      .collect::<Vec<_>>();
+
+    // Test i32 with mixed positive and negative values
+    {
+      let coeffs_i32: Vec<i32> = (0..n)
+        .map(|i| {
+          let val = (rand::random::<u32>() % 1000) as i32;
+          if i % 2 == 0 { val } else { -val } // Alternate signs
+        })
+        .collect();
+
+      // Compute expected result using field elements
+      let coeffs_field: Vec<F> = coeffs_i32
+        .iter()
+        .map(|&v| {
+          if v >= 0 {
+            F::from(v as u64)
+          } else {
+            -F::from((-v) as u64)
+          }
+        })
+        .collect();
+      let expected = msm(&coeffs_field, &bases, true).unwrap();
+
+      // Compute using msm_generic with i32
+      let actual = msm_generic(&coeffs_i32, &bases, true).unwrap();
+
+      assert_eq!(expected, actual, "i32 MSM with mixed signs should match field MSM");
+    }
+
+    // Test i64 with mixed positive and negative values
+    {
+      let coeffs_i64: Vec<i64> = (0..n)
+        .map(|i| {
+          let val = (rand::random::<u64>() % 100_000) as i64;
+          if i % 3 == 0 { -val } else { val } // Every 3rd is negative
+        })
+        .collect();
+
+      // Compute expected result using field elements
+      let coeffs_field: Vec<F> = coeffs_i64
+        .iter()
+        .map(|&v| {
+          if v >= 0 {
+            F::from(v as u64)
+          } else {
+            -F::from((-v) as u64)
+          }
+        })
+        .collect();
+      let expected = msm(&coeffs_field, &bases, true).unwrap();
+
+      // Compute using msm_generic with i64
+      let actual = msm_generic(&coeffs_i64, &bases, true).unwrap();
+
+      assert_eq!(expected, actual, "i64 MSM with mixed signs should match field MSM");
+    }
+
+    // Test edge case: all negative
+    {
+      let coeffs_i32: Vec<i32> = (0..n).map(|_| -((rand::random::<u32>() % 100) as i32) - 1).collect();
+      let coeffs_field: Vec<F> = coeffs_i32.iter().map(|&v| -F::from((-v) as u64)).collect();
+      let expected = msm(&coeffs_field, &bases, true).unwrap();
+      let actual = msm_generic(&coeffs_i32, &bases, true).unwrap();
+      assert_eq!(expected, actual, "All-negative i32 MSM should match");
+    }
+
+    // Test edge case: zeros mixed in
+    {
+      let coeffs_i64: Vec<i64> = (0..n)
+        .map(|i| {
+          if i % 4 == 0 {
+            0
+          } else if i % 2 == 0 {
+            (rand::random::<u64>() % 1000) as i64
+          } else {
+            -((rand::random::<u64>() % 1000) as i64)
+          }
+        })
+        .collect();
+      let coeffs_field: Vec<F> = coeffs_i64
+        .iter()
+        .map(|&v| {
+          if v >= 0 {
+            F::from(v as u64)
+          } else {
+            -F::from((-v) as u64)
+          }
+        })
+        .collect();
+      let expected = msm(&coeffs_field, &bases, true).unwrap();
+      let actual = msm_generic(&coeffs_i64, &bases, true).unwrap();
+      assert_eq!(expected, actual, "Mixed zeros/pos/neg should match");
+    }
+  }
+
+  #[test]
+  fn test_msm_signed() {
+    test_msm_signed_with::<pallas::Scalar, pallas::Affine>();
+    test_msm_signed_with::<vesta::Scalar, vesta::Affine>();
   }
 }

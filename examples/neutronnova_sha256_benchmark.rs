@@ -406,6 +406,11 @@ fn benchmark_native_prove<E: Engine>(
     + num_traits::One
     + From<i32>,
 {
+  assert!(
+    num_instances >= 2,
+    "Native benchmark requires at least 2 instances (NIFS folding needs multiple instances)"
+  );
+
   let num_cores = rayon::current_num_threads();
 
   eprintln!(

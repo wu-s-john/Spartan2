@@ -23,6 +23,7 @@
 //! and other algebraic structures used throughout the Spartan proof system.
 use crate::{
   errors::SpartanError,
+  provider::msm::MsmScalar,
   traits::{Group, transcript::TranscriptReprTrait},
 };
 use core::{
@@ -30,8 +31,6 @@ use core::{
   ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign},
 };
 use halo2curves::{CurveAffine, serde::SerdeObject};
-use num_integer::Integer;
-use num_traits::ToPrimitive;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 
@@ -123,15 +122,18 @@ pub trait DlogGroupExt: DlogGroup {
       .collect::<Result<Vec<_>, _>>()
   }
 
-  /// A method to compute a multiexponentation with small scalars
-  fn vartime_multiscalar_mul_small<T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
+  /// A method to compute a multiexponentation with small scalars.
+  /// Accepts any type implementing `MsmScalar`, including both signed (i32, i64) and unsigned (u32, u64) types.
+  /// For signed types, negative scalars are handled correctly by negating the base point.
+  fn vartime_multiscalar_mul_small<T: MsmScalar>(
     scalars: &[T],
     bases: &[Self::AffineGroupElement],
     use_parallelism_internally: bool,
   ) -> Result<Self, SpartanError>;
 
-  /// A method to compute a batch of multiexponentations with small scalars
-  fn batch_vartime_multiscalar_mul_small<T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
+  /// A method to compute a batch of multiexponentations with small scalars.
+  /// Accepts any type implementing `MsmScalar`, including both signed and unsigned types.
+  fn batch_vartime_multiscalar_mul_small<T: MsmScalar>(
     scalars: &[Vec<T>],
     bases: &[Self::AffineGroupElement],
   ) -> Result<Vec<Self>, SpartanError> {
@@ -304,15 +306,14 @@ macro_rules! impl_traits {
         msm(scalars, bases, use_parallelism_internally)
       }
 
-      fn vartime_multiscalar_mul_small<T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
+      fn vartime_multiscalar_mul_small<T: $crate::provider::msm::MsmScalar>(
         scalars: &[T],
         bases: &[Self::AffineGroupElement],
         use_parallelism_internally: bool,
       ) -> Result<Self, $crate::errors::SpartanError> {
-        // Use msm_generic with u64 scalars for compile-time MAX_BITS algorithm selection.
-        // First convert T to u64, then use msm_generic which avoids runtime bit scanning.
-        let scalars_u64: Vec<u64> = scalars.iter().map(|s| (*s).into()).collect();
-        msm_generic(&scalars_u64, bases, use_parallelism_internally)
+        // Call msm_generic directly with the MsmScalar type - no conversion needed.
+        // msm_generic handles both signed and unsigned types correctly.
+        msm_generic(scalars, bases, use_parallelism_internally)
       }
     }
   };

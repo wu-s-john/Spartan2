@@ -21,8 +21,8 @@ use halo2curves::{
   pasta::{Pallas, PallasAffine, Vesta, VestaAffine},
 };
 use num_bigint::BigInt;
-use num_integer::Integer;
-use num_traits::{Num, ToPrimitive};
+
+use num_traits::{Num};
 use rayon::prelude::*;
 use sha3::Shake256;
 use std::io::Read;

@@ -501,4 +501,80 @@ mod tests {
       assert!(cs.is_satisfied(), "CS not satisfied at iteration {}", i);
     }
   }
+
+  /// Allocate input bytes as witness bits (not constants).
+  fn alloc_input_bits<Scalar, CS>(
+    cs: &mut CS,
+    bytes: &[u8],
+  ) -> Result<Vec<Boolean>, SynthesisError>
+  where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+  {
+    use bellpepper_core::boolean::AllocatedBit;
+
+    bytes
+      .iter()
+      .enumerate()
+      .flat_map(|(byte_idx, byte)| {
+        (0..8).rev().enumerate().map(move |(bit_idx, i)| {
+          let bit_val = (byte >> i) & 1 == 1;
+          (byte_idx, bit_idx, bit_val)
+        })
+      })
+      .map(|(byte_idx, bit_idx, bit_val)| {
+        AllocatedBit::alloc(
+          cs.namespace(|| format!("input_{}_{}", byte_idx, bit_idx)),
+          Some(bit_val),
+        )
+        .map(Boolean::from)
+      })
+      .collect()
+  }
+
+  #[test]
+  fn test_i64_vs_i32_constraint_count_comparison() {
+    use crate::bellpepper::test_shape_cs::TestShapeCS;
+    use crate::provider::Bn254Engine;
+    type Scalar = <Bn254Engine as crate::traits::Engine>::Scalar;
+
+    // i64 path: BatchingEq<21> + full addition
+    let mut cs_i64_batched = TestShapeCS::<Bn254Engine>::new();
+    let input_i64 = alloc_input_bits::<Scalar, _>(&mut cs_i64_batched, b"abc").unwrap();
+    let _ = small_sha256::<Scalar, _>(&mut cs_i64_batched, &input_i64).unwrap();
+    let constraints_i64_batched = cs_i64_batched.num_constraints();
+
+    // i32 path: NoBatchEq + limbed addition
+    let mut cs_i32_nobatch = TestShapeCS::<Bn254Engine>::new();
+    let input_i32 = alloc_input_bits::<Scalar, _>(&mut cs_i32_nobatch, b"abc").unwrap();
+    {
+      let mut eq = NoBatchEq::<Scalar, _>::new(&mut cs_i32_nobatch);
+      let _ = small_sha256_with_small_multi_eq(&mut eq, &input_i32, "").unwrap();
+    }
+    let constraints_i32_nobatch = cs_i32_nobatch.num_constraints();
+
+    // Native small_gadgets (i32 path with SmallCS)
+    use crate::small_gadgets::{bytes_to_bits as native_bytes_to_bits, small_sha256 as native_sha256, small_sha256_batched};
+    use crate::small_r1cs::{SmallCS, SmallConstraintSystem};
+
+    let mut cs_native = SmallCS::<i32, i32>::new();
+    let input_native = native_bytes_to_bits::<i32, i32>(b"abc");
+    let _ = native_sha256(&mut cs_native, &input_native).unwrap();
+    let constraints_native = cs_native.num_constraints();
+
+    let mut cs_native_batched = SmallCS::<i32, i32>::new();
+    let input_native_batched = native_bytes_to_bits::<i32, i32>(b"abc");
+    let _ = small_sha256_batched(&mut cs_native_batched, &input_native_batched).unwrap();
+    let constraints_native_batched = cs_native_batched.num_constraints();
+
+    println!("\n=== SHA-256 Constraint Counts Comparison ===");
+    println!("Bellpepper i64 (BatchingEq<21> + full):  {}", constraints_i64_batched);
+    println!("Bellpepper i32 (NoBatchEq + limbed):     {}", constraints_i32_nobatch);
+    println!("Native i32 (SmallCS, non-batched):       {}", constraints_native);
+    println!("Native i32 (SmallCS, BatchingSmallCS):   {}", constraints_native_batched);
+    println!();
+    println!("Bellpepper i32 vs i64: +{:.1}%", 100.0 * (constraints_i32_nobatch as f64 / constraints_i64_batched as f64 - 1.0));
+    println!("Native i32 vs Bellpepper i64: +{:.1}%", 100.0 * (constraints_native as f64 / constraints_i64_batched as f64 - 1.0));
+    println!("Native batched vs Bellpepper i64: +{:.1}%", 100.0 * (constraints_native_batched as f64 / constraints_i64_batched as f64 - 1.0));
+  }
 }

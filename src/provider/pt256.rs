@@ -22,8 +22,8 @@ use halo2curves::{
   t256::{T256, T256Affine},
 };
 use num_bigint::BigInt;
-use num_integer::Integer;
-use num_traits::{Num, ToPrimitive};
+
+use num_traits::{Num};
 use rayon::prelude::*;
 use sha3::Shake256;
 use std::io::Read;

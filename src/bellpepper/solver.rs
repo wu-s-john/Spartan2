@@ -151,3 +151,36 @@ impl<E: Engine> ConstraintSystem<E::Scalar> for SatisfyingAssignment<E> {
     &self.aux_assignment
   }
 }
+
+impl<E: Engine> SatisfyingAssignment<E> {
+  /// Extract auxiliary witness values as i64.
+  ///
+  /// This is useful for small-value circuits where all witness values are known
+  /// to fit in machine integers. Converting once here is cheaper than repeated
+  /// field-to-bytes conversion during MSM.
+  ///
+  /// # Returns
+  ///
+  /// A vector of i64 values, or `None` if any value doesn't fit in i64.
+  /// For small-value circuits, all values should fit.
+  pub fn extract_aux_as_i64(&self) -> Option<Vec<i64>> {
+    self
+      .aux_assignment
+      .iter()
+      .map(|f| crate::small_field::try_field_to_i64(f))
+      .collect()
+  }
+
+  /// Extract input (public) witness values as i64.
+  ///
+  /// # Returns
+  ///
+  /// A vector of i64 values, or `None` if any value doesn't fit in i64.
+  pub fn extract_input_as_i64(&self) -> Option<Vec<i64>> {
+    self
+      .input_assignment
+      .iter()
+      .map(|f| crate::small_field::try_field_to_i64(f))
+      .collect()
+  }
+}
