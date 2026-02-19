@@ -283,6 +283,138 @@ where
     Ok(())
 }
 
+// ========================================
+// Optimized SHA-256 with i64 coefficients (uses BatchingSmallCS<21>)
+// ========================================
+
+/// Compute SHA-256 hash with i64 coefficients for optimal constraint count.
+///
+/// Uses `BatchingSmallCS<21>` internally with full 35-bit addition.
+/// This matches bellpepper's constraint efficiency.
+///
+/// # Coefficient Bounds
+///
+/// For 5 operands: max sum = 5 × (2^32 - 1) ≈ 2^35
+/// - Full addition: max coefficient 2^34
+/// - With BatchingSmallCS<21>: 2^34 × 2^20 = 2^54 < 2^63 ✓
+///
+/// # Efficiency
+///
+/// - Full addition: 1 equality constraint per addition (vs 2 for limbed)
+/// - Batched (K=21): 1/21 ≈ 0.048 equality constraints per addition
+/// - Fused T2: saves 1 addition per round (64 total)
+pub fn small_sha256_batched_i64(
+    cs: &mut SmallCS<i32, i64>,
+    input: &[Boolean<i32, i64>],
+) -> Result<Vec<Boolean<i32, i64>>, SynthesisError> {
+    // Pad the input
+    let padded = sha256_padding(input);
+    let num_blocks = padded.len() / 512;
+
+    // Initialize hash state with IV
+    let mut h: [UInt32<i32, i64>; 8] = IV.map(UInt32::constant);
+
+    // Process each 512-bit block with batching
+    {
+        let mut batched = BatchingSmallCS::<i32, i64, 21>::new(cs);
+
+        for block_idx in 0..num_blocks {
+            let block_start = block_idx * 512;
+            let block_bits = &padded[block_start..block_start + 512];
+            sha256_compression_i64(&mut batched, &mut h, block_bits)?;
+        }
+    } // Drop flushes pending constraints
+
+    // Collect output bits (big-endian)
+    let mut output = Vec::with_capacity(256);
+    for h_i in h {
+        let be_bits = h_i.into_bits_be();
+        output.extend(be_bits);
+    }
+
+    Ok(output)
+}
+
+/// SHA-256 compression function with i64 coefficients.
+///
+/// Uses `add_many_full` for single-constraint addition and fuses T2 computation
+/// for optimal constraint count.
+pub fn sha256_compression_i64<CS>(
+    cs: &mut CS,
+    h: &mut [UInt32<i32, i64>; 8],
+    block: &[Boolean<i32, i64>],
+) -> Result<(), SynthesisError>
+where
+    CS: SmallConstraintSystem<i32, i64> + SmallMultiEqCS<i32, i64>,
+{
+    assert_eq!(block.len(), 512, "Block must be 512 bits");
+
+    // Parse block into 16 32-bit words
+    let mut w: Vec<UInt32<i32, i64>> = Vec::with_capacity(64);
+    for i in 0..16 {
+        let bits: [Boolean<i32, i64>; 32] = std::array::from_fn(|j| {
+            // Big-endian: first bit of word is MSB
+            block[i * 32 + (31 - j)].clone()
+        });
+        w.push(UInt32::from_bits_le(bits));
+    }
+
+    // Extend to 64 words using message schedule
+    for i in 16..64 {
+        // w[i] = σ1(w[i-2]) + w[i-7] + σ0(w[i-15]) + w[i-16]
+        let s0 = w[i - 15].sha256_sigma0(cs)?;
+        let s1 = w[i - 2].sha256_sigma1(cs)?;
+        let wi = UInt32::add_many_full(cs, &[s1, w[i - 7].clone(), s0, w[i - 16].clone()])?;
+        w.push(wi);
+    }
+
+    // Initialize working variables
+    let mut a = h[0].clone();
+    let mut b = h[1].clone();
+    let mut c = h[2].clone();
+    let mut d = h[3].clone();
+    let mut e = h[4].clone();
+    let mut f = h[5].clone();
+    let mut g = h[6].clone();
+    let mut hh = h[7].clone();
+
+    // 64 rounds
+    for i in 0..64 {
+        // T1 = h + Σ1(e) + Ch(e,f,g) + K[i] + W[i]
+        let sum1_e = e.sha256_sum1(cs)?;
+        let ch_efg = UInt32::sha256_ch(cs, &e, &f, &g)?;
+        let k_i = UInt32::constant(K[i]);
+        let t1 = UInt32::add_many_full(cs, &[hh.clone(), sum1_e, ch_efg, k_i, w[i].clone()])?;
+
+        // Σ0(a) and Maj(a,b,c) for fused T2
+        let sum0_a = a.sha256_sum0(cs)?;
+        let maj_abc = UInt32::sha256_maj(cs, &a, &b, &c)?;
+
+        // Update working variables
+        hh = g;
+        g = f;
+        f = e;
+        e = UInt32::add_many_full(cs, &[d.clone(), t1.clone()])?;
+        d = c;
+        c = b;
+        b = a;
+        // Fused: a = T1 + Σ0(a) + Maj(a,b,c) - saves one addition per round!
+        a = UInt32::add_many_full(cs, &[t1, sum0_a, maj_abc])?;
+    }
+
+    // Add working variables to hash state
+    h[0] = UInt32::add_many_full(cs, &[h[0].clone(), a])?;
+    h[1] = UInt32::add_many_full(cs, &[h[1].clone(), b])?;
+    h[2] = UInt32::add_many_full(cs, &[h[2].clone(), c])?;
+    h[3] = UInt32::add_many_full(cs, &[h[3].clone(), d])?;
+    h[4] = UInt32::add_many_full(cs, &[h[4].clone(), e])?;
+    h[5] = UInt32::add_many_full(cs, &[h[5].clone(), f])?;
+    h[6] = UInt32::add_many_full(cs, &[h[6].clone(), g])?;
+    h[7] = UInt32::add_many_full(cs, &[h[7].clone(), hh])?;
+
+    Ok(())
+}
+
 /// Apply SHA-256 padding to input bits.
 ///
 /// Padding: append 1 bit, then 0s, then 64-bit length (big-endian).

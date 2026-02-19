@@ -16,7 +16,7 @@ use crate::{
   errors::SpartanError,
   r1cs::{R1CSInstance, R1CSWitness, SplitR1CSShape},
   small_field::SmallValueField,
-  small_gadgets::{Boolean, small_sha256_batched},
+  small_gadgets::{Boolean, small_sha256_batched, small_sha256_batched_i64},
   small_r1cs::{SmallCS, SynthesisError as SmallSynthesisError},
   traits::{Engine, pcs::PCSEngineTrait},
 };
@@ -130,6 +130,96 @@ impl NativeSmallSha256ChainCircuit {
 
     // Create blind and commit using commit_small_direct - passes i32 directly to MSM
     // This avoids the field conversion overhead entirely (no i32 → field → u64 roundtrip)
+    let r_W = E::PCS::blind(ck, W.len());
+    let comm_W = E::PCS::commit_small_direct(ck, &W, &r_W)?;
+
+    Ok((
+      R1CSWitness { W, r_W },
+      R1CSInstance::new_unchecked_generic(comm_W, X),
+    ))
+  }
+
+  // ========================================
+  // i64 coefficient path (optimized constraints)
+  // ========================================
+
+  /// Synthesize into SmallCS<i32, i64> with optimized constraints.
+  ///
+  /// Uses full 35-bit addition and K=21 batching for optimal constraint count.
+  /// Witnesses are i32, but matrix coefficients are i64.
+  pub fn synthesize_i64(&self, cs: &mut SmallCS<i32, i64>) -> Result<(), SmallSynthesisError> {
+    // Allocate input bytes as Boolean<i32, i64> bits (big-endian per byte)
+    let mut current_bits: Vec<Boolean<i32, i64>> = Vec::with_capacity(256);
+    for &byte in &self.input {
+      for i in (0..8).rev() {
+        let bit_val = ((byte >> i) & 1) != 0;
+        current_bits.push(Boolean::alloc(cs, Some(bit_val))?);
+      }
+    }
+
+    // Chain SHA-256 hashes (using i64 optimized version)
+    for _ in 0..self.chain_length {
+      current_bits = small_sha256_batched_i64(cs, &current_bits)?;
+    }
+
+    // Verify against expected output
+    let expected = self.expected_output();
+    let expected_bits: Vec<bool> = expected
+      .iter()
+      .flat_map(|&byte| (0..8).rev().map(move |i| ((byte >> i) & 1) != 0))
+      .collect();
+
+    for (i, (computed, &expected_bit)) in current_bits.iter().zip(expected_bits.iter()).enumerate()
+    {
+      let computed_val = computed.value.unwrap_or(false);
+      assert_eq!(
+        computed_val, expected_bit,
+        "Hash bit {} mismatch: computed={}, expected={}",
+        i, computed_val, expected_bit
+      );
+    }
+
+    // Expose hash bits as public inputs
+    for bit in &current_bits {
+      bit.inputize(cs)?;
+    }
+
+    Ok(())
+  }
+
+  /// Build the R1CS shape with i64 coefficients.
+  ///
+  /// Returns `SplitR1CSShape<E, i64>` with optimized constraint count.
+  pub fn to_shape_i64<E: Engine>(&self) -> SplitR1CSShape<E, i64> {
+    let mut cs = SmallCS::<i32, i64>::new();
+    self.synthesize_i64(&mut cs).expect("Synthesis failed");
+    cs.to_split_r1cs_shape()
+  }
+
+  /// Build R1CSWitness<E, i32> and R1CSInstance<E, i32> using i64 coefficient path.
+  ///
+  /// Uses the optimized i64 constraint system but returns i32 witnesses
+  /// (since witness values are still i32 bits).
+  pub fn to_witness_and_instance_i64<E: Engine>(
+    &self,
+    ck: &CommitmentKey<E>,
+    num_rest_padded: usize,
+  ) -> Result<(R1CSWitness<E, i32>, R1CSInstance<E, i32>), SpartanError>
+  where
+    E::Scalar: SmallValueField<i32>,
+  {
+    let mut cs = SmallCS::<i32, i64>::new();
+    self
+      .synthesize_i64(&mut cs)
+      .map_err(|e| SpartanError::SynthesisError { reason: format!("{:?}", e) })?;
+
+    let mut W: Vec<i32> = cs.witness_values();
+    let X: Vec<i32> = cs.public_values();
+
+    // Pad witness to match shape's padded size
+    W.resize(num_rest_padded, 0);
+
+    // Create blind and commit using commit_small_direct - passes i32 directly to MSM
     let r_W = E::PCS::blind(ck, W.len());
     let comm_W = E::PCS::commit_small_direct(ck, &W, &r_W)?;
 

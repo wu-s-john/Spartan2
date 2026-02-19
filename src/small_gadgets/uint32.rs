@@ -465,6 +465,92 @@ impl<W: Witness, C: Coefficient> UInt32<W, C> {
         })
     }
 
+    /// Add multiple UInt32 values using full 35-bit addition (i64 coefficients).
+    ///
+    /// Uses a single equality constraint instead of 2-limb decomposition.
+    /// Requires i64 coefficients to handle max coefficient 2^34.
+    ///
+    /// # Coefficient Bounds
+    ///
+    /// For 5 operands: max sum = 5 × (2^32 - 1) ≈ 2^35
+    /// - Result bits coefficient: up to 2^34 (for bit 34)
+    /// - With BatchingSmallCS<21>: 2^34 × 2^20 = 2^54 < 2^63 ✓
+    ///
+    /// # Constraints
+    ///
+    /// Creates 1 equality constraint (vs 2 for limbed), which can be batched
+    /// by BatchingSmallCS<21> for optimal constraint reduction.
+    pub fn add_many_full<CS>(cs: &mut CS, operands: &[Self]) -> Result<Self, SynthesisError>
+    where
+        C: From<i64>,
+        CS: SmallConstraintSystem<W, C> + SmallMultiEqCS<W, C>,
+    {
+        assert!(!operands.is_empty(), "add_many_full requires at least one operand");
+
+        if operands.len() == 1 {
+            return Ok(operands[0].clone());
+        }
+
+        // Compute the witness value (as u64 to handle overflow bits)
+        let sum_value_u64: Option<u64> = operands
+            .iter()
+            .try_fold(0u64, |acc, op| op.value.map(|v| acc + (v as u64)));
+        let sum_value: Option<u32> = sum_value_u64.map(|v| v as u32); // Truncate to 32 bits
+
+        // How many bits do we need? For N operands: ceil(log2(N × 2^32)) = 32 + ceil(log2(N))
+        let max_value = (operands.len() as u64) * (u32::MAX as u64);
+        let result_bits_needed = 64 - max_value.leading_zeros() as usize;
+
+        // Allocate result bits (up to 35 bits for 5 operands)
+        let mut all_result_bits: Vec<Boolean<W, C>> = Vec::with_capacity(result_bits_needed);
+        for i in 0..result_bits_needed {
+            let bit_val = sum_value_u64.map(|s| (s >> i) & 1 == 1);
+            all_result_bits.push(Boolean::alloc(cs, bit_val)?);
+        }
+
+        // Build LHS: sum of all operand bits
+        let mut lhs = LinearCombination::<C>::zero();
+        for operand in operands {
+            for i in 0..32 {
+                let coeff = C::from(1i64 << i);
+                if let Some(var) = operand.bits[i].var {
+                    if operand.bits[i].is_negated() {
+                        lhs = lhs + (coeff, CS::one()) - (coeff, var);
+                    } else {
+                        lhs = lhs + (coeff, var);
+                    }
+                } else if operand.bits[i].get_value() == Some(true) {
+                    lhs = lhs + (coeff, CS::one());
+                }
+            }
+        }
+
+        // Build RHS: result bits with positional coefficients
+        let mut rhs = LinearCombination::<C>::zero();
+        for (i, bit) in all_result_bits.iter().enumerate() {
+            let coeff = C::from(1i64 << i);
+            if let Some(var) = bit.var {
+                rhs = rhs + (coeff, var);
+            }
+        }
+
+        // Single equality constraint
+        cs.enforce_equal(&lhs, &rhs);
+
+        // Truncate to 32 bits for result
+        let result_bits: [Boolean<W, C>; 32] = all_result_bits
+            .into_iter()
+            .take(32)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+
+        Ok(UInt32 {
+            bits: result_bits,
+            value: sum_value,
+        })
+    }
+
     /// Add multiple UInt32 values using 3-limb decomposition.
     ///
     /// Uses 12-bit limbs (0-11, 12-23, 24-31) with relative bit positions
@@ -784,8 +870,9 @@ impl<W: Witness, C: Coefficient> UInt32<W, C> {
 
     /// Ch(x, y, z) = (x ∧ y) ⊕ (¬x ∧ z)
     ///
-    /// Optimized: ch = z ^ (x & (y ^ z))
-    /// 96 constraints (32 × 3 ops: XOR, AND, XOR).
+    /// Uses optimized single-constraint formula per bit:
+    /// x × (y - z) = ch - z
+    /// 32 constraints total.
     pub fn sha256_ch<CS: SmallConstraintSystem<W, C>>(
         cs: &mut CS,
         x: &Self,
@@ -795,9 +882,7 @@ impl<W: Witness, C: Coefficient> UInt32<W, C> {
         let mut bits: [Option<Boolean<W, C>>; 32] = std::array::from_fn(|_| None);
 
         for i in 0..32 {
-            let y_xor_z = Boolean::xor(cs, &y.bits[i], &z.bits[i])?;
-            let x_and_yxz = Boolean::and(cs, &x.bits[i], &y_xor_z)?;
-            bits[i] = Some(Boolean::xor(cs, &z.bits[i], &x_and_yxz)?);
+            bits[i] = Some(Boolean::sha256_ch(cs, &x.bits[i], &y.bits[i], &z.bits[i])?);
         }
 
         let bits: [Boolean<W, C>; 32] = bits.map(|b| b.unwrap());
@@ -811,8 +896,10 @@ impl<W: Witness, C: Coefficient> UInt32<W, C> {
 
     /// Maj(x, y, z) = (x ∧ y) ⊕ (x ∧ z) ⊕ (y ∧ z)
     ///
-    /// Optimized: maj = (x & y) ^ (z & (x ^ y))
-    /// 128 constraints (32 × 4 ops: XOR, AND, AND, XOR).
+    /// Uses optimized 2-constraint formula per bit:
+    /// 1. bc = y × z
+    /// 2. (2bc - y - z) × x = bc - maj
+    /// 64 constraints total.
     pub fn sha256_maj<CS: SmallConstraintSystem<W, C>>(
         cs: &mut CS,
         x: &Self,
@@ -822,10 +909,7 @@ impl<W: Witness, C: Coefficient> UInt32<W, C> {
         let mut bits: [Option<Boolean<W, C>>; 32] = std::array::from_fn(|_| None);
 
         for i in 0..32 {
-            let x_xor_y = Boolean::xor(cs, &x.bits[i], &y.bits[i])?;
-            let z_and_xxy = Boolean::and(cs, &z.bits[i], &x_xor_y)?;
-            let x_and_y = Boolean::and(cs, &x.bits[i], &y.bits[i])?;
-            bits[i] = Some(Boolean::xor(cs, &x_and_y, &z_and_xxy)?);
+            bits[i] = Some(Boolean::sha256_maj(cs, &x.bits[i], &y.bits[i], &z.bits[i])?);
         }
 
         let bits: [Boolean<W, C>; 32] = bits.map(|b| b.unwrap());

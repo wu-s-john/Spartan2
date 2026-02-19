@@ -379,13 +379,13 @@ fn make_native_circuits(
     .collect()
 }
 
-/// Benchmark native i32 arithmetic path using SmallCS + prove_native.
+/// Benchmark native i64 coefficient path using SmallCS + prove_native.
 ///
 /// This path uses:
-/// - NativeSmallSha256ChainCircuit (SmallCS<i32, i32> + small_gadgets/sha256)
-/// - SplitR1CSShape<E, i32> (small coefficients)
-/// - R1CSWitness<E, i32> / R1CSInstance<E, i32> (small values)
-/// - NeutronNovaNIFS::prove_native with pure i32 × i32 → i64 arithmetic
+/// - NativeSmallSha256ChainCircuit with i64 coefficients (SmallCS<i32, i64> + small_gadgets/sha256)
+/// - SplitR1CSShape<E, i64> (i64 coefficients for optimal constraints)
+/// - R1CSWitness<E, i32> / R1CSInstance<E, i32> (i32 witness values)
+/// - NeutronNovaNIFS::prove_native with i64 × i32 → i128 arithmetic
 fn benchmark_native_prove<E: Engine>(
   num_instances: usize,
   chain_length: usize,
@@ -398,13 +398,13 @@ fn benchmark_native_prove<E: Engine>(
     + DelayedReduction<i64>
     + DelayedReduction<i128>
     + DelayedReduction<E::Scalar>,
-  i32: WideningMul<i32, i64>,
-  i64: Witness + WideMul + Accumulator,
+  i32: WideningMul<i64, i64> + Witness,  // i64 coeff × i32 witness → i64 acc
+  i64: WideMul + Accumulator,
   <i64 as WideMul>::Product: Copy + Ord + num_traits::Signed
     + std::ops::Div<Output = <i64 as WideMul>::Product>
     + std::ops::Mul<Output = <i64 as WideMul>::Product>
     + num_traits::One
-    + From<i32>,
+    + From<i64>,
 {
   assert!(
     num_instances >= 2,
@@ -414,16 +414,16 @@ fn benchmark_native_prove<E: Engine>(
   let num_cores = rayon::current_num_threads();
 
   eprintln!(
-    "Setting up Native NeutronNova for {} instances, chain_length={}, cores={}...",
+    "Setting up Native NeutronNova (i64 coefficients) for {} instances, chain_length={}, cores={}...",
     num_instances, chain_length, num_cores
   );
 
   // Create native circuits
   let circuits = make_native_circuits(num_instances, chain_length);
 
-  // Get shape from first circuit
+  // Get shape from first circuit using i64 coefficients
   let t0 = Instant::now();
-  let shape: SplitR1CSShape<E, i32> = circuits[0].to_shape();
+  let shape: SplitR1CSShape<E, i64> = circuits[0].to_shape_i64();
 
   // Create commitment key from shape (need field version for CK setup)
   let shape_field: SplitR1CSShape<E> = SplitR1CSShape::new_simple(
@@ -450,16 +450,20 @@ fn benchmark_native_prove<E: Engine>(
   let setup_ms = t0.elapsed().as_millis();
   eprintln!("Setup done in {} ms (constraints: {})", setup_ms, shape.num_cons);
 
-  // Generate witnesses and instances (native i32)
+  // Generate witnesses and instances (native i32 witnesses with i64 coefficient synthesis)
+  // Parallelize across circuits using rayon
+  use rayon::prelude::*;
   let t_witness = Instant::now();
-  let (witnesses, instances): (Vec<R1CSWitness<E, i32>>, Vec<R1CSInstance<E, i32>>) = circuits
-    .iter()
-    .map(|c| c.to_witness_and_instance(&ck, shape.num_rest).expect("to_witness_and_instance"))
-    .unzip();
+  let results: Vec<_> = circuits
+    .par_iter()
+    .map(|c| c.to_witness_and_instance_i64(&ck, shape.num_rest).expect("to_witness_and_instance_i64"))
+    .collect();
+  let (witnesses, instances): (Vec<R1CSWitness<E, i32>>, Vec<R1CSInstance<E, i32>>) =
+    results.into_iter().unzip();
   let witness_gen_ms = t_witness.elapsed().as_millis();
-  eprintln!("Witness generation done in {} ms", witness_gen_ms);
+  eprintln!("Witness generation done in {} ms (parallelized)", witness_gen_ms);
 
-  // Run prove_native
+  // Run prove_native with i64 coefficients
   let t_prove = Instant::now();
 
   let mut vc = NeutronNovaVerifierCircuit::<E>::default(num_rounds_b, num_rounds_x, num_rounds_y);
@@ -467,7 +471,8 @@ fn benchmark_native_prove<E: Engine>(
     SatisfyingAssignment::<E>::initialize_multiround_witness(&vc_shape).expect("init vc_state");
   let mut transcript = <E as Engine>::TE::new(b"neutronnova_native_benchmark");
 
-  let result = NeutronNovaNIFS::<E>::prove_native::<i32, i64, i32>(
+  // Use i64 coefficients (C=i64), i32 witnesses (W=i32), i64 accumulator (i64 × i32 → i64)
+  let result = NeutronNovaNIFS::<E>::prove_native::<i32, i64, i64>(
     &shape,
     &instances,
     &witnesses,
@@ -486,7 +491,7 @@ fn benchmark_native_prove<E: Engine>(
   }
 
   // Print summary
-  eprintln!("\n===== Native Path Summary =====");
+  eprintln!("\n===== Native i64 Path Summary =====");
   eprintln!("  Instances:    {}", num_instances);
   eprintln!("  Chain length: {}", chain_length);
   eprintln!("  Constraints:  {}", shape.num_cons);

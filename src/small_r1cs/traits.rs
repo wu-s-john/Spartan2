@@ -179,6 +179,14 @@ impl WideningMul<i64, i64> for i32 {
     }
 }
 
+// Implementation for i64 × i32 → i64 (wider coefficient × small witness)
+impl WideningMul<i32, i64> for i64 {
+    #[inline]
+    fn wide_mul(self, w: i32) -> i64 {
+        self * (w as i64)
+    }
+}
+
 /// Trait for constraint systems that support batched equality constraints.
 ///
 /// This trait extends the basic constraint system operations with the ability

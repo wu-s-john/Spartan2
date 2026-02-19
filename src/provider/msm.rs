@@ -520,14 +520,48 @@ fn msm_windowed_generic<C: CurveAffine, S: MsmScalar>(
     bases: &[C],
     max_bits: usize,
   ) -> C::Curve {
-    let c = if bases.len() < 32 {
+    let zero = C::Curve::identity();
+
+    // Pre-filter: separate boolean scalars (0, 1, -1) from larger values.
+    // This is a major optimization for SHA-256 witnesses which are mostly binary.
+    let mut boolean_sum = zero;
+    let mut non_boolean_scalars = Vec::new();
+    let mut non_boolean_bases = Vec::new();
+
+    for (scalar, base) in scalars.iter().zip(bases) {
+      if scalar.msm_is_zero() {
+        // Skip zeros
+        continue;
+      }
+      let abs_val = scalar.get_window(0, max_bits.min(64));
+      if abs_val == 1 {
+        // Handle 1 and -1 directly
+        if S::IS_SIGNED && scalar.is_negative() {
+          boolean_sum += -(*base);
+        } else {
+          boolean_sum += *base;
+        }
+      } else {
+        non_boolean_scalars.push(*scalar);
+        non_boolean_bases.push(*base);
+      }
+    }
+
+    // If all scalars were boolean, we're done
+    if non_boolean_scalars.is_empty() {
+      return boolean_sum;
+    }
+
+    // Process non-boolean scalars with windowed method
+    let c = if non_boolean_bases.len() < 32 {
       3
     } else {
-      compute_ln(bases.len()) + 2
+      compute_ln(non_boolean_bases.len()) + 2
     };
 
-    let zero = C::Curve::identity();
-    let scalars_and_bases_iter = scalars.iter().zip(bases).filter(|(s, _)| !s.msm_is_zero());
+    let scalars_and_bases_iter = non_boolean_scalars
+      .iter()
+      .zip(non_boolean_bases.iter());
     let window_starts: Vec<usize> = (0..max_bits).step_by(c).collect();
 
     let window_sums: Vec<_> = window_starts
@@ -538,30 +572,15 @@ fn msm_windowed_generic<C: CurveAffine, S: MsmScalar>(
 
         scalars_and_bases_iter.clone().for_each(|(scalar, base)| {
           // Handle sign: for negative scalars, negate the base point
-          // This works because: (-s) × G = s × (-G)
-          let (base_to_use, is_neg) = if S::IS_SIGNED && scalar.is_negative() {
-            // Negate the affine point (just negates y-coordinate, O(1))
-            (-*base, true)
+          let base_to_use = if S::IS_SIGNED && scalar.is_negative() {
+            -(*base)
           } else {
-            (*base, false)
+            *base
           };
 
-          // Check if scalar is 1 (or -1 for signed) - handle specially in first window
-          // For signed types, get_window already operates on absolute value
-          let full_val = scalar.get_window(0, max_bits.min(64));
-          if full_val == 1 {
-            if w_start == 0 {
-              if is_neg {
-                res += base_to_use; // base_to_use is already negated
-              } else {
-                res += base;
-              }
-            }
-          } else {
-            let window_val = scalar.get_window(w_start, c);
-            if window_val != 0 {
-              buckets[window_val - 1] += base_to_use;
-            }
+          let window_val = scalar.get_window(w_start, c);
+          if window_val != 0 {
+            buckets[window_val - 1] += base_to_use;
           }
         });
 
@@ -574,9 +593,11 @@ fn msm_windowed_generic<C: CurveAffine, S: MsmScalar>(
       })
       .collect();
 
+    // Combine boolean sum with windowed result
     let lowest = window_sums.first().copied().unwrap_or(zero);
 
-    lowest
+    boolean_sum
+      + lowest
       + window_sums[1..]
         .iter()
         .rev()
