@@ -10,6 +10,7 @@ use crate::{
   VerifierKey,
   digest::SimpleDigestible,
   errors::SpartanError,
+  small_field::SmallValueField,
   small_r1cs::{Accumulator, WideningMul, Witness},
   start_span,
   traits::{
@@ -971,7 +972,11 @@ impl<E: Engine> SplitR1CSShape<E> {
     })
   }
 
-  pub fn equalize(S_A: &mut Self, S_B: &mut Self) {
+  // Generic equalize implementation - accepts any coefficient type
+  fn equalize_generic<C: Copy + Clone + Send + Sync>(
+    S_A: &mut SplitR1CSShape<E, C>,
+    S_B: &mut SplitR1CSShape<E, C>,
+  ) {
     let orig_cons_a = S_A.num_cons;
     let orig_cons_b = S_B.num_cons;
 
@@ -984,7 +989,7 @@ impl<E: Engine> SplitR1CSShape<E> {
     S_A.num_cons = num_cons_padded;
     S_B.num_cons = num_cons_padded;
 
-    let move_public_vars = |M: &mut SparseMatrix<E::Scalar>, num_cons: usize, num_vars: usize| {
+    let move_public_vars = |M: &mut SparseMatrix<C>, num_cons: usize, num_vars: usize| {
       M.indices.par_iter_mut().for_each(|c| {
         if *c >= num_vars {
           // public and challenge variables
@@ -1208,31 +1213,102 @@ impl<E: Engine, C: Copy + Clone + Send + Sync> SplitR1CSShape<E, C> {
   ///
   /// This constructor is used for circuits synthesized with SmallCS that don't
   /// need the shared/precommitted variable split.
+  ///
+  /// Applies padding to matrices so that column indices and `cols` match the
+  /// padded shape dimensions.
+  ///
+  /// # Arguments
+  /// - `num_cons_unpadded`: Number of constraints before padding
+  /// - `num_shared_unpadded`: Number of shared witnesses (phase 1)
+  /// - `num_precommitted_unpadded`: Number of precommitted witnesses (phase 2)
+  /// - `num_rest_unpadded`: Number of rest witnesses (phase 3)
+  /// - `num_public`: Number of public inputs
+  /// - `num_challenges`: Number of challenges (usually 0 for simple shapes)
+  /// - `A, B, C_mat`: The R1CS matrices
   pub fn new_simple(
     num_cons_unpadded: usize,
+    num_shared_unpadded: usize,
+    num_precommitted_unpadded: usize,
     num_rest_unpadded: usize,
     num_public: usize,
-    A: SparseMatrix<C>,
-    B: SparseMatrix<C>,
-    C: SparseMatrix<C>,
+    num_challenges: usize,
+    mut A: SparseMatrix<C>,
+    mut B: SparseMatrix<C>,
+    mut C_mat: SparseMatrix<C>,
   ) -> Self {
+    let width = crate::r1cs::DEFAULT_COMMITMENT_WIDTH;
     let num_cons = num_cons_unpadded.next_power_of_two();
-    let num_rest = num_rest_unpadded.next_power_of_two();
+
+    // Pad each segment to width, same logic as SplitR1CSShape::new
+    let num_shared = crate::r1cs::pad_to_width(width, num_shared_unpadded);
+    let num_precommitted = crate::r1cs::pad_to_width(width, num_precommitted_unpadded);
+    let mut num_rest = crate::r1cs::pad_to_width(width, num_rest_unpadded);
+
+    // Ensure total vars >= num_public + num_challenges + 1
+    let num_vars = num_shared + num_precommitted + num_rest;
+    if num_vars < num_public + num_challenges + 1 {
+      num_rest = std::cmp::max(num_public + num_challenges + 1, num_vars)
+        - (num_shared + num_precommitted);
+    }
+
+    // Ensure total vars is power of two
+    let num_vars = num_shared + num_precommitted + num_rest;
+    if num_vars.next_power_of_two() != num_vars {
+      num_rest = num_vars.next_power_of_two() - (num_shared + num_precommitted);
+    }
+
+    let num_vars_unpadded = num_shared_unpadded + num_precommitted_unpadded + num_rest_unpadded;
+    let num_vars_padded = num_shared + num_precommitted + num_rest;
+
+    // Apply padding to matrices (same logic as SplitR1CSShape::new)
+    // Layout: [shared | precommitted | rest | 1 | public | challenges]
+    let apply_pad = |m: &mut SparseMatrix<C>| {
+      m.indices.par_iter_mut().for_each(|c| {
+        if *c >= num_shared_unpadded && *c < num_shared_unpadded + num_precommitted_unpadded {
+          // precommitted variables
+          *c += num_shared - num_shared_unpadded;
+        } else if *c >= num_shared_unpadded + num_precommitted_unpadded && *c < num_vars_unpadded {
+          // rest variables
+          *c += num_shared + num_precommitted - num_shared_unpadded - num_precommitted_unpadded;
+        } else if *c >= num_vars_unpadded {
+          // public and challenge variables (after witness and constant)
+          *c += num_vars_padded - num_vars_unpadded;
+        }
+      });
+
+      // Update column count
+      m.cols += num_vars_padded - num_vars_unpadded;
+
+      // Pad row pointers for constraint padding
+      let ex = {
+        let nnz = if m.indptr.is_empty() {
+          0
+        } else {
+          m.indptr[m.indptr.len() - 1]
+        };
+        vec![nnz; num_cons - num_cons_unpadded]
+      };
+      m.indptr.extend(ex);
+    };
+
+    apply_pad(&mut A);
+    apply_pad(&mut B);
+    apply_pad(&mut C_mat);
 
     SplitR1CSShape {
       num_cons,
       num_cons_unpadded,
-      num_shared_unpadded: 0,
-      num_precommitted_unpadded: 0,
+      num_shared_unpadded,
+      num_precommitted_unpadded,
       num_rest_unpadded,
-      num_shared: 0,
-      num_precommitted: 0,
+      num_shared,
+      num_precommitted,
       num_rest,
       num_public,
-      num_challenges: 0,
+      num_challenges,
       A,
       B,
-      C,
+      C: C_mat,
       digest: OnceCell::new(),
       _phantom: std::marker::PhantomData,
     }
@@ -1280,6 +1356,59 @@ impl<E: Engine, C: Copy + Clone + Send + Sync> SplitR1CSShape<E, C> {
     );
 
     Ok((Az, Bz, Cz))
+  }
+
+  /// Generate commitment key from shapes (generic over coefficient type).
+  ///
+  /// The commitment key only depends on dimensions, not coefficients,
+  /// so this works for any coefficient type.
+  pub fn commitment_key_generic(
+    shapes: &[&SplitR1CSShape<E, C>],
+  ) -> Result<(CommitmentKey<E>, VerifierKey<E>), SpartanError> {
+    let max = shapes
+      .iter()
+      .map(|s| s.num_shared + s.num_precommitted + s.num_rest)
+      .max()
+      .ok_or(SpartanError::InvalidInputLength {
+        reason: "commitment_key_generic: unable to find max number of variables".to_string(),
+      })?;
+
+    Ok(E::PCS::setup(b"ck", max, DEFAULT_COMMITMENT_WIDTH))
+  }
+
+  /// Equalize two shapes to have the same dimensions (generic over coefficient type).
+  ///
+  /// This ensures both shapes have the same `num_cons` and `num_rest` so they can
+  /// be used together in folding.
+  pub fn equalize(S_A: &mut Self, S_B: &mut Self) {
+    SplitR1CSShape::<E>::equalize_generic(S_A, S_B);
+  }
+}
+
+// i64 → field coefficient conversion for SplitR1CSShape
+impl<E: Engine> SplitR1CSShape<E, i64> {
+  /// Convert i64-coefficient shape to field-coefficient shape.
+  ///
+  /// This is used when you need field-coefficient shapes (e.g., for verifier key)
+  /// after synthesizing with `SmallCS<i32, i64>`.
+  pub fn to_field_coefficients(&self) -> SplitR1CSShape<E> {
+    SplitR1CSShape {
+      num_cons: self.num_cons,
+      num_cons_unpadded: self.num_cons_unpadded,
+      num_shared_unpadded: self.num_shared_unpadded,
+      num_precommitted_unpadded: self.num_precommitted_unpadded,
+      num_rest_unpadded: self.num_rest_unpadded,
+      num_shared: self.num_shared,
+      num_precommitted: self.num_precommitted,
+      num_rest: self.num_rest,
+      num_public: self.num_public,
+      num_challenges: self.num_challenges,
+      A: self.A.to_field_coefficients(),
+      B: self.B.to_field_coefficients(),
+      C: self.C.to_field_coefficients(),
+      digest: OnceCell::new(),
+      _phantom: std::marker::PhantomData,
+    }
   }
 }
 
@@ -1378,6 +1507,31 @@ impl<E: Engine> SplitR1CSInstance<E> {
       public_values,
       challenges,
     })
+  }
+
+  /// Create a SplitR1CSInstance from a native R1CSInstance<E, i32>.
+  ///
+  /// Used for circuits synthesized with SmallCS that only have "rest" witnesses
+  /// (no shared/precommitted). Converts i32 public inputs to field elements.
+  pub fn from_native(
+    instance: &R1CSInstance<E, i32>,
+  ) -> Self
+  where
+    E::Scalar: crate::small_field::SmallValueField<i32>,
+  {
+    let public_values: Vec<E::Scalar> = instance
+      .X
+      .iter()
+      .map(|&x| E::Scalar::small_to_field(x))
+      .collect();
+
+    SplitR1CSInstance {
+      comm_W_shared: None,
+      comm_W_precommitted: None,
+      comm_W_rest: instance.comm_W.clone(),
+      public_values,
+      challenges: vec![],
+    }
   }
 
   pub fn validate(

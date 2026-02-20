@@ -70,21 +70,24 @@ impl<W: Witness, C: Coefficient> SmallCS<W, C> {
 
     /// Convert to SplitR1CSShape with coefficient type C.
     ///
-    /// Creates a simple shape with all variables in the "rest" segment
-    /// (no shared or precommitted variables).
+    /// Uses the segment boundaries set by `end_shared_phase()` and
+    /// `end_precommitted_phase()` to determine shared/precommitted/rest split.
+    /// If no phases were marked, all variables go into "rest" for backwards compatibility.
     pub fn to_split_r1cs_shape<E: Engine>(&self) -> SplitR1CSShape<E, C>
     where
         C: Copy + Send + Sync,
     {
         let (a, b, c) = self.build_matrices();
         let num_cons_unpadded = self.num_constraints();
-        let num_vars_unpadded = self.num_aux();
         let num_public = self.num_inputs() - 1; // -1 for implicit ONE
 
         SplitR1CSShape::new_simple(
             num_cons_unpadded,
-            num_vars_unpadded,
+            self.num_shared(),
+            self.num_precommitted(),
+            self.num_rest(),
             num_public,
+            0, // num_challenges
             a.into(),
             b.into(),
             c.into(),

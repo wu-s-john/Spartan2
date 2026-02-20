@@ -18,7 +18,7 @@ use crate::{
   small_field::SmallValueField,
   small_gadgets::{Boolean, small_sha256_batched, small_sha256_batched_i64},
   small_r1cs::{SmallCS, SynthesisError as SmallSynthesisError},
-  traits::{Engine, pcs::PCSEngineTrait},
+  traits::{Engine, circuit::NativeSmallCircuit, pcs::PCSEngineTrait},
 };
 
 /// Native small-value SHA-256 chain circuit.
@@ -147,6 +147,11 @@ impl NativeSmallSha256ChainCircuit {
   ///
   /// Uses full 35-bit addition and K=21 batching for optimal constraint count.
   /// Witnesses are i32, but matrix coefficients are i64.
+  ///
+  /// Note: Three-phase witness separation (shared/precommitted/rest) is not yet
+  /// implemented for the native path. All witnesses currently go into "rest".
+  /// To enable precommitted witness support, the witness generation would need
+  /// to create separate commitments for each segment.
   pub fn synthesize_i64(&self, cs: &mut SmallCS<i32, i64>) -> Result<(), SmallSynthesisError> {
     // Allocate input bytes as Boolean<i32, i64> bits (big-endian per byte)
     let mut current_bits: Vec<Boolean<i32, i64>> = Vec::with_capacity(256);
@@ -227,6 +232,26 @@ impl NativeSmallSha256ChainCircuit {
       R1CSWitness { W, r_W },
       R1CSInstance::new_unchecked_generic(comm_W, X),
     ))
+  }
+}
+
+// Implement NativeSmallCircuit trait for use with prove_native_zk
+impl<E: Engine> NativeSmallCircuit<E> for NativeSmallSha256ChainCircuit
+where
+  E::Scalar: SmallValueField<i32>,
+{
+  fn synthesize_i64(&self, cs: &mut SmallCS<i32, i64>) -> Result<(), SmallSynthesisError> {
+    // Delegate to the existing method
+    NativeSmallSha256ChainCircuit::synthesize_i64(self, cs)
+  }
+
+  fn to_witness_and_instance_i64(
+    &self,
+    ck: &CommitmentKey<E>,
+    num_rest_padded: usize,
+  ) -> Result<(R1CSWitness<E, i32>, R1CSInstance<E, i32>), SpartanError> {
+    // Delegate to the existing method
+    NativeSmallSha256ChainCircuit::to_witness_and_instance_i64(self, ck, num_rest_padded)
   }
 }
 

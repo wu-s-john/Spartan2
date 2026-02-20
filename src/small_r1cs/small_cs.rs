@@ -15,6 +15,11 @@ use bellpepper_core::{Index, Variable};
 ///
 /// This stores all constraints and witnesses using native integer types,
 /// deferring field conversion until commitment time.
+///
+/// Supports three-phase witness allocation for NeutronNova compatibility:
+/// - Phase 1 (shared): `aux[0..shared_end]`
+/// - Phase 2 (precommitted): `aux[shared_end..precommitted_end]`
+/// - Phase 3 (rest): `aux[precommitted_end..]`
 #[derive(Clone, Debug)]
 pub struct SmallCS<W: Witness, C: Coefficient> {
     /// Public inputs (includes implicit "1" at index 0).
@@ -25,6 +30,12 @@ pub struct SmallCS<W: Witness, C: Coefficient> {
     pub constraints: Vec<(LinearCombination<C>, LinearCombination<C>, LinearCombination<C>)>,
     /// Namespace stack for debugging.
     namespace: Vec<String>,
+
+    // Segment boundaries for three-phase allocation
+    /// End of shared segment: aux[0..shared_end] are shared witnesses.
+    shared_end: usize,
+    /// End of precommitted segment: aux[shared_end..precommitted_end] are precommitted witnesses.
+    precommitted_end: usize,
 }
 
 impl<W: Witness, C: Coefficient> Default for SmallCS<W, C> {
@@ -43,7 +54,40 @@ impl<W: Witness, C: Coefficient> SmallCS<W, C> {
             aux: vec![],
             constraints: vec![],
             namespace: vec![],
+            shared_end: 0,
+            precommitted_end: 0,
         }
+    }
+
+    /// Mark the end of the shared witness allocation phase.
+    ///
+    /// All witnesses allocated before this call become "shared" witnesses.
+    pub fn end_shared_phase(&mut self) {
+        self.shared_end = self.aux.len();
+        self.precommitted_end = self.aux.len();
+    }
+
+    /// Mark the end of the precommitted witness allocation phase.
+    ///
+    /// All witnesses allocated between `end_shared_phase()` and this call
+    /// become "precommitted" witnesses.
+    pub fn end_precommitted_phase(&mut self) {
+        self.precommitted_end = self.aux.len();
+    }
+
+    /// Get the number of shared witnesses.
+    pub fn num_shared(&self) -> usize {
+        self.shared_end
+    }
+
+    /// Get the number of precommitted witnesses.
+    pub fn num_precommitted(&self) -> usize {
+        self.precommitted_end - self.shared_end
+    }
+
+    /// Get the number of rest (remaining) witnesses.
+    pub fn num_rest(&self) -> usize {
+        self.aux.len() - self.precommitted_end
     }
 
     /// Build the full witness vector z = [aux | 1 | inputs[1..]].

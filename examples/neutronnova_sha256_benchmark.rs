@@ -52,8 +52,10 @@ enum BenchMode {
   Nifs,
   /// Benchmark full NeutronNovaZkSNARK::prove
   ZkProve,
-  /// Benchmark native i32 arithmetic path (SmallCS + prove_native)
+  /// Benchmark native i32 arithmetic path (SmallCS + prove_native) - NIFS only
   Native,
+  /// Benchmark full NeutronNovaZkSNARK::prove_native_zk (native synthesis + full ZK pipeline)
+  NativeZk,
 }
 
 #[derive(Parser)]
@@ -428,8 +430,11 @@ fn benchmark_native_prove<E: Engine>(
   // Create commitment key from shape (need field version for CK setup)
   let shape_field: SplitR1CSShape<E> = SplitR1CSShape::new_simple(
     shape.num_cons_unpadded,
+    shape.num_shared_unpadded,
+    shape.num_precommitted_unpadded,
     shape.num_rest_unpadded,
     shape.num_public,
+    shape.num_challenges,
     shape.A.map_coeffs(|c| <E as Engine>::Scalar::from(c as u64)),
     shape.B.map_coeffs(|c| <E as Engine>::Scalar::from(c as u64)),
     shape.C.map_coeffs(|c| <E as Engine>::Scalar::from(c as u64)),
@@ -502,6 +507,82 @@ fn benchmark_native_prove<E: Engine>(
   eprintln!("  Total:        {} ms", setup_ms + witness_gen_ms + prove_ms);
 }
 
+/// Benchmark full NeutronNovaZkSNARK::prove_native_zk
+///
+/// Uses native SmallCS<i32, i64> synthesis + prove_native + full ZK pipeline.
+/// No bellpepper synthesis, no field→i64 conversion.
+fn benchmark_native_zk_prove<E: Engine>(
+  num_instances: usize,
+  chain_length: usize,
+  _timing_data: &TimingData,
+) where
+  E::PCS: FoldingEngineTrait<E>,
+  E::Scalar: SmallValueField<i32>
+    + SmallValueField<i64>
+    + DelayedReduction<i32>
+    + DelayedReduction<i64>
+    + DelayedReduction<i128>
+    + DelayedReduction<E::Scalar>,
+{
+  assert!(
+    num_instances >= 2,
+    "Native ZK benchmark requires at least 2 instances (NIFS folding needs multiple instances)"
+  );
+
+  let num_cores = rayon::current_num_threads();
+
+  eprintln!(
+    "Setting up Native ZK NeutronNova for {} instances, chain_length={}, cores={}...",
+    num_instances, chain_length, num_cores
+  );
+
+  // Create native circuits
+  let step_circuits = make_native_circuits(num_instances, chain_length);
+  let core_circuit = {
+    let mut input = [0u8; 32];
+    input[0] = 0xff; // Different from step circuits
+    NativeSmallSha256ChainCircuit::new(input, chain_length)
+  };
+
+  // Setup using setup_native
+  let t_setup = Instant::now();
+  let (pk, vk) = NeutronNovaZkSNARK::<E>::setup_native(&step_circuits[0], &core_circuit, num_instances)
+    .expect("setup_native failed");
+  let setup_ms = t_setup.elapsed().as_millis();
+  eprintln!("Setup done in {} ms (constraints: {})", setup_ms, pk.S_step.num_cons);
+
+  // Prove using prove_native_zk
+  let t_prove = Instant::now();
+  let proof = NeutronNovaZkSNARK::<E>::prove_native_zk(&pk, &step_circuits, &core_circuit);
+  let prove_ms = t_prove.elapsed().as_millis();
+
+  match &proof {
+    Ok(_) => eprintln!("prove_native_zk succeeded in {} ms", prove_ms),
+    Err(e) => eprintln!("prove_native_zk failed: {:?}", e),
+  }
+
+  // Verify
+  if let Ok(ref p) = proof {
+    let t_verify = Instant::now();
+    let verify_result = p.verify(&vk, num_instances);
+    let verify_ms = t_verify.elapsed().as_millis();
+    match verify_result {
+      Ok(_) => eprintln!("Verification succeeded in {} ms", verify_ms),
+      Err(e) => eprintln!("Verification failed: {:?}", e),
+    }
+  }
+
+  // Print summary
+  eprintln!("\n===== Native ZK prove_native_zk Summary =====");
+  eprintln!("  Instances:       {}", num_instances);
+  eprintln!("  Chain length:    {}", chain_length);
+  eprintln!("  Constraints:     {}", pk.S_step.num_cons);
+  eprintln!("  Cores:           {}", num_cores);
+  eprintln!("  Setup:           {} ms", setup_ms);
+  eprintln!("  prove_native_zk: {} ms", prove_ms);
+  eprintln!("  Total:           {} ms", setup_ms + prove_ms);
+}
+
 fn main() {
   let args = Args::parse();
 
@@ -528,6 +609,9 @@ fn main() {
     (FieldChoice::Bn254Fr, BenchMode::Native) => {
       benchmark_native_prove::<Bn254Engine>(args.instances, args.chain_length, &timing_data)
     }
+    (FieldChoice::Bn254Fr, BenchMode::NativeZk) => {
+      benchmark_native_zk_prove::<Bn254Engine>(args.instances, args.chain_length, &timing_data)
+    }
     (FieldChoice::PallasFq, BenchMode::Nifs) => {
       benchmark_nifs_prove::<PallasHyraxEngine>(args.instances, args.chain_length, &timing_data)
     }
@@ -537,6 +621,9 @@ fn main() {
     (FieldChoice::PallasFq, BenchMode::Native) => {
       benchmark_native_prove::<PallasHyraxEngine>(args.instances, args.chain_length, &timing_data)
     }
+    (FieldChoice::PallasFq, BenchMode::NativeZk) => {
+      benchmark_native_zk_prove::<PallasHyraxEngine>(args.instances, args.chain_length, &timing_data)
+    }
     (FieldChoice::VestaFp, BenchMode::Nifs) => {
       benchmark_nifs_prove::<VestaHyraxEngine>(args.instances, args.chain_length, &timing_data)
     }
@@ -545,6 +632,9 @@ fn main() {
     }
     (FieldChoice::VestaFp, BenchMode::Native) => {
       benchmark_native_prove::<VestaHyraxEngine>(args.instances, args.chain_length, &timing_data)
+    }
+    (FieldChoice::VestaFp, BenchMode::NativeZk) => {
+      benchmark_native_zk_prove::<VestaHyraxEngine>(args.instances, args.chain_length, &timing_data)
     }
   }
 }

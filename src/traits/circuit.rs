@@ -6,6 +6,8 @@
 
 //! This module defines traits that a circuit provider must implement to be used with Spartan.
 use crate::traits::Engine;
+use crate::{CommitmentKey, errors::SpartanError, r1cs::{R1CSInstance, R1CSWitness}};
+use crate::small_r1cs::{SmallCS, SynthesisError as SmallSynthesisError};
 use bellpepper_core::{ConstraintSystem, SynthesisError, num::AllocatedNum};
 
 /// A helper trait for defining a randomized circuit that Spartan proves.
@@ -82,4 +84,50 @@ pub trait MultiRoundCircuit<E: Engine>: Send + Sync + Clone {
 
   /// Returns the number of rounds in the circuit
   fn num_rounds(&self) -> usize;
+}
+
+/// A trait for circuits that synthesize into `SmallCS<i32, i64>` for native small-value proving.
+///
+/// This trait enables circuits to use native integer arithmetic during synthesis instead of
+/// field element arithmetic, providing significant performance benefits for circuits with
+/// small witness values (like SHA-256 where witnesses are bits).
+///
+/// # Type Parameters
+/// - Witnesses are `i32` (bits, small integers)
+/// - Matrix coefficients are `i64` (for optimized constraint batching)
+///
+/// # Example
+/// ```ignore
+/// impl<E: Engine> NativeSmallCircuit<E> for MySha256Circuit
+/// where
+///     E::Scalar: SmallValueField<i32>,
+/// {
+///     fn synthesize_i64(&self, cs: &mut SmallCS<i32, i64>) -> Result<(), SmallSynthesisError> {
+///         // Allocate variables and constraints using native i32/i64 arithmetic
+///     }
+///
+///     fn to_witness_and_instance_i64(&self, ck: &CommitmentKey<E>, num_rest_padded: usize)
+///         -> Result<(R1CSWitness<E, i32>, R1CSInstance<E, i32>), SpartanError> {
+///         // Synthesize and commit
+///     }
+/// }
+/// ```
+pub trait NativeSmallCircuit<E: Engine>: Send + Sync + Clone {
+  /// Synthesize the circuit into `SmallCS<i32, i64>`.
+  ///
+  /// Uses native i32 witnesses and i64 coefficients for efficient constraint representation.
+  fn synthesize_i64(&self, cs: &mut SmallCS<i32, i64>) -> Result<(), SmallSynthesisError>;
+
+  /// Create witness and instance by synthesizing and committing.
+  ///
+  /// This method:
+  /// 1. Synthesizes into `SmallCS<i32, i64>`
+  /// 2. Extracts `Vec<i32>` witnesses
+  /// 3. Commits using `commit_small_direct` (no field conversion)
+  /// 4. Returns `R1CSWitness<E, i32>` and `R1CSInstance<E, i32>`
+  fn to_witness_and_instance_i64(
+    &self,
+    ck: &CommitmentKey<E>,
+    num_rest_padded: usize,
+  ) -> Result<(R1CSWitness<E, i32>, R1CSInstance<E, i32>), SpartanError>;
 }

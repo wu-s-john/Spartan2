@@ -413,6 +413,33 @@ impl<C: Copy> SparseMatrix<C> {
   }
 }
 
+// i64 → field coefficient conversion
+impl SparseMatrix<i64> {
+  /// Convert i64 coefficients to field elements.
+  ///
+  /// Handles both positive and negative values correctly.
+  pub fn to_field_coefficients<F: PrimeField>(&self) -> SparseMatrix<F> {
+    let data: Vec<F> = self
+      .data
+      .iter()
+      .map(|&coeff| {
+        if coeff >= 0 {
+          F::from(coeff as u64)
+        } else {
+          -F::from((-coeff) as u64)
+        }
+      })
+      .collect();
+
+    SparseMatrix {
+      data,
+      indices: self.indices.clone(),
+      indptr: self.indptr.clone(),
+      cols: self.cols,
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
