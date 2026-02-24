@@ -1,3 +1,4 @@
+#![allow(unused)] // Helper functions used by macros when invoked
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: MIT
 
@@ -35,8 +36,18 @@ macro_rules! impl_field_reduction_constants {
       const MONT_INV: u64 = $crate::big_num::macros::compute_mont_inv(Self::MODULUS[0]);
       const R512_MOD: [u64; 4] =
         $crate::big_num::macros::compute_r512_mod(Self::MODULUS, Self::R_MOD);
+      const R384_MOD: [u64; 4] =
+        $crate::big_num::macros::compute_r384_mod(Self::MODULUS, Self::R_MOD);
       const MAX_REDC_SUB_CORRECTIONS: usize =
         $crate::big_num::macros::compute_max_redc_sub_corrections(Self::MODULUS);
+      const BARRETT_MU: [u64; 5] =
+        $crate::big_num::macros::compute_barrett_mu(Self::MODULUS);
+      const USE_4_LIMB_BARRETT: bool =
+        $crate::big_num::macros::is_4_limb_barrett(Self::MODULUS);
+      const PASTA_STYLE_MODULUS: bool =
+        $crate::big_num::macros::is_pasta_style(Self::MODULUS);
+      const PASTA_C: [u64; 2] =
+        $crate::big_num::macros::compute_pasta_c(Self::MODULUS);
     }
 
     // Enforce small MAX_REDC_SUB_CORRECTIONS for performance.
@@ -189,4 +200,52 @@ pub const fn compute_r512_mod(p: [u64; 4], r_mod: [u64; 4]) -> [u64; 4] {
   // R512_MOD = R_MOD * R_MOD mod p = (2^256 mod p)² mod p = 2^512 mod p
   let r_squared = mul_4_by_4(&r_mod, &r_mod);
   reduce_8_mod_4(&r_squared, &p)
+}
+
+/// Compute 2^384 mod p.
+///
+/// This computes R384_MOD = 2^384 mod p by multiplying R_MOD (2^256 mod p) by
+/// 2^128 and then reducing.
+pub const fn compute_r384_mod(p: [u64; 4], r_mod: [u64; 4]) -> [u64; 4] {
+  // 2^384 = 2^256 * 2^128
+  // R384_MOD = (R_MOD * 2^128) mod p
+  // 2^128 as 4 limbs: [0, 0, 1, 0]
+  let two_128 = [0u64, 0, 1, 0];
+  let product = mul_4_by_4(&r_mod, &two_128);
+  reduce_8_mod_4(&product, &p)
+}
+
+/// Compute Barrett reciprocal μ = ⌊2^512 / p⌋.
+///
+/// For a 256-bit prime p, μ fits in 5 limbs (up to 320 bits).
+///
+/// NOTE: This returns a placeholder [0; 5]. Types that need Barrett reduction
+/// should have direct implementations in field_reduction_constants.rs with
+/// precomputed values.
+pub const fn compute_barrett_mu(_p: [u64; 4]) -> [u64; 5] {
+  // Computing ⌊2^512 / p⌋ at compile time requires sophisticated const division.
+  // For now, return zeros - types that use Barrett reduction have direct impls
+  // with precomputed values in field_reduction_constants.rs.
+  [0u64; 5]
+}
+
+/// Check if 2p < 2^256, enabling 4-limb Barrett fast path.
+pub const fn is_4_limb_barrett(p: [u64; 4]) -> bool {
+  // 2p < 2^256 iff p < 2^255 iff the MSB of p is 0
+  p[3] < 0x8000_0000_0000_0000
+}
+
+/// Check if modulus has Pasta-style structure (MODULUS[2] = 0, MODULUS[3] = 2^62).
+pub const fn is_pasta_style(p: [u64; 4]) -> bool {
+  p[2] == 0 && p[3] == 0x4000_0000_0000_0000
+}
+
+/// Compute PASTA_C: the c constant for Pasta primes p = 2^254 + c.
+/// Returns [0, 0] for non-Pasta primes.
+pub const fn compute_pasta_c(p: [u64; 4]) -> [u64; 2] {
+  if is_pasta_style(p) {
+    [p[0], p[1]]
+  } else {
+    [0, 0]
+  }
 }

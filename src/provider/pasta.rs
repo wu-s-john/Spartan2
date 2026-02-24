@@ -55,9 +55,8 @@ impl_traits!(
 
 // Implement big_num traits for Pasta scalar fields
 // Pallas scalar = Fq, Vesta scalar = Fp
-crate::impl_field_reduction_constants!(pallas::Scalar);
+// Note: FieldReductionConstants impls are in big_num/field_reduction_constants.rs
 crate::impl_montgomery_limbs!(pallas::Scalar);
-crate::impl_field_reduction_constants!(vesta::Scalar);
 crate::impl_montgomery_limbs!(vesta::Scalar);
 
 #[cfg(test)]

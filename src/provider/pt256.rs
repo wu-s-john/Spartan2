@@ -57,9 +57,8 @@ impl_traits!(
 );
 
 // Implement big_num traits for P256/T256 scalar fields
-crate::impl_field_reduction_constants!(p256::Scalar);
+// Both have direct implementations in field_reduction_constants.rs
 crate::impl_montgomery_limbs!(p256::Scalar);
-crate::impl_field_reduction_constants!(t256::Scalar);
 crate::impl_montgomery_limbs!(t256::Scalar);
 
 impl<G: Group> TranscriptReprTrait<G> for t256::Base {

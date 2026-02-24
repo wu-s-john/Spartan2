@@ -39,7 +39,10 @@ pub mod traits;
 
 // internal modules
 mod big_num;
+mod csr;
+mod lagrange_accumulator;
 mod polys;
+mod small_sumcheck;
 mod sumcheck;
 
 // public modules for proof systems

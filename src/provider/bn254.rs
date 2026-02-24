@@ -43,7 +43,7 @@ impl_traits!(
 );
 
 // Implement big_num traits for BN254 scalar field (Fr)
-crate::impl_field_reduction_constants!(types::Scalar);
+// Note: FieldReductionConstants impl is in big_num/field_reduction_constants.rs
 crate::impl_montgomery_limbs!(types::Scalar);
 
 // BN254 is not a cycle pair, so we need to manually implement TranscriptReprTrait for the Base field

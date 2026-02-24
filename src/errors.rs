@@ -107,4 +107,20 @@ pub enum SpartanError {
     /// The maximum size that can be handled
     max: usize,
   },
+  /// returned when a field element doesn't fit in a small value type
+  #[error("SmallValueOverflow: {value} in {context}")]
+  SmallValueOverflow {
+    /// String representation of the value that overflowed
+    value: String,
+    /// Context where the overflow occurred
+    context: String,
+  },
+  /// returned when small-value rounds is zero but should be positive
+  #[error("SmallValueRoundsZero: l0={l0}, num_vars={num_vars}")]
+  SmallValueRoundsZero {
+    /// The l0 parameter (number of small-value rounds)
+    l0: usize,
+    /// Total number of variables
+    num_vars: usize,
+  },
 }
