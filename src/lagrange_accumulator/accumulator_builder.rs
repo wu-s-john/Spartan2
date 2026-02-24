@@ -119,23 +119,10 @@ where
 
   let ext_size = base.pow(l0 as u32); // (D+1)^l0
 
-  // Build eq cache: precomputes ex * ey products for all combinations.
-  // Layout: eq_cache[round][x_out * num_y + y] for cache-friendly access.
-  // Each parallel task (fixed x_out) accesses a contiguous block of size num_y.
-  let eq_cache: Vec<Vec<F>> = eq_tables
-    .e_y
-    .iter()
-    .map(|round_ey| {
-      eq_tables
-        .e_xout
-        .iter()
-        .flat_map(|ex| round_ey.iter().map(|ey| *ex * *ey))
-        .collect()
-    })
-    .collect();
-
-  // Precompute num_y per round for transposed access
-  let num_y_per_round: Vec<usize> = eq_tables.e_y.iter().map(|ey| ey.len()).collect();
+  // E_Y tables are used directly in final scatter (no precomputed eq_cache)
+  // E_X (e_xout) weights are applied during fold, E_Y after merge
+  let e_y = &eq_tables.e_y;
+  let e_xout = &eq_tables.e_xout;
 
   // Borrow e_in directly (no clone needed)
   let e_in = &eq_tables.e_in;
@@ -207,19 +194,15 @@ where
           state.beta_values.push((beta_idx, val));
         }
 
-        // Distribute beta values → A_i(v,u) via idx4 using precomputed eq cache
-        // Multiply-accumulate into wide accumulator (Montgomery REDC at end)
+        // Phase 5: Accumulate S[β] += E_X[x_out] × val
+        // E_Y factor is applied in final scatter after all x_out iterations
+        let e_xout_val = &e_xout[x_out_bits];
         for &(beta_idx, ref val) in &state.beta_values {
-          for pref in &beta_prefix_cache[beta_idx] {
-            // Transposed layout: eq_cache[round][x_out * num_y + y] for contiguous y access
-            let num_y = num_y_per_round[pref.round_0];
-            let eq_eval = eq_cache[pref.round_0][x_out_bits * num_y + pref.y_idx];
-            <F as DelayedReduction<F>>::unreduced_multiply_accumulate(
-              &mut state.acc.rounds[pref.round_0].data_mut()[pref.v_idx][pref.u_idx],
-              val,
-              &eq_eval,
-            );
-          }
+          <F as DelayedReduction<F>>::unreduced_multiply_accumulate(
+            &mut state.s_beta[beta_idx],
+            val,
+            e_xout_val,
+          );
         }
 
         state
@@ -227,27 +210,33 @@ where
     )
     .collect();
 
-  // Sequential merge: avoids parallel reduce tree overhead and identity allocations.
-  // Each fold task's State is merged one by one, spreading deallocation cost.
+  // Sequential merge: combines s_beta arrays element-wise.
   // Using std::iter::Iterator::reduce (not rayon's) - no extra state allocations.
   let merged = fold_results
     .into_iter()
     .reduce(|mut a, b| {
-      a.acc.merge(&b.acc);
+      for (a_s, b_s) in a.s_beta.iter_mut().zip(&b.s_beta) {
+        *a_s += *b_s;
+      }
       a
     })
     .expect("num_x_out > 0 guarantees non-empty fold results");
 
-  // Finalize: reduce each bucket from wide 9-limb to field element
+  // Phase 6: Final scatter - A_i(v,u) += E_Y,i[y] × S[β]
+  // E_Y factor is applied ONCE per β after all x_out, not once per (x_out, β)
   let mut result: LagrangeAccumulators<F, 2> = LagrangeAccumulators::new(l0);
-  for (round_idx, round) in merged.acc.rounds.iter().enumerate() {
-    for (v_idx, row) in round.data().iter().enumerate() {
-      for (u_idx, elem) in row.iter().enumerate() {
-        if !elem.is_zero() {
-          result.rounds[round_idx].data_mut()[v_idx][u_idx] =
-            <F as DelayedReduction<F>>::reduce(elem);
-        }
-      }
+  for beta_idx in 0..num_betas {
+    if merged.s_beta[beta_idx].is_zero() {
+      continue;
+    }
+    let s_val = <F as DelayedReduction<F>>::reduce(&merged.s_beta[beta_idx]);
+    if s_val == F::ZERO {
+      continue;
+    }
+
+    for pref in &beta_prefix_cache[beta_idx] {
+      let e_y_val = e_y[pref.round_0][pref.y_idx];
+      result.rounds[pref.round_0].data_mut()[pref.v_idx][pref.u_idx] += s_val * e_y_val;
     }
   }
   result

@@ -48,7 +48,7 @@ use std::ops::{Add, Sub};
 /// - `az_extended_evals/scratch`, `bz_extended_evals/scratch`: Two buffer pairs each for Az and Bz
 ///   (4 buffers total per polynomial × 2 polynomials = 8 buffer fields total). Both Az and Bz
 ///   extension results must be available simultaneously to compute Az(β) × Bz(β) for each β.
-/// - `acc`: Bucket accumulators for scatter phase (unreduced F×F).
+/// - `s_beta`: Global accumulator S[β] = Σ E_X[x_out] × val, accumulated across x_out iterations.
 ///
 /// # Type Parameters
 ///
@@ -70,9 +70,10 @@ where
   /// Uses unreduced wide-limb form for delayed modular reduction.
   /// Reset each x_out iteration.
   pub partial_sums: Vec<<F as DelayedReduction<SmallValue::Product>>::Accumulator>,
-  /// Bucket accumulators for accumulator building phase.
-  /// Uses unreduced F×F form (accumulator for field × field products).
-  pub acc: LagrangeAccumulators<<F as DelayedReduction<F>>::Accumulator, D>,
+  /// S[β] = Σ_{x_out} E_X[x_out] × reduced_partial_sum[β]
+  /// Accumulated across all x_out iterations within a fold task, then merged.
+  /// Uses unreduced F×F form for delayed modular reduction.
+  pub s_beta: Vec<<F as DelayedReduction<F>>::Accumulator>,
   /// Prefix evaluations of Az for current suffix. Size: 2^l0
   pub az_prefix_boolean_evals: Vec<SmallValue>,
   /// Prefix evaluations of Bz for current suffix. Size: 2^l0
@@ -102,10 +103,10 @@ where
     + Sync,
   SmallValue: WideMul + Copy + Default + num_traits::Zero + Add<Output = SmallValue> + Sub<Output = SmallValue> + Send + Sync,
 {
-  pub fn new(l0: usize, num_betas: usize, prefix_size: usize, ext_size: usize) -> Self {
+  pub fn new(_l0: usize, num_betas: usize, prefix_size: usize, ext_size: usize) -> Self {
     Self {
       partial_sums: vec![<F as DelayedReduction<SmallValue::Product>>::Accumulator::zero(); num_betas],
-      acc: LagrangeAccumulators::new(l0),
+      s_beta: vec![<F as DelayedReduction<F>>::Accumulator::zero(); num_betas],
       az_prefix_boolean_evals: vec![SmallValue::zero(); prefix_size],
       bz_prefix_boolean_evals: vec![SmallValue::zero(); prefix_size],
       az_extended_evals: vec![SmallValue::zero(); ext_size],
