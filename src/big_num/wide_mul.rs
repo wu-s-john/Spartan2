@@ -1,4 +1,3 @@
-#![allow(unused)] // TODO: Remove when small_sumcheck module is added
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: MIT
 // This file is part of the Spartan2 project.

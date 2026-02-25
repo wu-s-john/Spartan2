@@ -1,20 +1,28 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: MIT
 
-//! DelayedReduction trait for accumulating unreduced field products.
+//! DelayedReduction trait and standalone accumulation functions.
 //!
 //! Modular reduction (Montgomery REDC) is expensive. When summing many
 //! products `Σ (field_i × field_j)`, the standard approach does N reductions.
 //! Delayed reduction accumulates unreduced products in wide integers, reducing
 //! only once at the end.
+//!
+//! # Architecture
+//!
+//! This module provides:
+//! - [`DelayedReduction`] trait defining the accumulation interface
+//! - Standalone accumulation functions for different product types
+//! - Macros to generate trait implementations for specific fields
+//!
+//! The trait implementations are generated via macros in provider files:
+//! - `impl_delayed_reduction!` for BN254, P256, T256 (generic Barrett)
+//! - `impl_delayed_reduction_pasta!` for Pallas, Vesta (Pasta Barrett)
 
 use super::{
-  barrett::{barrett_reduce_6, barrett_reduce_7},
-  limbs::{SignedWideLimbs, SubMagResult, WideLimbs, mac, mul_4_by_4, sub_mag},
-  montgomery::{MontgomeryLimbs, montgomery_reduce_9},
-  small_value_field::SupportsSmallI64,
+  limbs::{SignedWideLimbs, WideLimbs, mac, mul_4_by_4},
+  montgomery::MontgomeryLimbs,
 };
-use ff::PrimeField;
 use num_traits::Zero;
 use std::ops::AddAssign;
 
@@ -33,171 +41,101 @@ pub trait DelayedReduction<Value>: Sized {
 }
 
 // ============================================================================
-// DelayedReduction<i32> - for field × i32 products (direct small values)
+// Standalone accumulation functions
 // ============================================================================
 
-impl<F: MontgomeryLimbs + PrimeField> DelayedReduction<i32> for F {
-  /// Accumulator for field × i32 products.
-  ///
-  /// # Overflow Bounds
-  /// - Field element: 254 bits (BN254 Fr)
-  /// - i32 magnitude: 32 bits
-  /// - Product size: 286 bits (5 limbs)
-  /// - SignedWideLimbs<6>: 384 bits capacity
-  /// - Headroom: 98 bits → supports up to 2^98 accumulations
-  type Accumulator = SignedWideLimbs<6>;
-
-  #[inline(always)]
-  fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i32) {
-    // Extend i32 to i64 and use the same accumulation logic
-    let value64 = *value as i64;
-    let (target, mag) = if value64 >= 0 {
-      (&mut acc.pos, value64 as u64)
-    } else {
-      (&mut acc.neg, value64.wrapping_neg() as u64)
-    };
-    let a = field.to_limbs();
-    let (r0, c) = mac(target.0[0], a[0], mag, 0);
-    let (r1, c) = mac(target.0[1], a[1], mag, c);
-    let (r2, c) = mac(target.0[2], a[2], mag, c);
-    let (r3, c) = mac(target.0[3], a[3], mag, c);
-    let (r4, of) = target.0[4].overflowing_add(c);
-    target.0[0] = r0;
-    target.0[1] = r1;
-    target.0[2] = r2;
-    target.0[3] = r3;
-    target.0[4] = r4;
-    target.0[5] = target.0[5].wrapping_add(of as u64);
-  }
-
-  #[inline(always)]
-  fn reduce(acc: &Self::Accumulator) -> Self {
-    match sub_mag::<6>(&acc.pos.0, &acc.neg.0) {
-      SubMagResult::Positive(mag) => F::from_limbs(barrett_reduce_6::<F>(&mag)),
-      SubMagResult::Negative(mag) => -F::from_limbs(barrett_reduce_6::<F>(&mag)),
-    }
-  }
-}
-
-// ============================================================================
-// DelayedReduction<i64> - for field × i64 products (from i32 × i32 or direct)
-// ============================================================================
-
-impl<F: MontgomeryLimbs + PrimeField> DelayedReduction<i64> for F {
-  /// Accumulator for field × i64 products.
-  ///
-  /// # Overflow Bounds
-  /// - Field element: 254 bits (BN254 Fr)
-  /// - i64 magnitude: 64 bits
-  /// - Product size: 318 bits (5 limbs)
-  /// - SignedWideLimbs<6>: 384 bits capacity
-  /// - Headroom: 66 bits → supports up to 2^66 accumulations
-  type Accumulator = SignedWideLimbs<6>;
-
-  #[inline(always)]
-  fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i64) {
-    // Handle sign: accumulate into pos or neg based on sign of value
-    let (target, mag) = if *value >= 0 {
-      (&mut acc.pos, *value as u64)
-    } else {
-      (&mut acc.neg, (*value).wrapping_neg() as u64)
-    };
-    // Fused multiply-accumulate: field × value
-    let a = field.to_limbs();
-    let (r0, c) = mac(target.0[0], a[0], mag, 0);
-    let (r1, c) = mac(target.0[1], a[1], mag, c);
-    let (r2, c) = mac(target.0[2], a[2], mag, c);
-    let (r3, c) = mac(target.0[3], a[3], mag, c);
-    // Propagate carry without multiply (just add)
-    let (r4, of) = target.0[4].overflowing_add(c);
-    target.0[0] = r0;
-    target.0[1] = r1;
-    target.0[2] = r2;
-    target.0[3] = r3;
-    target.0[4] = r4;
-    target.0[5] = target.0[5].wrapping_add(of as u64);
-  }
-
-  #[inline(always)]
-  fn reduce(acc: &Self::Accumulator) -> Self {
-    // Subtract in limb space first, then reduce once (saves one Barrett reduction)
-    match sub_mag::<6>(&acc.pos.0, &acc.neg.0) {
-      SubMagResult::Positive(mag) => F::from_limbs(barrett_reduce_6::<F>(&mag)),
-      SubMagResult::Negative(mag) => -F::from_limbs(barrett_reduce_6::<F>(&mag)),
-    }
-  }
-}
-
-// ============================================================================
-// DelayedReduction<i128> - for field × i128 products (from i64 × i64)
-// ============================================================================
-
-impl<F: SupportsSmallI64 + PrimeField> DelayedReduction<i128> for F {
-  /// Accumulator for field × i128 products (from i64 × i64).
-  ///
-  /// # Overflow Bounds
-  /// - Field element: 254 bits (BN254 Fr)
-  /// - i128 magnitude: 128 bits
-  /// - Product size: 382 bits (6 limbs)
-  /// - SignedWideLimbs<7>: 448 bits capacity
-  /// - Headroom: 66 bits → supports up to 2^66 accumulations
-  type Accumulator = SignedWideLimbs<7>;
-
-  #[inline(always)]
-  fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i128) {
-    let (target, mag) = if *value >= 0 {
-      (&mut acc.pos, *value as u128)
-    } else {
-      (&mut acc.neg, (-*value) as u128)
-    };
-    // Fused 4×2 multiply-accumulate: two passes at different offsets
-    let a = field.to_limbs();
-    let b_lo = mag as u64;
-    let b_hi = (mag >> 64) as u64;
-
-    // Pass 1: multiply by b_lo at offset 0
-    let (r0, c) = mac(target.0[0], a[0], b_lo, 0);
-    let (r1, c) = mac(target.0[1], a[1], b_lo, c);
-    let (r2, c) = mac(target.0[2], a[2], b_lo, c);
-    let (r3, c) = mac(target.0[3], a[3], b_lo, c);
-    // Propagate carry without multiply (just add)
-    let (r4, of1) = target.0[4].overflowing_add(c);
-    let c1 = of1 as u64;
-    target.0[0] = r0;
-
-    // Pass 2: multiply by b_hi at offset 1 (add to r1..r5)
-    let (r1, c) = mac(r1, a[0], b_hi, 0);
-    let (r2, c) = mac(r2, a[1], b_hi, c);
-    let (r3, c) = mac(r3, a[2], b_hi, c);
-    let (r4, c) = mac(r4, a[3], b_hi, c);
-    // Add both carries (c from pass 2, c1 from pass 1) into position 5
-    let (r5, c) = mac(target.0[5], c1, 1, c);
-    target.0[1] = r1;
-    target.0[2] = r2;
-    target.0[3] = r3;
-    target.0[4] = r4;
-    target.0[5] = r5;
-    // Propagate final carry through remaining limbs (just add)
-    target.0[6] = target.0[6].wrapping_add(c);
-  }
-
-  #[inline(always)]
-  fn reduce(acc: &Self::Accumulator) -> Self {
-    // Subtract in limb space first, then reduce once (saves one Barrett reduction)
-    match sub_mag::<7>(&acc.pos.0, &acc.neg.0) {
-      SubMagResult::Positive(mag) => F::from_limbs(barrett_reduce_7::<F>(&mag)),
-      SubMagResult::Negative(mag) => -F::from_limbs(barrett_reduce_7::<F>(&mag)),
-    }
-  }
-}
-
-// ============================================================================
-// DelayedReduction<F> - for field × field products
-// ============================================================================
-
-/// DelayedReduction<F> for field × field products.
+/// Accumulate field × small_value where small_value is a single u64 magnitude.
 ///
-/// Uses WideLimbs<9> (576 bits) as accumulator, supporting up to 2^68 products.
+/// This function is shared by i32 and i64 accumulation (same 4×1 multiply pattern).
+/// The caller handles sign extraction and chooses the target (pos or neg).
+///
+/// # Arguments
+/// - `target`: The unsigned accumulator to add to (either pos or neg side)
+/// - `field`: The field element (4 limbs in Montgomery form)
+/// - `magnitude`: The absolute value of the small integer (as u64)
+///
+/// # Overflow Bounds
+/// - Field element: 254 bits (BN254 Fr)
+/// - u64 magnitude: 64 bits
+/// - Product size: 318 bits (5 limbs)
+/// - WideLimbs<6>: 384 bits capacity
+/// - Headroom: 66 bits → supports up to 2^66 accumulations
+#[inline(always)]
+pub(crate) fn accumulate_field_times_small<F: MontgomeryLimbs>(
+  target: &mut WideLimbs<6>,
+  field: &F,
+  magnitude: u64,
+) {
+  let a = field.to_limbs();
+  let (r0, c) = mac(target.0[0], a[0], magnitude, 0);
+  let (r1, c) = mac(target.0[1], a[1], magnitude, c);
+  let (r2, c) = mac(target.0[2], a[2], magnitude, c);
+  let (r3, c) = mac(target.0[3], a[3], magnitude, c);
+  let (r4, of) = target.0[4].overflowing_add(c);
+  target.0[0] = r0;
+  target.0[1] = r1;
+  target.0[2] = r2;
+  target.0[3] = r3;
+  target.0[4] = r4;
+  target.0[5] = target.0[5].wrapping_add(of as u64);
+}
+
+/// Accumulate field × i128 product into a SignedWideLimbs<7> accumulator.
+///
+/// Uses 4×2 multiply pattern since i128 spans 2 limbs.
+///
+/// # Overflow Bounds
+/// - Field element: 254 bits (BN254 Fr)
+/// - i128 magnitude: 128 bits
+/// - Product size: 382 bits (6 limbs)
+/// - SignedWideLimbs<7>: 448 bits capacity
+/// - Headroom: 66 bits → supports up to 2^66 accumulations
+#[inline(always)]
+pub(crate) fn accumulate_field_times_i128<F: MontgomeryLimbs>(
+  acc: &mut SignedWideLimbs<7>,
+  field: &F,
+  value: &i128,
+) {
+  let (target, mag) = if *value >= 0 {
+    (&mut acc.pos, *value as u128)
+  } else {
+    (&mut acc.neg, (-*value) as u128)
+  };
+
+  // Fused 4×2 multiply-accumulate: two passes at different offsets
+  let a = field.to_limbs();
+  let b_lo = mag as u64;
+  let b_hi = (mag >> 64) as u64;
+
+  // Pass 1: multiply by b_lo at offset 0
+  let (r0, c) = mac(target.0[0], a[0], b_lo, 0);
+  let (r1, c) = mac(target.0[1], a[1], b_lo, c);
+  let (r2, c) = mac(target.0[2], a[2], b_lo, c);
+  let (r3, c) = mac(target.0[3], a[3], b_lo, c);
+  // Propagate carry without multiply (just add)
+  let (r4, of1) = target.0[4].overflowing_add(c);
+  let c1 = of1 as u64;
+  target.0[0] = r0;
+
+  // Pass 2: multiply by b_hi at offset 1 (add to r1..r5)
+  let (r1, c) = mac(r1, a[0], b_hi, 0);
+  let (r2, c) = mac(r2, a[1], b_hi, c);
+  let (r3, c) = mac(r3, a[2], b_hi, c);
+  let (r4, c) = mac(r4, a[3], b_hi, c);
+  // Add both carries (c from pass 2, c1 from pass 1) into position 5
+  let (r5, c) = mac(target.0[5], c1, 1, c);
+  target.0[1] = r1;
+  target.0[2] = r2;
+  target.0[3] = r3;
+  target.0[4] = r4;
+  target.0[5] = r5;
+  // Propagate final carry through remaining limbs (just add)
+  target.0[6] = target.0[6].wrapping_add(c);
+}
+
+/// Accumulate field × field product into a WideLimbs<9> accumulator.
+///
+/// Uses full 4×4 multiply producing 8-limb result.
 ///
 /// # Capacity Invariant
 ///
@@ -206,39 +144,34 @@ impl<F: SupportsSmallI64 + PrimeField> DelayedReduction<i128> for F {
 /// With a u64 limb, we can accumulate up to 2^64 products before overflow.
 /// In practice, sumcheck rounds are bounded by polynomial size (≤ 2^40),
 /// so this limit is never approached. The debug_assert below catches misuse.
-impl<F: MontgomeryLimbs + PrimeField + Copy> DelayedReduction<F> for F {
-  type Accumulator = WideLimbs<9>;
-
-  #[inline(always)]
-  fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field_a: &Self, field_b: &F) {
-    // Compute field_a × field_b as 8 limbs and add to accumulator
-    let product = mul_4_by_4(field_a.to_limbs(), field_b.to_limbs());
-    let mut carry = 0u128;
-    for (acc_limb, &prod_limb) in acc.0.iter_mut().take(8).zip(product.iter()) {
-      let sum = (*acc_limb as u128) + (prod_limb as u128) + carry;
-      *acc_limb = sum as u64;
-      carry = sum >> 64;
-    }
-
-    // Accumulate carry into the 9th limb. Overflow here means we've exceeded
-    // the accumulator's capacity (~2^64 products) - this should never happen
-    // in valid usage since sumcheck polynomials are bounded by practical sizes.
-    let old_limb8 = acc.0[8];
-    acc.0[8] = acc.0[8].wrapping_add(carry as u64);
-    debug_assert!(
-      acc.0[8] >= old_limb8,
-      "DelayedReduction accumulator overflow: limb 8 wrapped from {} to {} (carry={}). \
-       Too many products accumulated without reduction.",
-      old_limb8,
-      acc.0[8],
-      carry
-    );
+#[inline(always)]
+pub(crate) fn accumulate_field_times_field<F: MontgomeryLimbs + Copy>(
+  acc: &mut WideLimbs<9>,
+  field_a: &F,
+  field_b: &F,
+) {
+  // Compute field_a × field_b as 8 limbs and add to accumulator
+  let product = mul_4_by_4(field_a.to_limbs(), field_b.to_limbs());
+  let mut carry = 0u128;
+  for (acc_limb, &prod_limb) in acc.0.iter_mut().take(8).zip(product.iter()) {
+    let sum = (*acc_limb as u128) + (prod_limb as u128) + carry;
+    *acc_limb = sum as u64;
+    carry = sum >> 64;
   }
 
-  #[inline(always)]
-  fn reduce(acc: &Self::Accumulator) -> Self {
-    F::from_limbs(montgomery_reduce_9::<F>(&acc.0))
-  }
+  // Accumulate carry into the 9th limb. Overflow here means we've exceeded
+  // the accumulator's capacity (~2^64 products) - this should never happen
+  // in valid usage since sumcheck polynomials are bounded by practical sizes.
+  let old_limb8 = acc.0[8];
+  acc.0[8] = acc.0[8].wrapping_add(carry as u64);
+  debug_assert!(
+    acc.0[8] >= old_limb8,
+    "DelayedReduction accumulator overflow: limb 8 wrapped from {} to {} (carry={}). \
+     Too many products accumulated without reduction.",
+    old_limb8,
+    acc.0[8],
+    carry
+  );
 }
 
 // =============================================================================
@@ -246,7 +179,14 @@ impl<F: MontgomeryLimbs + PrimeField + Copy> DelayedReduction<F> for F {
 // =============================================================================
 
 #[cfg(test)]
-pub(crate) fn test_delayed_reduction_sum_impl<F: MontgomeryLimbs + PrimeField + Copy>() {
+use super::field_reduction_constants::MontgomeryReductionConstants;
+#[cfg(test)]
+use ff::PrimeField;
+
+#[cfg(test)]
+pub(crate) fn test_delayed_reduction_sum_impl<
+  F: MontgomeryLimbs + MontgomeryReductionConstants + PrimeField + Copy + DelayedReduction<F>,
+>() {
   use rand::{SeedableRng, rngs::StdRng};
 
   let mut rng = StdRng::seed_from_u64(54321);
@@ -259,7 +199,7 @@ pub(crate) fn test_delayed_reduction_sum_impl<F: MontgomeryLimbs + PrimeField + 
   let expected: F = a_vec.iter().zip(b_vec.iter()).map(|(a, b)| *a * *b).sum();
 
   // Compute using delayed reduction
-  let mut acc = WideLimbs::<9>::default();
+  let mut acc = <F as DelayedReduction<F>>::Accumulator::default();
   for (a, b) in a_vec.iter().zip(b_vec.iter()) {
     <F as DelayedReduction<F>>::unreduced_multiply_accumulate(&mut acc, a, b);
   }
@@ -271,52 +211,38 @@ pub(crate) fn test_delayed_reduction_sum_impl<F: MontgomeryLimbs + PrimeField + 
   );
 }
 
+/// Generic test for DelayedReduction<V> where V is any small value type (i32, i64, i128).
+///
+/// Tests that accumulating field × small_value products with delayed reduction
+/// produces the same result as immediate field multiplication.
 #[cfg(test)]
-pub(crate) fn test_delayed_reduction_i32_impl<F: MontgomeryLimbs + PrimeField + Copy>() {
-  use super::small_value_field::i64_to_field;
+pub(crate) fn test_delayed_reduction_small_impl<F, V>()
+where
+  F: MontgomeryLimbs + PrimeField + Copy + DelayedReduction<V> + super::SmallValueField<V>,
+  V: Copy,
+  rand::distributions::Standard: rand::distributions::Distribution<V>,
+{
   use rand::{Rng, SeedableRng, rngs::StdRng};
 
   let mut rng = StdRng::seed_from_u64(54321);
 
-  let mut acc = SignedWideLimbs::<6>::default();
+  let mut acc = <F as DelayedReduction<V>>::Accumulator::default();
   let mut expected = F::ZERO;
 
-  // Sum 100 field × i32 products (mix of positive and negative)
-  for i in 0..100 {
+  // Sum 100 field × V products with full range sampling
+  for _ in 0..100 {
     let field = F::random(&mut rng);
-    let value_abs: i32 = rng.gen_range(0..=1000);
-    let value: i32 = if i % 2 == 0 { value_abs } else { -value_abs };
+    let value: V = rng.r#gen();
 
-    <F as DelayedReduction<i32>>::unreduced_multiply_accumulate(&mut acc, &field, &value);
-    expected += field * i64_to_field::<F>(value as i64);
+    <F as DelayedReduction<V>>::unreduced_multiply_accumulate(&mut acc, &field, &value);
+    expected += field * F::small_to_field(value);
   }
 
-  let result = <F as DelayedReduction<i32>>::reduce(&acc);
-  assert_eq!(result, expected, "Delayed reduction i32 failed");
-}
-
-#[cfg(test)]
-pub(crate) fn test_delayed_reduction_i64_impl<F: MontgomeryLimbs + PrimeField + Copy>() {
-  use super::small_value_field::i64_to_field;
-  use rand::{Rng, SeedableRng, rngs::StdRng};
-
-  let mut rng = StdRng::seed_from_u64(54321);
-
-  let mut acc = SignedWideLimbs::<6>::default();
-  let mut expected = F::ZERO;
-
-  // Sum 100 field × i64 products (mix of positive and negative)
-  for i in 0..100 {
-    let field = F::random(&mut rng);
-    let value_abs: i64 = rng.gen_range(0..=100_000i64);
-    let value: i64 = if i % 2 == 0 { value_abs } else { -value_abs };
-
-    <F as DelayedReduction<i64>>::unreduced_multiply_accumulate(&mut acc, &field, &value);
-    expected += field * i64_to_field::<F>(value);
-  }
-
-  let result = <F as DelayedReduction<i64>>::reduce(&acc);
-  assert_eq!(result, expected, "Delayed reduction i64 failed");
+  let result = <F as DelayedReduction<V>>::reduce(&acc);
+  assert_eq!(
+    result, expected,
+    "Delayed reduction failed for small value type"
+  );
 }
 
 /// Generate tests for `DelayedReduction` implementation.
@@ -332,12 +258,17 @@ macro_rules! test_delayed_reduction {
 
       #[test]
       fn delayed_reduction_i32() {
-        $crate::big_num::delayed_reduction::test_delayed_reduction_i32_impl::<$field>();
+        $crate::big_num::delayed_reduction::test_delayed_reduction_small_impl::<$field, i32>();
       }
 
       #[test]
       fn delayed_reduction_i64() {
-        $crate::big_num::delayed_reduction::test_delayed_reduction_i64_impl::<$field>();
+        $crate::big_num::delayed_reduction::test_delayed_reduction_small_impl::<$field, i64>();
+      }
+
+      #[test]
+      fn delayed_reduction_i128() {
+        $crate::big_num::delayed_reduction::test_delayed_reduction_small_impl::<$field, i128>();
       }
     }
   };

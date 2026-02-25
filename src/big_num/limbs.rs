@@ -1,4 +1,3 @@
-#![allow(unused)] // Some functions used only by Barrett reduction path
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: MIT
 
@@ -296,6 +295,39 @@ pub(super) const fn sub<const N: usize>(a: &[u64; N], b: &[u64; N]) -> [u64; N] 
   result
 }
 
+/// Subtract N-limb b from N-limb a with borrow output: a - b → (result, borrow).
+///
+/// Used for branchless canonicalization patterns.
+#[inline(always)]
+pub(super) const fn sub_with_borrow<const N: usize>(a: &[u64; N], b: &[u64; N]) -> ([u64; N], u64) {
+  let mut result = [0u64; N];
+  let mut borrow = 0u64;
+  let mut i = 0;
+  while i < N {
+    let (diff, b1) = a[i].overflowing_sub(b[i]);
+    let (diff2, b2) = diff.overflowing_sub(borrow);
+    result[i] = diff2;
+    borrow = (b1 as u64) + (b2 as u64);
+    i += 1;
+  }
+  (result, borrow)
+}
+
+/// Constant-time select: if cond { a } else { b }
+///
+/// Used for branchless canonicalization to avoid data-dependent branches.
+#[inline(always)]
+pub(super) const fn select<const N: usize>(cond: bool, a: &[u64; N], b: &[u64; N]) -> [u64; N] {
+  let mask = (cond as u64).wrapping_neg(); // 0xFFFF...FFFF if true, 0 if false
+  let mut result = [0u64; N];
+  let mut i = 0;
+  while i < N {
+    result[i] = (a[i] & mask) | (b[i] & !mask);
+    i += 1;
+  }
+  result
+}
+
 /// Shift an N-limb value left by one bit.
 #[inline(always)]
 pub(super) const fn shl<const N: usize>(a: &[u64; N]) -> [u64; N] {
@@ -307,6 +339,21 @@ pub(super) const fn shl<const N: usize>(a: &[u64; N]) -> [u64; N] {
     result[i] = (a[i] << 1) | carry;
     carry = new_carry;
     i += 1;
+  }
+  result
+}
+
+/// Shift an N-limb value right by one bit.
+#[inline(always)]
+pub(super) const fn shr<const N: usize>(a: &[u64; N]) -> [u64; N] {
+  let mut result = [0u64; N];
+  let mut carry = 0u64;
+  let mut i = N;
+  while i > 0 {
+    i -= 1;
+    let new_carry = a[i] << 63;
+    result[i] = (a[i] >> 1) | carry;
+    carry = new_carry;
   }
   result
 }
@@ -445,79 +492,29 @@ pub(super) fn mul_3x4_lo4(a: &[u64; 3], b: &[u64; 4]) -> [u64; 4] {
   result
 }
 
-// =============================================================================
-// 4-limb comparison and arithmetic operations
-// =============================================================================
-
-/// Check if 4-limb value a >= 4-limb value b.
+/// Multiply 3-limb by 4-limb, returning low 5 limbs.
+///
+/// Full 3×4 multiply keeping only the low 5 limbs of the 7-limb result.
 #[inline(always)]
-pub(super) fn gte_4_4(a: &[u64; 4], b: &[u64; 4]) -> bool {
-  for i in (0..4).rev() {
-    if a[i] > b[i] {
-      return true;
+pub(super) fn mul_3x4_lo5(a: &[u64; 3], b: &[u64; 4]) -> [u64; 5] {
+  let mut result = [0u64; 5];
+
+  for i in 0..3 {
+    let mut carry = 0u128;
+    for j in 0..4 {
+      if i + j < 5 {
+        let prod = (a[i] as u128) * (b[j] as u128) + (result[i + j] as u128) + carry;
+        result[i + j] = prod as u64;
+        carry = prod >> 64;
+      }
     }
-    if a[i] < b[i] {
-      return false;
+    // Handle the final carry for position i+4 if it's within bounds
+    if i + 4 < 5 {
+      result[i + 4] = carry as u64;
     }
   }
-  true // equal
-}
 
-/// Add two 4-limb values, returning 4 limbs + carry (0 or 1).
-#[inline(always)]
-pub(super) fn add_4_4(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], u64) {
-  let mut result = [0u64; 4];
-  let mut carry = 0u128;
-  for i in 0..4 {
-    let sum = (a[i] as u128) + (b[i] as u128) + carry;
-    result[i] = sum as u64;
-    carry = sum >> 64;
-  }
-  (result, carry as u64)
-}
-
-/// Subtract two 4-limb values: a - b (wrapping).
-#[inline(always)]
-pub(super) fn sub_4_4(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
-  let mut result = [0u64; 4];
-  let mut borrow = 0u64;
-  for i in 0..4 {
-    let (diff, b1) = a[i].overflowing_sub(b[i]);
-    let (diff2, b2) = diff.overflowing_sub(borrow);
-    result[i] = diff2;
-    borrow = (b1 as u64) + (b2 as u64);
-  }
   result
-}
-
-/// Subtract two 4-limb values with borrow output: a - b → (result, borrow).
-///
-/// Used for branchless canonicalization patterns.
-#[inline(always)]
-pub(super) fn sub_4_4_with_borrow(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], u64) {
-  let mut result = [0u64; 4];
-  let mut borrow = 0u64;
-  for i in 0..4 {
-    let (diff, b1) = a[i].overflowing_sub(b[i]);
-    let (diff2, b2) = diff.overflowing_sub(borrow);
-    result[i] = diff2;
-    borrow = (b1 as u64) + (b2 as u64);
-  }
-  (result, borrow)
-}
-
-/// Constant-time select: if cond { a } else { b }
-///
-/// Used for branchless canonicalization to avoid data-dependent branches.
-#[inline(always)]
-pub(super) fn select_4(cond: bool, a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
-  let mask = (cond as u64).wrapping_neg(); // 0xFFFF...FFFF if true, 0 if false
-  [
-    (a[0] & mask) | (b[0] & !mask),
-    (a[1] & mask) | (b[1] & !mask),
-    (a[2] & mask) | (b[2] & !mask),
-    (a[3] & mask) | (b[3] & !mask),
-  ]
 }
 
 // =============================================================================

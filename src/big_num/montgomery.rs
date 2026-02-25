@@ -7,14 +7,16 @@
 //! (e.g., `provider::bn254`, `provider::pasta`, `provider::pt256`).
 
 use super::{
-  field_reduction_constants::FieldReductionConstants,
+  field_reduction_constants::MontgomeryReductionConstants,
   limbs::{add, gte, sub, sub_5_4},
 };
 
 /// Trait for field types that expose their internal Montgomery-form limbs.
 ///
 /// Field elements are stored as `value * R mod p` where R = 2^256.
-pub(crate) trait MontgomeryLimbs: FieldReductionConstants {
+/// This trait is independent of reduction constants - implementations
+/// are generated via `impl_montgomery_limbs!` macro.
+pub(crate) trait MontgomeryLimbs {
   fn from_limbs(limbs: [u64; 4]) -> Self;
   fn to_limbs(&self) -> &[u64; 4];
 }
@@ -34,7 +36,7 @@ pub(crate) trait MontgomeryLimbs: FieldReductionConstants {
 ///
 /// 3. **Carry correction**: If c=1, add R_MOD and do one conditional subtract.
 #[inline]
-pub(crate) fn montgomery_reduce_9<F: FieldReductionConstants>(c: &[u64; 9]) -> [u64; 4] {
+pub(crate) fn montgomery_reduce_9<F: MontgomeryReductionConstants>(c: &[u64; 9]) -> [u64; 4] {
   // STEP 1: Fold 9 limbs to 8 limbs + carry bit
   //
   // Input: C = c[0..8] + c[8]·2^512  (9 limbs representing a value up to ~2^576)
@@ -117,7 +119,7 @@ pub(crate) fn montgomery_reduce_9<F: FieldReductionConstants>(c: &[u64; 9]) -> [
 /// **Key insight**: Standard REDC produces a value in [0, R), NOT [0, p).
 /// Since R > p for 256-bit primes, we need Q subtractions to canonicalize.
 #[inline]
-fn montgomery_reduce_8<F: FieldReductionConstants>(t: &[u64; 8]) -> [u64; 4] {
+fn montgomery_reduce_8<F: MontgomeryReductionConstants>(t: &[u64; 8]) -> [u64; 4] {
   let mut r = [t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], 0u64];
 
   // Montgomery reduction: eliminate low 4 limbs (exactly 4 iterations)
@@ -184,7 +186,7 @@ use super::limbs::mul_4_by_4;
 use ff::PrimeField;
 
 #[cfg(test)]
-pub(crate) fn test_r512_mod_impl<F: FieldReductionConstants + MontgomeryLimbs + PrimeField>() {
+pub(crate) fn test_r512_mod_impl<F: MontgomeryReductionConstants + MontgomeryLimbs + PrimeField>() {
   let mut wide_512 = [0u64; 9];
   wide_512[8] = 1;
   let reduced = montgomery_reduce_9::<F>(&wide_512);
@@ -194,7 +196,7 @@ pub(crate) fn test_r512_mod_impl<F: FieldReductionConstants + MontgomeryLimbs + 
 
 #[cfg(test)]
 pub(crate) fn test_r512_folding_identity_impl<
-  F: FieldReductionConstants + MontgomeryLimbs + PrimeField,
+  F: MontgomeryReductionConstants + MontgomeryLimbs + PrimeField,
 >() {
   let base_input: [u64; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 1];
   let base_reduced = F::from_limbs(montgomery_reduce_9::<F>(&base_input));
@@ -209,7 +211,7 @@ pub(crate) fn test_r512_folding_identity_impl<
 
 #[cfg(test)]
 pub(crate) fn test_montgomery_round_trip_impl<
-  F: FieldReductionConstants + MontgomeryLimbs + PrimeField + Copy,
+  F: MontgomeryReductionConstants + MontgomeryLimbs + PrimeField + Copy,
 >() {
   use rand::{SeedableRng, rngs::StdRng};
   let mut rng = StdRng::seed_from_u64(12345);

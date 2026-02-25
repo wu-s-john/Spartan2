@@ -55,9 +55,16 @@ impl_traits!(
 
 // Implement big_num traits for Pasta scalar fields
 // Pallas scalar = Fq, Vesta scalar = Fp
-// Note: FieldReductionConstants impls are in big_num/field_reduction_constants.rs
 crate::impl_montgomery_limbs!(pallas::Scalar);
 crate::impl_montgomery_limbs!(vesta::Scalar);
+crate::impl_small_value_field!(pallas::Scalar);
+crate::impl_small_value_field!(vesta::Scalar);
+crate::impl_montgomery_reduction_constants!(pallas::Scalar);
+crate::impl_montgomery_reduction_constants!(vesta::Scalar);
+crate::impl_pasta_reduction_constants!(pallas::Scalar);
+crate::impl_pasta_reduction_constants!(vesta::Scalar);
+crate::impl_delayed_reduction_pasta!(pallas::Scalar);
+crate::impl_delayed_reduction_pasta!(vesta::Scalar);
 
 #[cfg(test)]
 mod tests {
@@ -104,10 +111,31 @@ mod tests {
 
 #[cfg(test)]
 mod big_num_tests {
-  crate::test_field_reduction_constants!(pallas_frc, crate::provider::pasta::pallas::Scalar);
+  // Small value field
+  crate::test_small_value_field!(pallas_svf, crate::provider::pasta::pallas::Scalar);
+  crate::test_small_value_field!(vesta_svf, crate::provider::pasta::vesta::Scalar);
+
+  // Montgomery
+  crate::test_montgomery_reduction_constants!(pallas_mrc, crate::provider::pasta::pallas::Scalar);
+  crate::test_montgomery_reduction_constants!(vesta_mrc, crate::provider::pasta::vesta::Scalar);
   crate::test_montgomery!(pallas_mont, crate::provider::pasta::pallas::Scalar);
-  crate::test_delayed_reduction!(pallas_dr, crate::provider::pasta::pallas::Scalar);
-  crate::test_field_reduction_constants!(vesta_frc, crate::provider::pasta::vesta::Scalar);
   crate::test_montgomery!(vesta_mont, crate::provider::pasta::vesta::Scalar);
+
+  // Barrett (Pasta 2-fold)
+  crate::test_pasta_reduction_constants!(pallas_prc, crate::provider::pasta::pallas::Scalar);
+  crate::test_pasta_reduction_constants!(vesta_prc, crate::provider::pasta::vesta::Scalar);
+  crate::test_barrett_reduction!(
+    pallas_br,
+    crate::provider::pasta::pallas::Scalar,
+    crate::big_num::barrett::pasta::barrett_reduce_6::<crate::provider::pasta::pallas::Scalar>
+  );
+  crate::test_barrett_reduction!(
+    vesta_br,
+    crate::provider::pasta::vesta::Scalar,
+    crate::big_num::barrett::pasta::barrett_reduce_6::<crate::provider::pasta::vesta::Scalar>
+  );
+
+  // Delayed reduction
+  crate::test_delayed_reduction!(pallas_dr, crate::provider::pasta::pallas::Scalar);
   crate::test_delayed_reduction!(vesta_dr, crate::provider::pasta::vesta::Scalar);
 }

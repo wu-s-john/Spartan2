@@ -43,8 +43,11 @@ impl_traits!(
 );
 
 // Implement big_num traits for BN254 scalar field (Fr)
-// Note: FieldReductionConstants impl is in big_num/field_reduction_constants.rs
 crate::impl_montgomery_limbs!(types::Scalar);
+crate::impl_small_value_field!(types::Scalar);
+crate::impl_montgomery_reduction_constants!(types::Scalar);
+crate::impl_barrett_reduction_constants!(types::Scalar);
+crate::impl_delayed_reduction!(types::Scalar);
 
 // BN254 is not a cycle pair, so we need to manually implement TranscriptReprTrait for the Base field
 impl<G: Group> TranscriptReprTrait<G> for types::Base {
@@ -55,7 +58,21 @@ impl<G: Group> TranscriptReprTrait<G> for types::Base {
 
 #[cfg(test)]
 mod big_num_tests {
-  crate::test_field_reduction_constants!(scalar_frc, crate::provider::bn254::types::Scalar);
+  // Small value field
+  crate::test_small_value_field!(scalar_svf, crate::provider::bn254::types::Scalar);
+
+  // Montgomery
+  crate::test_montgomery_reduction_constants!(scalar_mrc, crate::provider::bn254::types::Scalar);
   crate::test_montgomery!(scalar_mont, crate::provider::bn254::types::Scalar);
+
+  // Barrett
+  crate::test_barrett_reduction_constants!(scalar_brc, crate::provider::bn254::types::Scalar);
+  crate::test_barrett_reduction!(
+    scalar_br,
+    crate::provider::bn254::types::Scalar,
+    crate::big_num::barrett::barrett_reduce_6::<crate::provider::bn254::types::Scalar>
+  );
+
+  // Delayed reduction
   crate::test_delayed_reduction!(scalar_dr, crate::provider::bn254::types::Scalar);
 }

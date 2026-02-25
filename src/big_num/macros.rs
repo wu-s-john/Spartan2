@@ -1,64 +1,122 @@
-#![allow(unused)] // Helper functions used by macros when invoked
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: MIT
 
 //! Macros and const fn helpers for implementing field traits.
 //!
-//! This module provides:
-//! - `impl_field_reduction_constants!` - implements `FieldReductionConstants` for a field type
-//! - `impl_montgomery_limbs!` - implements `MontgomeryLimbs` for a field type
+//! This module provides macros for implementing various field-related traits:
+//!
+//! ## Reduction Constants
+//! - [`impl_montgomery_reduction_constants!`] - Montgomery REDC constants (all fields)
+//! - [`impl_barrett_reduction_constants!`] - Generic Barrett constants (BN254, P256, T256)
+//! - [`impl_pasta_reduction_constants!`] - Pasta 2-fold Barrett constants (Pallas, Vesta)
+//!
+//! ## Limb Access
+//! - [`impl_montgomery_limbs!`] - Montgomery limb access (all fields)
+//!
+//! ## Small Value Field
+//! - [`impl_small_value_field!`] - SmallValueField<i32/i64/i128> (all fields)
+//! - [`test_small_value_field!`] - Test macro (in `small_value_field` module)
+//!
+//! ## Delayed Reduction
+//! - [`impl_delayed_reduction!`] - DelayedReduction using generic Barrett (BN254, P256, T256)
+//! - [`impl_delayed_reduction_pasta!`] - DelayedReduction using Pasta Barrett (Pallas, Vesta)
 //!
 //! All constants are computed at compile time from the field's `PrimeField::MODULUS`
 //! and `Field::ONE` values.
 
-use super::limbs::{gte_5_4, mul_4_by_4, reduce_8_mod_4, sub_5_4};
+use super::limbs::{clz, gte, gte_5_4, mul_4_by_4, reduce_8_mod_4, shl, shr, sub, sub_5_4};
 
 // =============================================================================
-// Implementation macros
+// Reduction Constants Macros
 // =============================================================================
 
-/// Implement `FieldReductionConstants` for a field type.
+/// Implement `MontgomeryReductionConstants` for a field type.
 ///
-/// This macro automatically computes all constants at compile time from the
-/// field's `PrimeField::MODULUS` hex string and `Field::ONE` value.
+/// This macro computes all Montgomery REDC constants at compile time.
+/// Required for all fields that use Montgomery reduction.
 ///
 /// # Example
 /// ```ignore
-/// crate::impl_field_reduction_constants!(Fp);
+/// crate::impl_montgomery_reduction_constants!(Fp);
 /// ```
 #[macro_export]
-macro_rules! impl_field_reduction_constants {
+macro_rules! impl_montgomery_reduction_constants {
   ($field:ty) => {
-    impl $crate::big_num::FieldReductionConstants for $field {
+    impl $crate::big_num::MontgomeryReductionConstants for $field {
       const MODULUS: [u64; 4] =
         $crate::big_num::macros::parse_hex_to_limbs(<$field as ff::PrimeField>::MODULUS);
       const R_MOD: [u64; 4] = <$field as ff::Field>::ONE.0;
       const MONT_INV: u64 = $crate::big_num::macros::compute_mont_inv(Self::MODULUS[0]);
       const R512_MOD: [u64; 4] =
         $crate::big_num::macros::compute_r512_mod(Self::MODULUS, Self::R_MOD);
-      const R384_MOD: [u64; 4] =
-        $crate::big_num::macros::compute_r384_mod(Self::MODULUS, Self::R_MOD);
       const MAX_REDC_SUB_CORRECTIONS: usize =
         $crate::big_num::macros::compute_max_redc_sub_corrections(Self::MODULUS);
-      const BARRETT_MU: [u64; 5] =
-        $crate::big_num::macros::compute_barrett_mu(Self::MODULUS);
-      const USE_4_LIMB_BARRETT: bool =
-        $crate::big_num::macros::is_4_limb_barrett(Self::MODULUS);
-      const PASTA_STYLE_MODULUS: bool =
-        $crate::big_num::macros::is_pasta_style(Self::MODULUS);
-      const PASTA_C: [u64; 2] =
-        $crate::big_num::macros::compute_pasta_c(Self::MODULUS);
     }
 
     // Enforce small MAX_REDC_SUB_CORRECTIONS for performance.
     // The final reduction loop in montgomery_reduce_8 iterates this many times.
     // For 254-256 bit primes, this should be 1-4. Values > 8 indicate a problem.
     const _: () = assert!(
-      <$field as $crate::big_num::FieldReductionConstants>::MAX_REDC_SUB_CORRECTIONS <= 8,
+      <$field as $crate::big_num::MontgomeryReductionConstants>::MAX_REDC_SUB_CORRECTIONS <= 8,
       "MAX_REDC_SUB_CORRECTIONS too large for efficient reduction"
     );
   };
 }
+
+/// Implement `BarrettReductionConstants` for a field type.
+///
+/// This macro computes generic μ-Barrett constants at compile time.
+/// Use for BN254, P256, T256 (non-Pasta fields).
+///
+/// # Example
+/// ```ignore
+/// crate::impl_barrett_reduction_constants!(Bn254Fr);
+/// ```
+#[macro_export]
+macro_rules! impl_barrett_reduction_constants {
+  ($field:ty) => {
+    impl $crate::big_num::BarrettReductionConstants for $field {
+      const MODULUS: [u64; 4] =
+        $crate::big_num::macros::parse_hex_to_limbs(<$field as ff::PrimeField>::MODULUS);
+      const R384_MOD: [u64; 4] =
+        $crate::big_num::macros::compute_r384_mod(Self::MODULUS, <$field as ff::Field>::ONE.0);
+      const BARRETT_MU: [u64; 5] = $crate::big_num::macros::compute_barrett_mu(Self::MODULUS);
+      const USE_4_LIMB_BARRETT: bool = $crate::big_num::macros::is_4_limb_barrett(Self::MODULUS);
+    }
+  };
+}
+
+/// Implement `PastaReductionConstants` for a Pasta field type.
+///
+/// This macro computes Pasta 2-fold Barrett constants at compile time.
+/// For Pasta primes p = 2^254 + PRIME_OFFSET where PRIME_OFFSET fits in 2 limbs.
+///
+/// # Example
+/// ```ignore
+/// crate::impl_pasta_reduction_constants!(pallas::Scalar);
+/// ```
+#[macro_export]
+macro_rules! impl_pasta_reduction_constants {
+  ($field:ty) => {
+    impl $crate::big_num::PastaReductionConstants for $field {
+      const MODULUS: [u64; 4] =
+        $crate::big_num::macros::parse_hex_to_limbs(<$field as ff::PrimeField>::MODULUS);
+      const PRIME_OFFSET: [u64; 2] = $crate::big_num::macros::compute_prime_offset(Self::MODULUS);
+    }
+
+    // Verify this is actually a Pasta-style prime
+    const _: () = assert!(
+      $crate::big_num::macros::is_pasta_style(
+        <$field as $crate::big_num::PastaReductionConstants>::MODULUS
+      ),
+      "Field is not a Pasta-style prime (p != 2^254 + c)"
+    );
+  };
+}
+
+// =============================================================================
+// Limb Access Macro
+// =============================================================================
 
 /// Implement `MontgomeryLimbs` for a field type with `.0` containing `[u64; 4]`.
 ///
@@ -78,6 +136,291 @@ macro_rules! impl_montgomery_limbs {
       #[inline]
       fn to_limbs(&self) -> &[u64; 4] {
         &self.0
+      }
+    }
+  };
+}
+
+// =============================================================================
+// SmallValueField Macro
+// =============================================================================
+
+/// Implement `SmallValueField<i32>`, `SmallValueField<i64>`, `SmallValueField<i128>` for a field.
+///
+/// This macro generates implementations for converting between field elements and
+/// small integer types (i32, i64, i128).
+///
+/// # Example
+/// ```ignore
+/// crate::impl_small_value_field!(pallas::Scalar);
+/// ```
+#[macro_export]
+macro_rules! impl_small_value_field {
+  ($field:ty) => {
+    impl $crate::big_num::SmallValueField<i32> for $field {
+      #[inline]
+      fn small_to_field(val: i32) -> Self {
+        if val >= 0 {
+          Self::from(val as u64)
+        } else {
+          -Self::from((-val) as u64)
+        }
+      }
+
+      fn try_field_to_small(val: &Self) -> Option<i32> {
+        $crate::big_num::small_value_field::try_field_to_small_i32(val)
+      }
+    }
+
+    impl $crate::big_num::SmallValueField<i64> for $field {
+      #[inline]
+      fn small_to_field(val: i64) -> Self {
+        $crate::big_num::small_value_field::i64_to_field(val)
+      }
+
+      fn try_field_to_small(val: &Self) -> Option<i64> {
+        $crate::big_num::small_value_field::try_field_to_i64(val)
+      }
+    }
+
+    impl $crate::big_num::SmallValueField<i128> for $field {
+      #[inline]
+      fn small_to_field(val: i128) -> Self {
+        $crate::big_num::small_value_field::i128_to_field(val)
+      }
+
+      fn try_field_to_small(val: &Self) -> Option<i128> {
+        $crate::big_num::small_value_field::try_field_to_i128(val)
+      }
+    }
+  };
+}
+
+// =============================================================================
+// Delayed Reduction Macros
+// =============================================================================
+
+/// Implement `DelayedReduction` using generic Barrett reduction.
+///
+/// Use for BN254, P256, T256 (non-Pasta fields).
+/// This wires the accumulation functions to `barrett_reduce_6` and `barrett_reduce_7`
+/// from the main `barrett` module, and `montgomery_reduce_9` for field×field.
+///
+/// # Example
+/// ```ignore
+/// crate::impl_delayed_reduction!(Bn254Fr);
+/// ```
+#[macro_export]
+macro_rules! impl_delayed_reduction {
+  ($field:ty) => {
+    impl $crate::big_num::DelayedReduction<i32> for $field {
+      type Accumulator = $crate::big_num::SignedWideLimbs<6>;
+
+      #[inline(always)]
+      fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i32) {
+        let value64 = *value as i64;
+        let (target, mag) = if value64 >= 0 {
+          (&mut acc.pos, value64 as u64)
+        } else {
+          (&mut acc.neg, value64.wrapping_neg() as u64)
+        };
+        $crate::big_num::delayed_reduction::accumulate_field_times_small(target, field, mag);
+      }
+
+      #[inline(always)]
+      fn reduce(acc: &Self::Accumulator) -> Self {
+        use $crate::big_num::montgomery::MontgomeryLimbs;
+        match $crate::big_num::sub_mag::<6>(&acc.pos.0, &acc.neg.0) {
+          $crate::big_num::SubMagResult::Positive(mag) => {
+            Self::from_limbs($crate::big_num::barrett::barrett_reduce_6::<$field>(&mag))
+          }
+          $crate::big_num::SubMagResult::Negative(mag) => {
+            -Self::from_limbs($crate::big_num::barrett::barrett_reduce_6::<$field>(&mag))
+          }
+        }
+      }
+    }
+
+    impl $crate::big_num::DelayedReduction<i64> for $field {
+      type Accumulator = $crate::big_num::SignedWideLimbs<6>;
+
+      #[inline(always)]
+      fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i64) {
+        let (target, mag) = if *value >= 0 {
+          (&mut acc.pos, *value as u64)
+        } else {
+          (&mut acc.neg, (*value).wrapping_neg() as u64)
+        };
+        $crate::big_num::delayed_reduction::accumulate_field_times_small(target, field, mag);
+      }
+
+      #[inline(always)]
+      fn reduce(acc: &Self::Accumulator) -> Self {
+        use $crate::big_num::montgomery::MontgomeryLimbs;
+        match $crate::big_num::sub_mag::<6>(&acc.pos.0, &acc.neg.0) {
+          $crate::big_num::SubMagResult::Positive(mag) => {
+            Self::from_limbs($crate::big_num::barrett::barrett_reduce_6::<$field>(&mag))
+          }
+          $crate::big_num::SubMagResult::Negative(mag) => {
+            -Self::from_limbs($crate::big_num::barrett::barrett_reduce_6::<$field>(&mag))
+          }
+        }
+      }
+    }
+
+    impl $crate::big_num::DelayedReduction<i128> for $field {
+      type Accumulator = $crate::big_num::SignedWideLimbs<7>;
+
+      #[inline(always)]
+      fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i128) {
+        $crate::big_num::delayed_reduction::accumulate_field_times_i128(acc, field, value);
+      }
+
+      #[inline(always)]
+      fn reduce(acc: &Self::Accumulator) -> Self {
+        use $crate::big_num::montgomery::MontgomeryLimbs;
+        match $crate::big_num::sub_mag::<7>(&acc.pos.0, &acc.neg.0) {
+          $crate::big_num::SubMagResult::Positive(mag) => {
+            Self::from_limbs($crate::big_num::barrett::barrett_reduce_7::<$field>(&mag))
+          }
+          $crate::big_num::SubMagResult::Negative(mag) => {
+            -Self::from_limbs($crate::big_num::barrett::barrett_reduce_7::<$field>(&mag))
+          }
+        }
+      }
+    }
+
+    impl $crate::big_num::DelayedReduction<$field> for $field {
+      type Accumulator = $crate::big_num::WideLimbs<9>;
+
+      #[inline(always)]
+      fn unreduced_multiply_accumulate(
+        acc: &mut Self::Accumulator,
+        field_a: &Self,
+        field_b: &$field,
+      ) {
+        $crate::big_num::delayed_reduction::accumulate_field_times_field(acc, field_a, field_b);
+      }
+
+      #[inline(always)]
+      fn reduce(acc: &Self::Accumulator) -> Self {
+        use $crate::big_num::montgomery::MontgomeryLimbs;
+        Self::from_limbs($crate::big_num::montgomery::montgomery_reduce_9::<$field>(
+          &acc.0,
+        ))
+      }
+    }
+  };
+}
+
+/// Implement `DelayedReduction` using Pasta 2-fold Barrett reduction.
+///
+/// Use for Pallas, Vesta (Pasta fields).
+/// This wires the accumulation functions to `barrett::pasta::barrett_reduce_6` and
+/// `barrett::pasta::barrett_reduce_7`, and `montgomery_reduce_9` for field×field.
+///
+/// # Example
+/// ```ignore
+/// crate::impl_delayed_reduction_pasta!(pallas::Scalar);
+/// ```
+#[macro_export]
+macro_rules! impl_delayed_reduction_pasta {
+  ($field:ty) => {
+    impl $crate::big_num::DelayedReduction<i32> for $field {
+      type Accumulator = $crate::big_num::SignedWideLimbs<6>;
+
+      #[inline(always)]
+      fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i32) {
+        let value64 = *value as i64;
+        let (target, mag) = if value64 >= 0 {
+          (&mut acc.pos, value64 as u64)
+        } else {
+          (&mut acc.neg, value64.wrapping_neg() as u64)
+        };
+        $crate::big_num::delayed_reduction::accumulate_field_times_small(target, field, mag);
+      }
+
+      #[inline(always)]
+      fn reduce(acc: &Self::Accumulator) -> Self {
+        use $crate::big_num::montgomery::MontgomeryLimbs;
+        match $crate::big_num::sub_mag::<6>(&acc.pos.0, &acc.neg.0) {
+          $crate::big_num::SubMagResult::Positive(mag) => Self::from_limbs(
+            $crate::big_num::barrett::pasta::barrett_reduce_6::<$field>(&mag),
+          ),
+          $crate::big_num::SubMagResult::Negative(mag) => -Self::from_limbs(
+            $crate::big_num::barrett::pasta::barrett_reduce_6::<$field>(&mag),
+          ),
+        }
+      }
+    }
+
+    impl $crate::big_num::DelayedReduction<i64> for $field {
+      type Accumulator = $crate::big_num::SignedWideLimbs<6>;
+
+      #[inline(always)]
+      fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i64) {
+        let (target, mag) = if *value >= 0 {
+          (&mut acc.pos, *value as u64)
+        } else {
+          (&mut acc.neg, (*value).wrapping_neg() as u64)
+        };
+        $crate::big_num::delayed_reduction::accumulate_field_times_small(target, field, mag);
+      }
+
+      #[inline(always)]
+      fn reduce(acc: &Self::Accumulator) -> Self {
+        use $crate::big_num::montgomery::MontgomeryLimbs;
+        match $crate::big_num::sub_mag::<6>(&acc.pos.0, &acc.neg.0) {
+          $crate::big_num::SubMagResult::Positive(mag) => Self::from_limbs(
+            $crate::big_num::barrett::pasta::barrett_reduce_6::<$field>(&mag),
+          ),
+          $crate::big_num::SubMagResult::Negative(mag) => -Self::from_limbs(
+            $crate::big_num::barrett::pasta::barrett_reduce_6::<$field>(&mag),
+          ),
+        }
+      }
+    }
+
+    impl $crate::big_num::DelayedReduction<i128> for $field {
+      type Accumulator = $crate::big_num::SignedWideLimbs<7>;
+
+      #[inline(always)]
+      fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i128) {
+        $crate::big_num::delayed_reduction::accumulate_field_times_i128(acc, field, value);
+      }
+
+      #[inline(always)]
+      fn reduce(acc: &Self::Accumulator) -> Self {
+        use $crate::big_num::montgomery::MontgomeryLimbs;
+        match $crate::big_num::sub_mag::<7>(&acc.pos.0, &acc.neg.0) {
+          $crate::big_num::SubMagResult::Positive(mag) => Self::from_limbs(
+            $crate::big_num::barrett::pasta::barrett_reduce_7::<$field>(&mag),
+          ),
+          $crate::big_num::SubMagResult::Negative(mag) => -Self::from_limbs(
+            $crate::big_num::barrett::pasta::barrett_reduce_7::<$field>(&mag),
+          ),
+        }
+      }
+    }
+
+    impl $crate::big_num::DelayedReduction<$field> for $field {
+      type Accumulator = $crate::big_num::WideLimbs<9>;
+
+      #[inline(always)]
+      fn unreduced_multiply_accumulate(
+        acc: &mut Self::Accumulator,
+        field_a: &Self,
+        field_b: &$field,
+      ) {
+        $crate::big_num::delayed_reduction::accumulate_field_times_field(acc, field_a, field_b);
+      }
+
+      #[inline(always)]
+      fn reduce(acc: &Self::Accumulator) -> Self {
+        use $crate::big_num::montgomery::MontgomeryLimbs;
+        Self::from_limbs($crate::big_num::montgomery::montgomery_reduce_9::<$field>(
+          &acc.0,
+        ))
       }
     }
   };
@@ -215,18 +558,62 @@ pub const fn compute_r384_mod(p: [u64; 4], r_mod: [u64; 4]) -> [u64; 4] {
   reduce_8_mod_4(&product, &p)
 }
 
-/// Compute Barrett reciprocal μ = ⌊2^512 / p⌋.
+/// Compute Barrett reciprocal μ = ⌊2^512 / p⌋ at compile time.
 ///
 /// For a 256-bit prime p, μ fits in 5 limbs (up to 320 bits).
-///
-/// NOTE: This returns a placeholder [0; 5]. Types that need Barrett reduction
-/// should have direct implementations in field_reduction_constants.rs with
-/// precomputed values.
-pub const fn compute_barrett_mu(_p: [u64; 4]) -> [u64; 5] {
-  // Computing ⌊2^512 / p⌋ at compile time requires sophisticated const division.
-  // For now, return zeros - types that use Barrett reduction have direct impls
-  // with precomputed values in field_reduction_constants.rs.
-  [0u64; 5]
+/// Uses binary long division - O(n²) in bits but only runs at compile time.
+pub const fn compute_barrett_mu(p: [u64; 4]) -> [u64; 5] {
+  // 2^512 as 9 limbs: limb[8] = 1, rest = 0
+  let mut dividend: [u64; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+  // Extend p to 9 limbs
+  let divisor: [u64; 9] = [p[0], p[1], p[2], p[3], 0, 0, 0, 0, 0];
+
+  // Quotient accumulator (5 limbs = 320 bits, enough for 2^512 / 2^254 ≈ 2^258)
+  let mut quotient: [u64; 5] = [0; 5];
+
+  // Find alignment: how many bits to shift divisor left
+  let dividend_clz = clz::<9>(&dividend);
+  let divisor_clz = clz::<9>(&divisor);
+
+  if divisor_clz <= dividend_clz {
+    // Divisor already larger than dividend (shouldn't happen for valid primes)
+    return quotient;
+  }
+
+  let shift_bits = divisor_clz - dividend_clz;
+
+  // Shift divisor left to align with dividend
+  let mut shifted_divisor = divisor;
+  let mut i = 0;
+  while i < shift_bits {
+    shifted_divisor = shl::<9>(&shifted_divisor);
+    i += 1;
+  }
+
+  // Binary long division: shift_bits + 1 iterations
+  let mut bit_pos = shift_bits;
+  loop {
+    if gte::<9>(&dividend, &shifted_divisor) {
+      dividend = sub::<9>(&dividend, &shifted_divisor);
+      // Set bit `bit_pos` in quotient
+      let limb_idx = (bit_pos / 64) as usize;
+      let bit_idx = bit_pos % 64;
+      if limb_idx < 5 {
+        quotient[limb_idx] |= 1u64 << bit_idx;
+      }
+    }
+
+    if bit_pos == 0 {
+      break;
+    }
+    bit_pos -= 1;
+
+    // Shift divisor right by 1
+    shifted_divisor = shr::<9>(&shifted_divisor);
+  }
+
+  quotient
 }
 
 /// Check if 2p < 2^256, enabling 4-limb Barrett fast path.
@@ -240,9 +627,9 @@ pub const fn is_pasta_style(p: [u64; 4]) -> bool {
   p[2] == 0 && p[3] == 0x4000_0000_0000_0000
 }
 
-/// Compute PASTA_C: the c constant for Pasta primes p = 2^254 + c.
+/// Compute PRIME_OFFSET: for Pasta primes p = 2^254 + c, returns [c0, c1].
 /// Returns [0, 0] for non-Pasta primes.
-pub const fn compute_pasta_c(p: [u64; 4]) -> [u64; 2] {
+pub const fn compute_prime_offset(p: [u64; 4]) -> [u64; 2] {
   if is_pasta_style(p) {
     [p[0], p[1]]
   } else {
