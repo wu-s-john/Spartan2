@@ -49,74 +49,6 @@ fn extend_single<T, const D: usize>(
   }
 }
 
-/// Extend 4 consecutive suffix elements with ILP optimization.
-/// Interleaves operations across 4 independent elements for better
-/// instruction-level parallelism on modern CPUs (especially AArch64).
-#[inline(always)]
-fn extend_batch4<T, const D: usize>(
-  src: &[T],
-  dst: &mut [T],
-  base_src: usize,
-  base_dst: usize,
-  suffix_count: usize,
-  s: usize,
-) where
-  T: Copy + Default + Add<Output = T> + Sub<Output = T>,
-{
-  // Load 4 pairs (contiguous reads)
-  let p0_0 = src[base_src + s];
-  let p0_1 = src[base_src + s + 1];
-  let p0_2 = src[base_src + s + 2];
-  let p0_3 = src[base_src + s + 3];
-
-  let p1_0 = src[base_src + suffix_count + s];
-  let p1_1 = src[base_src + suffix_count + s + 1];
-  let p1_2 = src[base_src + suffix_count + s + 2];
-  let p1_3 = src[base_src + suffix_count + s + 3];
-
-  // 4 independent diffs (ILP)
-  let d0 = p1_0 - p0_0;
-  let d1 = p1_1 - p0_1;
-  let d2 = p1_2 - p0_2;
-  let d3 = p1_3 - p0_3;
-
-  // γ = ∞ (4 contiguous writes)
-  dst[base_dst + s] = d0;
-  dst[base_dst + s + 1] = d1;
-  dst[base_dst + s + 2] = d2;
-  dst[base_dst + s + 3] = d3;
-
-  // γ = 0 (4 contiguous writes)
-  dst[base_dst + suffix_count + s] = p0_0;
-  dst[base_dst + suffix_count + s + 1] = p0_1;
-  dst[base_dst + suffix_count + s + 2] = p0_2;
-  dst[base_dst + suffix_count + s + 3] = p0_3;
-
-  if D >= 2 {
-    // γ = 1 (4 contiguous writes)
-    dst[base_dst + 2 * suffix_count + s] = p1_0;
-    dst[base_dst + 2 * suffix_count + s + 1] = p1_1;
-    dst[base_dst + 2 * suffix_count + s + 2] = p1_2;
-    dst[base_dst + 2 * suffix_count + s + 3] = p1_3;
-
-    // γ = 2..D-1: extrapolate (4 at a time)
-    if D > 2 {
-      let (mut v0, mut v1, mut v2, mut v3) = (p1_0, p1_1, p1_2, p1_3);
-      for k in 2..D {
-        v0 = v0 + d0;
-        v1 = v1 + d1;
-        v2 = v2 + d2;
-        v3 = v3 + d3;
-        let offset = (k + 1) * suffix_count + s;
-        dst[base_dst + offset] = v0;
-        dst[base_dst + offset + 1] = v1;
-        dst[base_dst + offset + 2] = v2;
-        dst[base_dst + offset + 3] = v3;
-      }
-    }
-  }
-}
-
 /// Extend boolean hypercube evaluations to Lagrange domain in-place.
 ///
 /// This is Procedure 6: extends polynomial evaluations from {0,1}^ℓ to U_D^ℓ.
@@ -187,18 +119,9 @@ where
     for prefix_idx in 0..prefix_count {
       let base_src = prefix_idx * current_stride;
       let base_dst = prefix_idx * next_stride;
-      let mut s = 0;
 
-      // Process 4 suffix elements at a time for ILP
-      while s + 4 <= suffix_count {
-        extend_batch4::<T, D>(src, dst, base_src, base_dst, suffix_count, s);
-        s += 4;
-      }
-
-      // Handle remainder (0-3 elements)
-      while s < suffix_count {
+      for s in 0..suffix_count {
         extend_single::<T, D>(src, dst, base_src, base_dst, suffix_count, s);
-        s += 1;
       }
     }
   }
@@ -215,9 +138,9 @@ where
 // ============================================================================
 
 #[cfg(test)]
-use crate::polys::multilinear::MultilinearPolynomial;
-#[cfg(test)]
 use crate::big_num::SmallValueField;
+#[cfg(test)]
+use crate::polys::multilinear::MultilinearPolynomial;
 #[cfg(test)]
 use ff::PrimeField;
 
@@ -336,18 +259,12 @@ impl<F: PrimeField, const D: usize> LagrangeExtendedEvals<F, D> {
   }
 
   pub fn from_evals(evals: Vec<F>, num_vars: usize) -> Self {
-    assert_eq!(evals.len(), (D + 1).pow(num_vars as u32), "evals length must match domain size");
+    assert_eq!(
+      evals.len(),
+      (D + 1).pow(num_vars as u32),
+      "evals length must match domain size"
+    );
     Self { evals, num_vars }
-  }
-}
-
-#[cfg(test)]
-impl<const D: usize> LagrangeExtendedEvals<i32, D> {
-  pub fn to_field<F: SmallValueField<i32>>(&self) -> LagrangeExtendedEvals<F, D> {
-    LagrangeExtendedEvals {
-      evals: self.evals.iter().map(|&v| F::small_to_field(v)).collect(),
-      num_vars: self.num_vars,
-    }
   }
 }
 
@@ -355,8 +272,7 @@ impl<const D: usize> LagrangeExtendedEvals<i32, D> {
 mod tests {
   use super::*;
   use crate::{
-    polys::multilinear::MultilinearPolynomial, provider::pasta::pallas,
-    big_num::SmallValueField,
+    big_num::SmallValueField, polys::multilinear::MultilinearPolynomial, provider::pasta::pallas,
   };
   use ff::Field;
 
@@ -628,22 +544,6 @@ mod tests {
   }
 
   #[test]
-  fn test_small_lagrange_to_field() {
-    const D: usize = 2;
-    let num_vars = 2;
-
-    let input: Vec<i32> = (0..(1 << num_vars)).map(|i| i + 1).collect();
-
-    let small_ext = LagrangeExtendedEvals::<i32, D>::from_boolean_evals(&input);
-    let field_ext: LagrangeExtendedEvals<Scalar, D> = small_ext.to_field::<Scalar>();
-
-    for i in 0..small_ext.len() {
-      let expected: Scalar = Scalar::small_to_field(small_ext.get(i));
-      assert_eq!(field_ext.get(i), expected);
-    }
-  }
-
-  #[test]
   fn test_small_lagrange_negative_values() {
     let p0: i32 = 100;
     let p1: i32 = 50;
@@ -655,7 +555,9 @@ mod tests {
     assert_eq!(extended.get(1), p0);
     assert_eq!(extended.get(2), p1);
 
-    let field_ext: LagrangeExtendedEvals<Scalar, 2> = extended.to_field::<Scalar>();
+    // Verify field version handles negative correctly
+    let input_field: Vec<Scalar> = vec![Scalar::from(100u64), Scalar::from(50u64)];
+    let field_ext = LagrangeExtendedEvals::<Scalar, 2>::from_boolean_evals(&input_field);
     assert_eq!(field_ext.get(0), -Scalar::from(50u64));
   }
 }

@@ -1,4 +1,3 @@
-#![allow(unused)] // TODO: Remove when small_sumcheck module is integrated
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: MIT
 // This file is part of the Spartan2 project.
@@ -10,8 +9,9 @@
 //! - `SparsePolynomial`: Efficient representation of sparse multilinear polynomials, storing only non-zero evaluations.
 
 use crate::{
-  math::Math, polys::eq::EqPolynomial, big_num::SmallValueField, big_num::vec_to_small,
-  zip_with_for_each,
+  big_num::{SmallValueField, vec_to_small},
+  math::Math,
+  polys::eq::EqPolynomial,
 };
 use core::ops::Index;
 use ff::{Field, PrimeField};
@@ -148,13 +148,7 @@ impl MultilinearPolynomial<i64> {
 
   /// Convert to field-element polynomial.
   pub fn to_field<F: SmallValueField<i64>>(&self) -> MultilinearPolynomial<F> {
-    MultilinearPolynomial::new(
-      self
-        .Z
-        .iter()
-        .map(|&s| F::small_to_field(s))
-        .collect(),
-    )
+    MultilinearPolynomial::new(self.Z.iter().map(|&s| F::small_to_field(s)).collect())
   }
 }
 
@@ -421,5 +415,4 @@ mod tests {
     assert_ne!(poly.Z[0], Scalar::from(6u64));
     assert_ne!(poly.Z[1], Scalar::from(8u64));
   }
-
 }

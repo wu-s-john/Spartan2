@@ -71,7 +71,6 @@ where
   }
 }
 
-#[allow(unused)] // TODO: Remove when small_sumcheck is integrated
 /// Bind the top variable of three multilinear polynomials to `r` in place.
 ///
 /// After binding, each polynomial has half the evaluations.

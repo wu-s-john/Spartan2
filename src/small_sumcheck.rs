@@ -1,4 +1,3 @@
-#![allow(unused)] // TODO: Remove when integrated into proof systems
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: MIT
 // This file is part of the Spartan2 project.
@@ -18,23 +17,15 @@
 //! # Overview
 //!
 //! The main entry point is [`prove_cubic_small_value`], which implements
-//! Algorithm 6 (EqPoly-SmallValueSC) combining:
-//! - Small-value optimization (Algorithm 4) for the first ℓ₀ rounds
-//! - Eq-poly optimization (Algorithm 5) for the remaining rounds
-//!
-//! # Key Components
-//!
-//! - [`SmallValueSumCheck`]: Tracks state during small-value rounds
-//! - [`build_univariate_round_polynomial`]: Constructs the cubic round polynomial
 
 use crate::{
+  big_num::{DelayedReduction, SmallValueField, WideMul},
   errors::SpartanError,
   lagrange_accumulator::{
     EqRoundFactor, LagrangeAccumulators, LagrangeBasisFactory, LagrangeCoeff, LagrangeEvals,
     LagrangeHatEvals, SPARTAN_T_DEGREE, build_accumulators_spartan, derive_t1,
   },
   polys::{eq::EqPolynomial, multilinear::MultilinearPolynomial, univariate::UniPoly},
-  big_num::{DelayedReduction, SmallValueField, WideMul},
   start_span,
   sumcheck::{SumcheckProof, eq_sumcheck},
   traits::{Engine, transcript::TranscriptEngineTrait},
@@ -51,7 +42,7 @@ use crate::sumcheck::PAR_THRESHOLD;
 /// This struct maintains the precomputed accumulators and running state
 /// needed to efficiently evaluate round polynomials using native integer
 /// arithmetic instead of field operations.
-pub struct SmallValueSumCheck<Scalar: PrimeField, const D: usize> {
+struct SmallValueSumCheck<Scalar: PrimeField, const D: usize> {
   accumulators: LagrangeAccumulators<Scalar, D>,
   coeff: LagrangeCoeff<Scalar, D>,
   eq_factor: EqRoundFactor<Scalar>,
@@ -60,7 +51,7 @@ pub struct SmallValueSumCheck<Scalar: PrimeField, const D: usize> {
 
 impl<Scalar: PrimeField, const D: usize> SmallValueSumCheck<Scalar, D> {
   /// Create a new small-value round tracker with precomputed accumulators.
-  pub fn new(
+  fn new(
     accumulators: LagrangeAccumulators<Scalar, D>,
     basis_factory: LagrangeBasisFactory<Scalar, D>,
   ) -> Self {
@@ -73,23 +64,23 @@ impl<Scalar: PrimeField, const D: usize> SmallValueSumCheck<Scalar, D> {
   }
 
   /// Create from accumulators with the standard Lagrange basis (0, 1, 2, ...).
-  pub fn from_accumulators(accumulators: LagrangeAccumulators<Scalar, D>) -> Self {
+  fn from_accumulators(accumulators: LagrangeAccumulators<Scalar, D>) -> Self {
     let basis_factory = LagrangeBasisFactory::<Scalar, D>::new(|i| Scalar::from(i as u64));
     Self::new(accumulators, basis_factory)
   }
 
   /// Evaluate t_i(u) for all u ∈ Û_D in a single pass for round i.
-  pub fn eval_t_all_u(&self, round: usize) -> LagrangeHatEvals<Scalar, D> {
+  fn eval_t_all_u(&self, round: usize) -> LagrangeHatEvals<Scalar, D> {
     self.accumulators.round(round).eval_t_all_u(&self.coeff)
   }
 
   /// Compute ℓ_i values for the provided w_i.
-  pub fn eq_round_values(&self, w_i: Scalar) -> LagrangeEvals<Scalar, 2> {
+  fn eq_round_values(&self, w_i: Scalar) -> LagrangeEvals<Scalar, 2> {
     self.eq_factor.values(w_i)
   }
 
   /// Advance the round state with the verifier challenge r_i.
-  pub fn advance(&mut self, li: &LagrangeEvals<Scalar, 2>, r_i: Scalar) {
+  fn advance(&mut self, li: &LagrangeEvals<Scalar, 2>, r_i: Scalar) {
     self.eq_factor.advance(li, r_i);
     self.coeff.extend(&self.basis_factory.basis_at(r_i));
   }
@@ -100,7 +91,7 @@ impl<Scalar: PrimeField, const D: usize> SmallValueSumCheck<Scalar, D> {
 /// Constructs s_i(X) = ℓ_i(X) · t_i(X) where:
 /// - ℓ_i(X) is the linear eq factor
 /// - t_i(X) is the degree-2 polynomial from accumulators
-pub(crate) fn build_univariate_round_polynomial<F: PrimeField>(
+fn build_univariate_round_polynomial<F: PrimeField>(
   li: &LagrangeEvals<F, 2>,
   t0: F,
   t1: F,
@@ -177,11 +168,7 @@ where
       F::unreduced_multiply_accumulate(&mut acc_c, eq_p, &poly_c_small.Z[idx]);
     }
 
-    (
-      F::reduce(&acc_a),
-      F::reduce(&acc_b),
-      F::reduce(&acc_c),
-    )
+    (F::reduce(&acc_a), F::reduce(&acc_b), F::reduce(&acc_c))
   };
 
   let results: Vec<(F, F, F)> = if stride >= PAR_THRESHOLD {
@@ -232,11 +219,17 @@ pub fn prove_cubic_small_value<E, SmallValue, const LB: usize>(
 ) -> Result<(SumcheckProof<E>, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
 where
   E: Engine,
-  SmallValue: WideMul + Copy + Default + num_traits::Zero + std::ops::Add<Output = SmallValue> + std::ops::Sub<Output = SmallValue> + Send + Sync,
+  SmallValue: WideMul
+    + Copy
+    + Default
+    + num_traits::Zero
+    + std::ops::Add<Output = SmallValue>
+    + std::ops::Sub<Output = SmallValue>
+    + Send
+    + Sync,
   E::Scalar: SmallValueField<SmallValue>
     + DelayedReduction<SmallValue>
-    + DelayedReduction<SmallValue::Product>
-    + DelayedReduction<E::Scalar>,
+    + DelayedReduction<SmallValue::Product>,
 {
   let num_rounds = taus.len();
   let mut r: Vec<E::Scalar> = Vec::with_capacity(num_rounds);
@@ -330,8 +323,8 @@ where
 
     let poly = {
       let (_eval_span, eval_t) = start_span!("compute_eval_points");
-      let (eval_point_0, eval_point_2, eval_point_3) = eq_instance
-        .evaluation_points_cubic_with_three_inputs(round, &poly_A, &poly_B, &poly_C);
+      let (eval_point_0, eval_point_2, eval_point_3) =
+        eq_instance.evaluation_points_cubic_with_three_inputs(round, &poly_A, &poly_B, &poly_C);
       if eval_t.elapsed().as_millis() > 0 {
         info!(elapsed_ms = %eval_t.elapsed().as_millis(), "compute_eval_points");
       }
@@ -376,11 +369,11 @@ where
 mod tests {
   use super::*;
   use crate::{
+    big_num::{DelayedReduction, SmallValueField, WideMul},
     gadgets::CubicChainCircuit,
     polys::multilinear::MultilinearPolynomial,
-    sha256_circuits::SmallSha256Circuit,
     provider::PallasHyraxEngine,
-    big_num::{DelayedReduction, SmallValueField, WideMul},
+    sha256_circuits::SmallSha256Circuit,
     spartan::SpartanSNARK,
     sumcheck::eq_sumcheck::EqSumCheckInstance,
     traits::{Engine, snark::R1CSSNARKTrait, transcript::TranscriptEngineTrait},
@@ -395,9 +388,19 @@ mod tests {
   /// evaluations as EqSumCheckInstance across multiple rounds.
   fn run_smallvalue_round_test<V>()
   where
-    V: WideMul + Copy + Default + num_traits::Zero + Add<Output = V> + Sub<Output = V> + Mul<Output = V> + Send + Sync + TryFrom<usize>,
+    V: WideMul
+      + Copy
+      + Default
+      + num_traits::Zero
+      + Add<Output = V>
+      + Sub<Output = V>
+      + Mul<Output = V>
+      + Send
+      + Sync
+      + TryFrom<usize>,
     <V as TryFrom<usize>>::Error: std::fmt::Debug,
-    F: SmallValueField<V> + DelayedReduction<V> + DelayedReduction<V::Product> + DelayedReduction<F>,
+    F:
+      SmallValueField<V> + DelayedReduction<V> + DelayedReduction<V::Product> + DelayedReduction<F>,
   {
     const NUM_VARS: usize = 6;
     const SMALL_VALUE_ROUNDS: usize = 3;

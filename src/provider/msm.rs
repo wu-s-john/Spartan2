@@ -484,7 +484,11 @@ mod tests {
       let coeffs: Vec<u64> = (0..n)
         .map(|_| {
           let r = rand::random::<u64>();
-          if bit_width == 64 { r } else { r % (1u64 << bit_width) }
+          if bit_width == 64 {
+            r
+          } else {
+            r % (1u64 << bit_width)
+          }
         })
         .collect::<Vec<_>>();
       let coeffs_scalar: Vec<F> = coeffs.iter().map(|b| F::from(*b)).collect::<Vec<_>>();

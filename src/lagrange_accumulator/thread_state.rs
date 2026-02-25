@@ -7,11 +7,10 @@
 //! Thread-local scratch buffers for accumulator building.
 //!
 //! These structs eliminate per-iteration heap allocations in the parallel fold loops
-//! of `build_accumulators_spartan` and `build_accumulators_neutronnova`. By hoisting buffer
-//! allocations to the fold identity closure (called once per Rayon thread subdivision),
-//! we reduce allocations from O(num_x_out) to O(num_threads).
+//! of `build_accumulators_spartan`. By hoisting buffer allocations to the fold identity
+//! closure (called once per Rayon thread subdivision), we reduce allocations from
+//! O(num_x_out) to O(num_threads).
 
-use super::accumulator::LagrangeAccumulators;
 use crate::big_num::{DelayedReduction, SmallValueField, WideMul};
 use ff::PrimeField;
 use num_traits::Zero;
@@ -64,7 +63,14 @@ where
     + DelayedReduction<F>
     + Send
     + Sync,
-  SmallValue: WideMul + Copy + Default + num_traits::Zero + Add<Output = SmallValue> + Sub<Output = SmallValue> + Send + Sync,
+  SmallValue: WideMul
+    + Copy
+    + Default
+    + num_traits::Zero
+    + Add<Output = SmallValue>
+    + Sub<Output = SmallValue>
+    + Send
+    + Sync,
 {
   /// Partial sums indexed by β, accumulated over the x_in loop.
   /// Uses unreduced wide-limb form for delayed modular reduction.
@@ -101,11 +107,21 @@ where
     + DelayedReduction<F>
     + Send
     + Sync,
-  SmallValue: WideMul + Copy + Default + num_traits::Zero + Add<Output = SmallValue> + Sub<Output = SmallValue> + Send + Sync,
+  SmallValue: WideMul
+    + Copy
+    + Default
+    + num_traits::Zero
+    + Add<Output = SmallValue>
+    + Sub<Output = SmallValue>
+    + Send
+    + Sync,
 {
   pub fn new(_l0: usize, num_betas: usize, prefix_size: usize, ext_size: usize) -> Self {
     Self {
-      partial_sums: vec![<F as DelayedReduction<SmallValue::Product>>::Accumulator::zero(); num_betas],
+      partial_sums: vec![
+        <F as DelayedReduction<SmallValue::Product>>::Accumulator::zero();
+        num_betas
+      ],
       s_beta: vec![<F as DelayedReduction<F>>::Accumulator::zero(); num_betas],
       az_prefix_boolean_evals: vec![SmallValue::zero(); prefix_size],
       bz_prefix_boolean_evals: vec![SmallValue::zero(); prefix_size],
@@ -127,83 +143,3 @@ where
     self.beta_values.clear();
   }
 }
-
-/// Thread-local scratch buffers for `build_accumulators_neutronnova`.
-///
-/// Supports both immediate reduction (`PS = F`) and delayed reduction
-/// (`PS = F::Accumulator`). Extension buffers use small values throughout,
-/// validated by `vec_to_small_for_extension` to stay within bounds after
-/// Lagrange extension (3^ℓ_b growth factor for D=2).
-///
-/// # Type Parameters
-///
-/// - `F`: Field type for partial sums and scatter accumulators
-/// - `SmallValue`: Value type for pref/extension buffers (i32, i64, etc.)
-/// - `PS`: Partial sum type (Accumulator for delayed reduction)
-/// - `D`: Polynomial degree bound
-pub(crate) struct NeutronNovaThreadState<F, SmallValue, PS: Copy + Default + Zero, const D: usize>
-where
-  F: PrimeField
-    + SmallValueField<SmallValue>
-    + DelayedReduction<SmallValue>
-    + DelayedReduction<SmallValue::Product>
-    + DelayedReduction<F>
-    + Send
-    + Sync,
-  SmallValue: WideMul + Copy + Default + num_traits::Zero + Add<Output = SmallValue> + Sub<Output = SmallValue> + Send + Sync,
-{
-  /// Partial sums indexed by β, accumulated over the x_L loop. Reset each x_R iteration.
-  /// Type is `F` for immediate reduction, or `Accumulator` for delayed reduction.
-  pub partial_sums: Vec<PS>,
-  /// Bucket accumulators for scatter phase (accumulator for field × field products).
-  pub scatter_acc: LagrangeAccumulators<<F as DelayedReduction<F>>::Accumulator, D>,
-  /// Prefix evaluations of Az for current x_R. Size: 2^l_b
-  pub az_prefix_boolean_evals: Vec<SmallValue>,
-  /// Prefix evaluations of Bz for current x_R. Size: 2^l_b
-  pub bz_prefix_boolean_evals: Vec<SmallValue>,
-  /// Result buffer for Az Lagrange extension. Size: 3^l_b
-  pub az_extended_evals: Vec<SmallValue>,
-  /// Scratch buffer for Az Lagrange extension.
-  pub az_extended_scratch: Vec<SmallValue>,
-  /// Result buffer for Bz Lagrange extension.
-  pub bz_extended_evals: Vec<SmallValue>,
-  /// Scratch buffer for Bz Lagrange extension.
-  pub bz_extended_scratch: Vec<SmallValue>,
-  /// Reusable buffer for filtered (beta_idx, reduced_value) pairs in scatter phase.
-  /// Values are field elements from reducing partial sums.
-  pub beta_values: Vec<(usize, F)>,
-}
-
-impl<F, SmallValue, PS: Copy + Default + Zero, const D: usize> NeutronNovaThreadState<F, SmallValue, PS, D>
-where
-  F: PrimeField
-    + SmallValueField<SmallValue>
-    + DelayedReduction<SmallValue>
-    + DelayedReduction<SmallValue::Product>
-    + DelayedReduction<F>
-    + Send
-    + Sync,
-  SmallValue: WideMul + Copy + Default + num_traits::Zero + Add<Output = SmallValue> + Sub<Output = SmallValue> + Send + Sync,
-{
-  pub fn new(l0: usize, num_betas: usize, prefix_size: usize, ext_size: usize) -> Self {
-    Self {
-      partial_sums: vec![PS::zero(); num_betas],
-      scatter_acc: LagrangeAccumulators::new(l0),
-      az_prefix_boolean_evals: vec![SmallValue::zero(); prefix_size],
-      bz_prefix_boolean_evals: vec![SmallValue::zero(); prefix_size],
-      az_extended_evals: vec![SmallValue::zero(); ext_size],
-      az_extended_scratch: vec![SmallValue::zero(); ext_size],
-      bz_extended_evals: vec![SmallValue::zero(); ext_size],
-      bz_extended_scratch: vec![SmallValue::zero(); ext_size],
-      beta_values: Vec::with_capacity(num_betas),
-    }
-  }
-
-  /// Zero out partial sums for the next x_R iteration.
-  #[inline]
-  pub fn reset_partial_sums(&mut self) {
-    self.partial_sums.fill(PS::zero());
-    self.beta_values.clear();
-  }
-}
-

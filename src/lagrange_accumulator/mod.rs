@@ -1,4 +1,3 @@
-#![allow(unused)] // TODO: Remove when integrated into proof systems
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: MIT
 // This file is part of the Spartan2 project.
@@ -24,7 +23,9 @@
 
 mod accumulator;
 mod accumulator_builder;
+mod accumulator_builder_2eq;
 mod basis;
+mod csr;
 mod domain;
 mod eq_round;
 mod evals;
@@ -45,9 +46,10 @@ pub use basis::{LagrangeBasisFactory, LagrangeCoeff};
 pub use accumulator::{LagrangeAccumulators, RoundAccumulator};
 
 // Builder functions
-pub use accumulator_builder::{
-  SPARTAN_T_DEGREE, build_accumulators_neutronnova, build_accumulators_spartan,
-};
+pub use accumulator_builder::{SPARTAN_T_DEGREE, build_accumulators_spartan};
+
+// 2-eq builder (for benchmarking comparison)
+pub use accumulator_builder_2eq::build_accumulators_spartan_2eq;
 
 // Eq round factor and derivation
 pub use eq_round::{EqRoundFactor, derive_t1};

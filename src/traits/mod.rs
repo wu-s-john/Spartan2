@@ -18,7 +18,10 @@ pub mod transcript;
 use pcs::PCSEngineTrait;
 use transcript::{TranscriptEngineTrait, TranscriptReprTrait};
 
-pub use crate::big_num::{DelayedReduction, FieldReductionConstants};
+pub use crate::big_num::{
+  BarrettReductionConstants, DelayedReduction, MontgomeryReductionConstants,
+  PastaReductionConstants,
+};
 
 /// Represents an element of a group
 /// This is currently tailored for an elliptic curve group
@@ -46,7 +49,7 @@ pub trait Engine: Clone + Copy + Debug + Send + Sync + Sized + Eq + PartialEq {
     + TranscriptReprTrait<Self::GE>
     + Serialize
     + for<'de> Deserialize<'de>
-    + FieldReductionConstants
+    + MontgomeryReductionConstants
     + DelayedReduction<Self::Scalar>;
 
   /// A type that represents an element of the group
