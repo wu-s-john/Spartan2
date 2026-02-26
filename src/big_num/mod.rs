@@ -27,7 +27,7 @@ mod limbs;
 // Re-exports: traits
 pub use delayed_reduction::DelayedReduction;
 pub use field_reduction_constants::{BarrettReductionConstants, FieldReductionConstants};
-pub use small_value_field::SmallValueField;
+pub use small_value_field::{SmallValue, SmallValueEngine, SmallValueField};
 #[allow(unused_imports)]
 pub use wide_mul::WideMul;
 

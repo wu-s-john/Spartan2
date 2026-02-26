@@ -37,10 +37,18 @@ pub mod errors;
 pub mod provider;
 pub mod traits;
 
-// internal modules
-mod big_num;
-mod polys;
-mod sumcheck;
+// internal modules (some exposed for benchmarks)
+/// Big-number arithmetic for delayed modular reduction.
+pub mod big_num;
+#[allow(dead_code)]
+mod lagrange_accumulator;
+/// Polynomial types and operations.
+pub mod polys;
+/// Small-value sumcheck optimization.
+#[allow(dead_code)]
+pub mod small_sumcheck;
+/// Sumcheck protocol implementation.
+pub mod sumcheck;
 
 // public modules for proof systems
 pub mod neutronnova_zk; // NeutronNova with zero-knowledge
