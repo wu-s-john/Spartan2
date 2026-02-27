@@ -16,8 +16,9 @@ use super::{
 };
 use crate::{
   big_num::{DelayedReduction, SmallValue, SmallValueEngine},
-  polys::{eq::compute_suffix_eq_pyramid, multilinear::MultilinearPolynomial},
+  polys::{eq::EqPolynomial, eq::compute_suffix_eq_pyramid, multilinear::MultilinearPolynomial},
 };
+use ff::PrimeField;
 use num_traits::Zero;
 use rayon::prelude::*;
 
@@ -27,33 +28,73 @@ use super::index::compute_idx4;
 /// For Spartan's cubic relation (A·B - C), D=2 yields quadratic t_i.
 pub const SPARTAN_T_DEGREE: usize = 2;
 
-pub(crate) struct BetaContributions {
-  contributions: Csr<AccumulatorPrefixIndex>,
+/// Precomputed eq polynomial tables with balanced split.
+struct EqSplitTables<F: PrimeField> {
+  /// eq(τ[l0..l0+in_vars], ·) evaluations, size 2^in_vars
+  e_in: Vec<F>,
+  /// eq(τ[l0+in_vars..], ·) evaluations, size 2^xout_vars
+  e_xout: Vec<F>,
+  /// Suffix eq pyramid for prefix variables, Vec per round
+  e_y: Vec<Vec<F>>,
+}
+
+/// Cached prefix indices for O(1) scatter access.
+pub(crate) struct BetaPrefixCache {
+  cache: Csr<AccumulatorPrefixIndex>,
   num_betas: usize,
+}
+
+/// Precompute eq polynomial tables with balanced split for e_in and e_xout.
+///
+/// Returns (tables, in_vars, xout_vars) where:
+/// - in_vars = ceil((l - l0) / 2) - variables for inner loop (e_in)
+/// - xout_vars = floor((l - l0) / 2) - variables for outer loop (e_xout)
+///
+/// The balanced split reduces precomputation cost by ~33% compared to the
+/// asymmetric l/2 split, and enables odd number of rounds.
+fn precompute_eq_tables<F: PrimeField>(taus: &[F], l0: usize) -> (EqSplitTables<F>, usize, usize) {
+  let l = taus.len();
+  let suffix_vars = l - l0;
+  let in_vars = suffix_vars.div_ceil(2); // ceiling: e_in larger (inner loop, sequential access)
+  let xout_vars = suffix_vars - in_vars; // floor: e_xout smaller (outer loop, reused)
+
+  let e_in = EqPolynomial::evals_from_points(&taus[l0..l0 + in_vars]); // 2^in_vars entries
+  let e_xout = EqPolynomial::evals_from_points(&taus[l0 + in_vars..]); // 2^xout_vars entries
+  let e_y = compute_suffix_eq_pyramid(&taus[..l0], l0); // Vec per round, total 2^l0 - 1
+
+  (EqSplitTables { e_in, e_xout, e_y }, in_vars, xout_vars)
+}
+
+/// Build beta → prefix index cache for O(1) scatter access.
+pub(crate) fn build_beta_cache<const D: usize>(l0: usize) -> BetaPrefixCache {
+  let base: usize = D + 1;
+  let num_betas = base.pow(l0 as u32);
+  let mut cache: Csr<AccumulatorPrefixIndex> = Csr::with_capacity(num_betas, num_betas * l0);
+  for b in 0..num_betas {
+    let beta = LagrangeIndex::<D>::from_flat_index(b, l0);
+    let entries = compute_idx4(&beta);
+    cache.push(&entries);
+  }
+
+  BetaPrefixCache { cache, num_betas }
 }
 
 /// Procedure 9: Build accumulators A_i(v, u) for Spartan's first sum-check (Algorithm 6).
 ///
 /// Computes accumulators for: g(X) = eq(τ, X) · (Az(X) · Bz(X) - Cz(X))
 ///
-/// # Two-Pass Approach
+/// D is the degree bound of t_i(X) (not s_i); for Spartan, D = 2.
 ///
-/// Uses a two-pass approach to avoid allocating an expanded eq table:
-/// - Pass 1 (x₀=0): Accumulates into S0 using `e_in_rest` coefficients
-/// - Pass 2 (x₀=1): Accumulates into S1 using `e_in_rest` coefficients
-/// - Combine: `result = (1-τ₀)×S₀ + τ₀×S₁`
+/// # Type Parameters
 ///
-/// This eliminates the allocation from `expanded_eq_left()` by using the existing
-/// pyramid slice `e_in_rest` and handling τ₀ algebraically.
+/// - `F`: Field type with small-value and delayed reduction support
+/// - `SV`: Witness value type (i32 or i64)
 ///
-/// # Arguments
+/// # Parallelism strategy
 ///
-/// - `az`, `bz`: Witness polynomials (small integer values)
-/// - `taus`: Challenge vector of length ℓ
-/// - `l0`: Number of small-value rounds (prefix variables)
-/// - `tau0`: First inner tau for two-pass combination
-/// - `e_in_rest`: eq(τ[1..in_vars], ·), size 2^(in_vars-1) - NO ALLOCATION
-/// - `e_xout`: eq(τ[in_vars..], ·), size 2^xout_vars
+/// - Outer parallel loop over x_out values (using Rayon fold-reduce)
+/// - Each thread maintains thread-local accumulators
+/// - Final reduction merges all thread-local results via element-wise addition
 ///
 /// # Spartan-specific optimizations (D=2)
 ///
@@ -64,9 +105,6 @@ pub fn build_accumulators_spartan<F, SV>(
   bz: &MultilinearPolynomial<SV>,
   taus: &[F],
   l0: usize,
-  tau0: F,
-  e_in_rest: &[F],
-  e_xout: &[F],
 ) -> LagrangeAccumulators<F, 2>
 where
   F: SmallValueEngine<SV>,
@@ -79,219 +117,119 @@ where
   debug_assert_eq!(taus.len(), l, "taus must have length ℓ");
   debug_assert!(l0 < l, "l0 must be < ℓ");
 
+  let suffix_vars = l - l0;
   let prefix_size = 1usize << l0;
 
-  // Compute e_y for the l0 prefix variables (used in final scatter)
-  let e_y = compute_suffix_eq_pyramid(&taus[..l0], l0);
+  // Precompute eq tables with balanced split
+  let (eq_tables, _in_vars, xout_vars) = precompute_eq_tables(taus, l0);
+  let num_x_out = 1usize << xout_vars;
 
-  // Compute variable counts from the known suffix size and e_xout.
-  // e_xout.len() = 2^xout_vars, and suffix_vars = in_vars + xout_vars.
-  let suffix_vars = l - l0;
-  let xout_vars = e_xout.len().trailing_zeros() as usize;
-  let in_vars = suffix_vars - xout_vars;
-
-  // Verify e_in_rest has the expected size: 2^(in_vars-1) if in_vars > 0, else 1
-  debug_assert_eq!(
-    e_in_rest.len(),
-    if in_vars == 0 { 1 } else { 1 << (in_vars - 1) },
-    "e_in_rest size mismatch: in_vars={}, expected {}, got {}",
-    in_vars,
-    if in_vars == 0 { 1 } else { 1 << (in_vars - 1) },
-    e_in_rest.len()
-  );
-  let num_x_out = e_xout.len();
-
-  // in_msb is only valid when in_vars > 0 (computed lazily to avoid underflow)
-  let in_msb = if in_vars > 0 { 1usize << (in_vars - 1) } else { 0 };
-
-  // Precompute tau0 factors for two-pass combination (only used when in_vars > 0)
-  let one_minus_tau0 = F::ONE - tau0;
-
-  let BetaContributions {
-    contributions: beta_contributions,
+  // Build beta → prefix index cache
+  let BetaPrefixCache {
+    cache: beta_prefix_cache,
     num_betas,
-  } = compute_beta_contributions::<2>(l0);
+  } = build_beta_cache::<2>(l0);
 
   // Only betas containing at least one ∞ coordinate contribute non-zero values.
+  // On binary inputs {0,1}^n, Az·Bz = Cz (R1CS identity), so Az·Bz - Cz = 0.
   let betas_with_infty: Vec<usize> = (0..num_betas)
     .filter(|&i| (0..l0).any(|d| (i / base.pow(d as u32)) % base == 0))
     .collect();
 
   let ext_size = base.pow(l0 as u32); // (D+1)^l0
 
-  // Parallel over x_out with thread-local state
+  // Build eq_cache: precomputes e_xout[x_out] * e_y[round][y] products.
+  // Layout: eq_cache[round][x_out * num_y + y] for cache-friendly access.
+  // Each parallel task (fixed x_out) accesses a contiguous block of size num_y.
+  let eq_cache: Vec<Vec<F>> = eq_tables
+    .e_y
+    .iter()
+    .map(|round_ey| {
+      eq_tables
+        .e_xout
+        .iter()
+        .flat_map(|ex| round_ey.iter().map(|ey| *ex * *ey))
+        .collect()
+    })
+    .collect();
+
+  // Precompute num_y per round for transposed access
+  let num_y_per_round: Vec<usize> = eq_tables.e_y.iter().map(|ey| ey.len()).collect();
+
+  // Borrow e_in directly (no clone needed)
+  let e_in = &eq_tables.e_in;
+
+  // Parallel over x_out with thread-local state (zero per-iteration allocations)
   type State<F2, SV2> = SpartanThreadState<F2, SV2, 2>;
 
   let fold_results: Vec<State<F, SV>> = (0..num_x_out)
     .into_par_iter()
     .fold(
-      || State::<F, SV>::new(num_betas, prefix_size, ext_size),
+      || State::<F, SV>::new(l0, num_betas, prefix_size, ext_size),
       |mut state: State<F, SV>, x_out_bits| {
-        // Handle two cases based on whether there are inner variables
-        if in_vars == 0 {
-          // ===== NO INNER VARIABLES =====
-          // No two-pass needed; just iterate over x_out with coeff = e_xout
-          let coeff = e_xout[x_out_bits];
-          let suffix = x_out_bits; // No inner component
+        // Reset partial sums for this x_out iteration
+        state.reset_partial_sums();
 
-          // Load prefix evaluations
+        // Inner loop over x_in - accumulate into UNREDUCED form
+        for (x_in_bits, e_in_eval) in e_in.iter().enumerate() {
+          let suffix = (x_in_bits << xout_vars) | x_out_bits;
+
+          // Fill prefix buffers by index assignment (no allocation)
           #[allow(clippy::needless_range_loop)]
           for prefix in 0..prefix_size {
             let idx = (prefix << suffix_vars) | suffix;
-            state.az.boolean_evals[prefix] = az.Z[idx];
-            state.bz.boolean_evals[prefix] = bz.Z[idx];
+            state.az_prefix_boolean_evals[prefix] = az.Z[idx];
+            state.bz_prefix_boolean_evals[prefix] = bz.Z[idx];
           }
 
-          // Extend to Lagrange domain
+          // Extend Az and Bz to Lagrange domain in-place (zero allocation)
           let az_size = extend_to_lagrange_domain::<SV, 2>(
-            &state.az.boolean_evals,
-            &mut state.az.extended_evals,
-            &mut state.az.extended_scratch,
+            &state.az_prefix_boolean_evals,
+            &mut state.az_extended_evals,
+            &mut state.az_extended_scratch,
           );
-          let az_ext = &state.az.extended_evals[..az_size];
+          let az_ext = &state.az_extended_evals[..az_size];
 
           let bz_size = extend_to_lagrange_domain::<SV, 2>(
-            &state.bz.boolean_evals,
-            &mut state.bz.extended_evals,
-            &mut state.bz.extended_scratch,
+            &state.bz_prefix_boolean_evals,
+            &mut state.bz_extended_evals,
+            &mut state.bz_extended_scratch,
           );
-          let bz_ext = &state.bz.extended_evals[..bz_size];
+          let bz_ext = &state.bz_extended_evals[..bz_size];
 
-          // Accumulate directly into s_beta
+          // Only process betas with ∞ - binary betas contribute 0 for satisfying witnesses
+          // Uses delayed modular reduction: accumulates into unreduced wide-limb form.
           for &beta_idx in &betas_with_infty {
             let prod = SV::wide_mul(az_ext[beta_idx], bz_ext[beta_idx]);
-            // Convert product to field element via accumulator
-            let mut temp_acc =
-              <F as DelayedReduction<SV::Product>>::Accumulator::default();
-            <F as DelayedReduction<SV::Product>>::unreduced_multiply_accumulate(
-              &mut temp_acc,
-              &F::ONE,
-              &prod,
-            );
-            let prod_field = <F as DelayedReduction<SV::Product>>::reduce(&temp_acc);
-            let val = prod_field * coeff;
-            if val != F::ZERO {
-              <F as DelayedReduction<F>>::unreduced_multiply_accumulate(
-                &mut state.s_beta[beta_idx],
-                &val,
-                &F::ONE,
-              );
-            }
+            F::unreduced_multiply_accumulate(&mut state.partial_sums[beta_idx], e_in_eval, &prod);
           }
-        } else {
-          // ===== TWO-PASS APPROACH (in_vars > 0) =====
-          // Precompute combined coefficients for this x_out
-          // c0 = e_xout[x_out] × (1 - τ₀)
-          // c1 = e_xout[x_out] × τ₀
-          let c0 = e_xout[x_out_bits] * one_minus_tau0;
-          let c1 = e_xout[x_out_bits] * tau0;
+        }
 
-          // ===== PASS 1: x₀ = 0 =====
-          state.reset_s0();
-
-          for (x_rest_bits, e_rest) in e_in_rest.iter().enumerate() {
-            // x_in has MSB = 0, so x_in = x_rest
-            let x_in_bits = x_rest_bits;
-            let suffix = (x_in_bits << xout_vars) | x_out_bits;
-
-            // Load prefix evaluations
-            #[allow(clippy::needless_range_loop)]
-            for prefix in 0..prefix_size {
-              let idx = (prefix << suffix_vars) | suffix;
-              state.az.boolean_evals[prefix] = az.Z[idx];
-              state.bz.boolean_evals[prefix] = bz.Z[idx];
-            }
-
-            // Extend to Lagrange domain
-            let az_size = extend_to_lagrange_domain::<SV, 2>(
-              &state.az.boolean_evals,
-              &mut state.az.extended_evals,
-              &mut state.az.extended_scratch,
-            );
-            let az_ext = &state.az.extended_evals[..az_size];
-
-            let bz_size = extend_to_lagrange_domain::<SV, 2>(
-              &state.bz.boolean_evals,
-              &mut state.bz.extended_evals,
-              &mut state.bz.extended_scratch,
-            );
-            let bz_ext = &state.bz.extended_evals[..bz_size];
-
-            // Accumulate into S0 for each non-binary β
-            for &beta_idx in &betas_with_infty {
-              let prod = SV::wide_mul(az_ext[beta_idx], bz_ext[beta_idx]);
-              <F as DelayedReduction<SV::Product>>::unreduced_multiply_accumulate(
-                &mut state.s0[beta_idx],
-                e_rest,
-                &prod,
-              );
-            }
+        // Pre-compute and filter: reduce all non-zero betas upfront
+        for &beta_idx in &betas_with_infty {
+          if state.partial_sums[beta_idx].is_zero() {
+            continue;
           }
-
-          // ===== PASS 2: x₀ = 1 =====
-          state.reset_s1();
-
-          for (x_rest_bits, e_rest) in e_in_rest.iter().enumerate() {
-            // x_in has MSB = 1
-            let x_in_bits = in_msb | x_rest_bits;
-            let suffix = (x_in_bits << xout_vars) | x_out_bits;
-
-            // Load prefix evaluations
-            #[allow(clippy::needless_range_loop)]
-            for prefix in 0..prefix_size {
-              let idx = (prefix << suffix_vars) | suffix;
-              state.az.boolean_evals[prefix] = az.Z[idx];
-              state.bz.boolean_evals[prefix] = bz.Z[idx];
-            }
-
-            // Extend to Lagrange domain
-            let az_size = extend_to_lagrange_domain::<SV, 2>(
-              &state.az.boolean_evals,
-              &mut state.az.extended_evals,
-              &mut state.az.extended_scratch,
-            );
-            let az_ext = &state.az.extended_evals[..az_size];
-
-            let bz_size = extend_to_lagrange_domain::<SV, 2>(
-              &state.bz.boolean_evals,
-              &mut state.bz.extended_evals,
-              &mut state.bz.extended_scratch,
-            );
-            let bz_ext = &state.bz.extended_evals[..bz_size];
-
-            // Accumulate into S1 for each non-binary β
-            for &beta_idx in &betas_with_infty {
-              let prod = SV::wide_mul(az_ext[beta_idx], bz_ext[beta_idx]);
-              <F as DelayedReduction<SV::Product>>::unreduced_multiply_accumulate(
-                &mut state.s1[beta_idx],
-                e_rest,
-                &prod,
-              );
-            }
+          // Reduce partial sum to field element
+          let val = <F as DelayedReduction<SV::Product>>::reduce(&state.partial_sums[beta_idx]);
+          if val == F::ZERO {
+            continue;
           }
+          state.beta_values.push((beta_idx, val));
+        }
 
-          // ===== COMBINE & ACCUMULATE =====
-          // For each β: val = s0_val × c0 + s1_val × c1
-          // where c0 = e_xout × (1-τ₀), c1 = e_xout × τ₀
-          state.clear_beta_values();
-
-          for &beta_idx in &betas_with_infty {
-            // Reduce S0 and S1 accumulators to field elements
-            let s0_val = <F as DelayedReduction<SV::Product>>::reduce(&state.s0[beta_idx]);
-            let s1_val = <F as DelayedReduction<SV::Product>>::reduce(&state.s1[beta_idx]);
-
-            // Combine: (1-τ₀)×S₀ + τ₀×S₁, weighted by e_xout
-            let val = s0_val * c0 + s1_val * c1;
-
-            if val == F::ZERO {
-              continue;
-            }
-
-            // Accumulate into s_beta
+        // Distribute beta values → A_i(v,u) via idx4 using precomputed eq_cache
+        // Multiply-accumulate into wide accumulator (Montgomery REDC at end)
+        for &(beta_idx, ref val) in &state.beta_values {
+          for pref in &beta_prefix_cache[beta_idx] {
+            // Transposed layout: eq_cache[round][x_out * num_y + y] for contiguous y access
+            let num_y = num_y_per_round[pref.round_0 as usize];
+            let eq_eval = eq_cache[pref.round_0 as usize][x_out_bits * num_y + pref.y_idx as usize];
             <F as DelayedReduction<F>>::unreduced_multiply_accumulate(
-              &mut state.s_beta[beta_idx],
-              &val,
-              &F::ONE, // Already weighted by e_xout in c0/c1
+              &mut state.acc.rounds[pref.round_0 as usize].data_mut()[pref.v_idx as usize]
+                [pref.u_idx as usize],
+              val,
+              &eq_eval,
             );
           }
         }
@@ -301,94 +239,31 @@ where
     )
     .collect();
 
-  // Sequential merge: combines s_beta arrays element-wise.
+  // Sequential merge: avoids parallel reduce tree overhead and identity allocations.
   let merged = fold_results
     .into_iter()
     .reduce(|mut a, b| {
-      for (a_s, b_s) in a.s_beta.iter_mut().zip(&b.s_beta) {
-        *a_s += *b_s;
-      }
+      a.acc.merge(&b.acc);
       a
     })
     .expect("num_x_out > 0 guarantees non-empty fold results");
 
-  // Final scatter: A_i(v,u) += E_Y,i[y] × S[β]
-  let mut result: LagrangeAccumulators<F, 2> = LagrangeAccumulators::new(l0);
-  for beta_idx in 0..num_betas {
-    if merged.s_beta[beta_idx].is_zero() {
-      continue;
-    }
-    let s_val = <F as DelayedReduction<F>>::reduce(&merged.s_beta[beta_idx]);
-    if s_val == F::ZERO {
-      continue;
-    }
-
-    for pref in &beta_contributions[beta_idx] {
-      let e_y_val = e_y[pref.round_0 as usize][pref.y_idx as usize];
-      result.rounds[pref.round_0 as usize].data_mut()[pref.v_idx as usize][pref.u_idx as usize] +=
-        s_val * e_y_val;
-    }
-  }
-  result
-}
-
-// =============================================================================
-// Helper functions
-// =============================================================================
-pub(crate) fn compute_beta_contributions<const D: usize>(l0: usize) -> BetaContributions {
-  let base: usize = D + 1;
-  let num_betas = base.pow(l0 as u32);
-  let mut contributions: Csr<AccumulatorPrefixIndex> =
-    Csr::with_capacity(num_betas, num_betas * l0);
-  for b in 0..num_betas {
-    let beta = LagrangeIndex::<D>::from_flat_index(b, l0);
-    let entries = compute_idx4(&beta);
-    contributions.push(&entries);
-  }
-
-  BetaContributions {
-    contributions,
-    num_betas,
-  }
+  // Finalize: reduce each bucket from wide 9-limb to field element
+  merged
+    .acc
+    .map(|acc| <F as DelayedReduction<F>>::reduce(acc))
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{
-    lagrange_accumulator::domain::LagrangeHatPoint, polys::eq::EqPolynomial,
-    provider::pasta::pallas,
-  };
+  use crate::{lagrange_accumulator::domain::LagrangeHatPoint, provider::pasta::pallas};
   use ff::Field;
 
   type Scalar = pallas::Scalar;
 
   // Use the shared constant for polynomial degree in tests
   const D: usize = SPARTAN_T_DEGREE;
-
-  /// Test helper: compute eq tables for two-pass approach from taus.
-  /// Uses balanced split: in_vars gets ceiling half, xout_vars gets floor half.
-  /// Returns (tau0, e_in_rest, e_xout) for the new signature.
-  fn compute_eq_tables_for_test(taus: &[Scalar], l0: usize) -> (Scalar, Vec<Scalar>, Vec<Scalar>) {
-    let l = taus.len();
-    let suffix_vars = l - l0;
-    let in_vars = suffix_vars.div_ceil(2); // ceiling (inner loop, larger)
-
-    // tau0 is the first inner tau
-    let tau0 = taus[l0];
-
-    // e_in_rest is eq table for taus[l0+1..l0+in_vars] (excluding tau0)
-    let e_in_rest = if in_vars <= 1 {
-      vec![Scalar::ONE] // Single element when in_vars is 0 or 1
-    } else {
-      EqPolynomial::evals_from_points(&taus[l0 + 1..l0 + in_vars])
-    };
-
-    // e_xout from remaining taus
-    let e_xout = EqPolynomial::evals_from_points(&taus[l0 + in_vars..]);
-
-    (tau0, e_in_rest, e_xout)
-  }
 
   /// Binary-β zero shortcut: Az=Bz=Cz=first variable (x0), so Az·Bz−Cz=0 on binary β.
   /// Non-binary β (∞) should yield non-zero in some bucket.
@@ -408,8 +283,7 @@ mod tests {
 
     let taus: Vec<Scalar> = vec![Scalar::from(3u64), Scalar::from(5u64)];
 
-    let (tau0, e_in_rest, e_xout) = compute_eq_tables_for_test(&taus, l0);
-    let acc = build_accumulators_spartan(&az, &bz, &taus, l0, tau0, &e_in_rest, &e_xout);
+    let acc = build_accumulators_spartan(&az, &bz, &taus, l0);
 
     // Only round 0 exists (v is empty). β ranges over U_d with binary {0,1} and non-binary {∞}.
     // Buckets for u = 0 should be zero (binary β), bucket for u = ∞ should be non-zero.
@@ -457,9 +331,8 @@ mod tests {
     ];
 
     // Build accumulators twice
-    let (tau0, e_in_rest, e_xout) = compute_eq_tables_for_test(&taus, l0);
-    let acc1 = build_accumulators_spartan(&az, &bz, &taus, l0, tau0, &e_in_rest, &e_xout);
-    let acc2 = build_accumulators_spartan(&az, &bz, &taus, l0, tau0, &e_in_rest, &e_xout);
+    let acc1 = build_accumulators_spartan(&az, &bz, &taus, l0);
+    let acc2 = build_accumulators_spartan(&az, &bz, &taus, l0);
 
     // Compare all buckets
     for round in 0..l0 {
@@ -496,9 +369,8 @@ mod tests {
     let taus: Vec<Scalar> = (0..l).map(|i| Scalar::from((i * 7 + 3) as u64)).collect();
 
     // Build accumulators twice to verify consistency
-    let (tau0, e_in_rest, e_xout) = compute_eq_tables_for_test(&taus, l0);
-    let acc1 = build_accumulators_spartan(&az, &bz, &taus, l0, tau0, &e_in_rest, &e_xout);
-    let acc2 = build_accumulators_spartan(&az, &bz, &taus, l0, tau0, &e_in_rest, &e_xout);
+    let acc1 = build_accumulators_spartan(&az, &bz, &taus, l0);
+    let acc2 = build_accumulators_spartan(&az, &bz, &taus, l0);
 
     for round in 0..l0 {
       let num_v = (D + 1).pow(round as u32);

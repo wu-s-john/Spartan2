@@ -967,44 +967,6 @@ pub(crate) mod eq_sumcheck {
       self.eval_eq_left = factor;
     }
 
-    /// Returns eq evaluations for the right half of variables (last `second_half` taus).
-    ///
-    /// Size: `2^second_half`
-    ///
-    /// This is `eq(τ[first_half..], x_right)` for all `x_right ∈ {0,1}^second_half`.
-    #[inline]
-    pub fn eq_evals_right(&self) -> &[E::Scalar] {
-      &self.poly_eq_right[self.second_half]
-    }
-
-    /// Returns eq evaluations for the left half EXCLUDING the first tau (τ₀).
-    ///
-    /// Size: `2^(first_half - 1)` if `first_half > 0`, else 1.
-    ///
-    /// This is `eq(τ[1..first_half], x_rest)` for all `x_rest ∈ {0,1}^{first_half-1}`.
-    ///
-    /// Use with the two-pass approach: iterate twice (x₀=0, x₀=1) and combine
-    /// as `(1-τ₀)×S₀ + τ₀×S₁` to avoid allocating the expanded table.
-    ///
-    /// This method does NOT allocate - it returns a slice into the existing pyramid.
-    #[inline]
-    pub fn eq_evals_left_without_first(&self) -> &[E::Scalar] {
-      if self.first_half == 0 {
-        &self.poly_eq_left[0] // [1]
-      } else {
-        &self.poly_eq_left[self.first_half - 1]
-      }
-    }
-
-    /// Returns the first tau value (τ₀) for two-pass combination.
-    ///
-    /// Used with `eq_evals_left_without_first()` to combine passes:
-    /// `result = (1 - τ₀) × S₀ + τ₀ × S₁`
-    #[inline]
-    pub fn first_tau(&self) -> E::Scalar {
-      self.taus[0]
-    }
-
     /// Evaluate poly_A * poly_B - poly_C
     #[inline]
     pub fn evaluation_points_cubic_with_three_inputs(

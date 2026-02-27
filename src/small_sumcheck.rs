@@ -242,24 +242,14 @@ where
   }
 
   // ===== Pre-computation Phase =====
-  // Create EqSumCheckInstance for suffix variables. This precomputes the eq polynomial
-  // pyramids that are reused for both the accumulator and remaining sumcheck rounds.
-  let mut eq_instance = eq_sumcheck::EqSumCheckInstance::<E>::new(&taus[l0..]);
-
-  // Extract eq tables from the instance. The split follows EqSumCheckInstance's convention:
-  // - tau0: first inner tau for two-pass combination
-  // - e_in_rest (inner loop): eq_evals_left_without_first() - NO ALLOCATION (uses pyramid slice)
-  // - e_xout (outer loop): eq_evals_right() from LAST second_half taus, size 2^second_half
-  let tau0 = eq_instance.first_tau();
-  let e_in_rest = eq_instance.eq_evals_left_without_first();
-  let e_xout = eq_instance.eq_evals_right();
-
   // Build accumulators A_i(v, u) for all i ∈ [ℓ₀] using small-value arithmetic.
-  // Uses two-pass approach: iterate twice (x₀=0, x₀=1), combine as (1-τ₀)×S₀ + τ₀×S₁.
-  // Internally uses: small × small → intermediate (for Az·Bz products),
+  // Internally computes eq tables with balanced split and precomputed eq_cache.
+  // Uses: small × small → intermediate (for Az·Bz products),
   // then intermediate × field (for eq weighting via DelayedReduction).
-  let accumulators =
-    build_accumulators_spartan(poly_A_small, poly_B_small, &taus, l0, tau0, e_in_rest, e_xout);
+  let accumulators = build_accumulators_spartan(poly_A_small, poly_B_small, &taus, l0);
+
+  // Create EqSumCheckInstance for suffix variables (used in remaining rounds).
+  let mut eq_instance = eq_sumcheck::EqSumCheckInstance::<E>::new(&taus[l0..]);
   let mut small_value_sumcheck =
     SmallValueSumCheck::<E::Scalar, SPARTAN_T_DEGREE>::from_accumulators(accumulators);
 
@@ -430,25 +420,8 @@ mod tests {
     // Claim = 0 for satisfying witness (Az·Bz = Cz)
     let mut claim = F::ZERO;
 
-    // Create suffix eq_instance and extract eq tables for accumulators.
-    // The split follows EqSumCheckInstance's convention:
-    // - tau0: first inner tau for two-pass combination
-    // - e_in_rest (inner loop): eq_evals_left_without_first() - NO ALLOCATION
-    // - e_xout (outer loop): LAST second_half taus, size 2^second_half
-    let suffix_eq_instance = EqSumCheckInstance::<E>::new(&taus[SMALL_VALUE_ROUNDS..]);
-    let tau0 = suffix_eq_instance.first_tau();
-    let e_in_rest = suffix_eq_instance.eq_evals_left_without_first();
-    let e_xout = suffix_eq_instance.eq_evals_right();
-
-    let accs = build_accumulators_spartan(
-      &az_poly,
-      &bz_poly,
-      &taus,
-      SMALL_VALUE_ROUNDS,
-      tau0,
-      e_in_rest,
-      e_xout,
-    );
+    // Build accumulators using the simplified API
+    let accs = build_accumulators_spartan(&az_poly, &bz_poly, &taus, SMALL_VALUE_ROUNDS);
     let mut small_value = SmallValueSumCheck::from_accumulators(accs);
 
     // Full eq_instance for verification against standard sumcheck
