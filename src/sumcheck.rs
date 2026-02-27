@@ -977,37 +977,32 @@ pub(crate) mod eq_sumcheck {
       &self.poly_eq_right[self.second_half]
     }
 
-    /// Returns expanded eq evaluations for the left half of variables (first `first_half` taus).
+    /// Returns eq evaluations for the left half EXCLUDING the first tau (τ₀).
     ///
-    /// Size: `2^first_half`
+    /// Size: `2^(first_half - 1)` if `first_half > 0`, else 1.
     ///
-    /// This is `eq(τ[0..first_half], x_left)` for all `x_left ∈ {0,1}^first_half`.
+    /// This is `eq(τ[1..first_half], x_rest)` for all `x_rest ∈ {0,1}^{first_half-1}`.
     ///
-    /// The internal pyramid only stores `2^(first_half-1)` values (from `taus[1..first_half]`)
-    /// since `taus[0]` is tracked separately in `eval_eq_left`. This method expands by
-    /// incorporating `taus[0]`.
-    pub fn expanded_eq_left(&self) -> Vec<E::Scalar> {
+    /// Use with the two-pass approach: iterate twice (x₀=0, x₀=1) and combine
+    /// as `(1-τ₀)×S₀ + τ₀×S₁` to avoid allocating the expanded table.
+    ///
+    /// This method does NOT allocate - it returns a slice into the existing pyramid.
+    #[inline]
+    pub fn eq_evals_left_without_first(&self) -> &[E::Scalar] {
       if self.first_half == 0 {
-        // No left variables - return [1]
-        return vec![E::Scalar::ONE];
+        &self.poly_eq_left[0] // [1]
+      } else {
+        &self.poly_eq_left[self.first_half - 1]
       }
+    }
 
-      // poly_eq_left[first_half-1] has size 2^(first_half-1) from taus[1..first_half]
-      // We expand by incorporating taus[0]: eq(τ₀, x₀) = (1-τ₀)(1-x₀) + τ₀·x₀
-      let partial = &self.poly_eq_left[self.first_half - 1];
-      let tau0 = self.taus[0];
-      let one_minus_tau0 = E::Scalar::ONE - tau0;
-
-      let mut full = Vec::with_capacity(partial.len() * 2);
-      // x[0] = 0: eq(τ₀, 0) = 1 - τ₀
-      for &v in partial {
-        full.push(v * one_minus_tau0);
-      }
-      // x[0] = 1: eq(τ₀, 1) = τ₀
-      for &v in partial {
-        full.push(v * tau0);
-      }
-      full
+    /// Returns the first tau value (τ₀) for two-pass combination.
+    ///
+    /// Used with `eq_evals_left_without_first()` to combine passes:
+    /// `result = (1 - τ₀) × S₀ + τ₀ × S₁`
+    #[inline]
+    pub fn first_tau(&self) -> E::Scalar {
+      self.taus[0]
     }
 
     /// Evaluate poly_A * poly_B - poly_C

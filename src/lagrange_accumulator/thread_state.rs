@@ -42,33 +42,22 @@ impl<SV: Zero + Clone> PolyExtensionBuffers<SV> {
 ///
 /// # Motivation
 ///
-/// Without this optimization, the fold closure allocates 5 vectors on every x_out iteration:
-/// ```ignore
-/// |mut acc, x_out_bits| {
-///     let mut beta_partial_sums = vec![S::ZERO; num_betas];     // ALLOC
-///     let mut az_prefix_boolean_evals = vec![...];                               // ALLOC
-///     let mut bz_prefix_boolean_evals = vec![...];                               // ALLOC
-///     let mut buf_a = vec![...];                                 // ALLOC
-///     let mut buf_b = vec![...];                                 // ALLOC
-///     ...
-/// }
-/// ```
-///
-/// For typical workloads (l=20, l0=4), num_x_out = 2^6 = 64, causing 320 allocations
-/// per parallel task. With Rayon's work-stealing, this leads to significant allocator
-/// contention and cache pollution.
-///
-/// # Solution
-///
+/// Without this optimization, the fold closure allocates vectors on every x_out iteration.
 /// By hoisting these buffers into a struct created once per Rayon thread subdivision
 /// (in the fold identity closure), we reduce allocations from O(num_x_out) to O(num_threads).
-/// The `reset_partial_sums()` method zeros the sums between iterations (cheap memset).
+///
+/// # Two-Pass Approach
+///
+/// The algorithm uses a two-pass approach to avoid allocating an expanded eq table:
+/// - Pass 1 (x₀=0): Accumulates into `s0` using `e_in_rest` coefficients
+/// - Pass 2 (x₀=1): Accumulates into `s1` using `e_in_rest` coefficients
+/// - Combine: `result = (1-τ₀)×S₀ + τ₀×S₁`
 ///
 /// # Buffer Layout
 ///
-/// - `az`, `bz`: Extension buffers for Az and Bz polynomials. Both must be available
-///   simultaneously to compute Az(β) × Bz(β) for each β.
-/// - `s_beta`: Global accumulator S[β] = Σ E_X[x_out] × val, accumulated across x_out iterations.
+/// - `s0`, `s1`: Two-pass accumulators for F × Wide products (SignedWideLimbs)
+/// - `s_beta`: Global accumulator for F × F products across x_out iterations (WideLimbs<9>)
+/// - `az`, `bz`: Extension buffers for small-value polynomials
 ///
 /// # Type Parameters
 ///
@@ -80,20 +69,23 @@ where
   F: SmallValueEngine<SV>,
   SV: SmallValue,
 {
-  /// Partial sums indexed by β, accumulated over the x_in loop.
-  /// Uses unreduced wide-limb form for delayed modular reduction.
-  /// Reset each x_out iteration.
-  pub partial_sums: Vec<<F as DelayedReduction<SV::Product>>::Accumulator>,
-  /// S[β] = Σ_{x_out} E_X[x_out] × reduced_partial_sum[β]
+  /// S0 accumulator for pass 1 (x₀ = 0).
+  /// Type: SignedWideLimbs<6> for i32/i64, SignedWideLimbs<7> for i128.
+  /// Accumulates: F × SV::Product (field × wide integer).
+  /// Reset at start of each x_out iteration.
+  pub s0: Vec<<F as DelayedReduction<SV::Product>>::Accumulator>,
+  /// S1 accumulator for pass 2 (x₀ = 1).
+  /// Same type as s0.
+  pub s1: Vec<<F as DelayedReduction<SV::Product>>::Accumulator>,
+  /// S[β] = Σ_{x_out} combined_val[β]
   /// Accumulated across all x_out iterations within a fold task, then merged.
-  /// Uses unreduced F×F form for delayed modular reduction.
+  /// Type: WideLimbs<9> for F × F products.
   pub s_beta: Vec<<F as DelayedReduction<F>>::Accumulator>,
   /// Extension buffers for Az polynomial.
   pub az: PolyExtensionBuffers<SV>,
   /// Extension buffers for Bz polynomial.
   pub bz: PolyExtensionBuffers<SV>,
-  /// Reusable buffer for filtered (beta_idx, reduced_value) pairs in accumulator building phase.
-  /// Values are field elements from reducing partial sums.
+  /// Reusable buffer for filtered (beta_idx, reduced_value) pairs.
   /// Eliminates per-x_out allocation overhead.
   pub beta_values: Vec<(usize, F)>,
 }
@@ -105,7 +97,11 @@ where
 {
   pub fn new(num_betas: usize, prefix_size: usize, ext_size: usize) -> Self {
     Self {
-      partial_sums: vec![
+      s0: vec![
+        <F as DelayedReduction<SV::Product>>::Accumulator::zero();
+        num_betas
+      ],
+      s1: vec![
         <F as DelayedReduction<SV::Product>>::Accumulator::zero();
         num_betas
       ],
@@ -116,13 +112,27 @@ where
     }
   }
 
-  /// Zero out partial sums for the next x_out iteration.
-  /// This is O(num_betas) but much cheaper than reallocating.
+  /// Reset S0 accumulator for pass 1.
+  /// Called at the start of each x_out iteration before pass 1.
   #[inline]
-  pub fn reset_partial_sums(&mut self) {
-    for sum in &mut self.partial_sums {
+  pub fn reset_s0(&mut self) {
+    for sum in &mut self.s0 {
       *sum = <F as DelayedReduction<SV::Product>>::Accumulator::zero();
     }
+  }
+
+  /// Reset S1 accumulator for pass 2.
+  /// Called after pass 1, before pass 2.
+  #[inline]
+  pub fn reset_s1(&mut self) {
+    for sum in &mut self.s1 {
+      *sum = <F as DelayedReduction<SV::Product>>::Accumulator::zero();
+    }
+  }
+
+  /// Clear beta_values buffer for reuse.
+  #[inline]
+  pub fn clear_beta_values(&mut self) {
     self.beta_values.clear();
   }
 }
