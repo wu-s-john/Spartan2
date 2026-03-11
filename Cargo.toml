@@ -56,8 +56,17 @@ default = []
 jem = ["tikv-jemallocator"]
 
 [profile.release]
+opt-level = 3
 debug = 1
-lto = "fat"
+lto = "thin"
+codegen-units = 1
+incremental = false
+
+[profile.bench]
+inherits = "release"
+debug = 2
+strip = false
+split-debuginfo = "unpacked"
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 halo2curves = { version = "0.9.0", features = ["derive_serde", "std", "asm"] }

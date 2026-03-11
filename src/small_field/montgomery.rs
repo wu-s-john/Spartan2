@@ -24,7 +24,7 @@ use halo2curves::{
 ///
 /// Field elements are stored as `value * R mod p` where R = 2^256.
 /// This trait provides direct access to those R-scaled limbs.
-pub(crate) trait MontgomeryLimbs: FieldReductionConstants {
+pub trait MontgomeryLimbs: FieldReductionConstants {
   /// Construct a field element from 4 Montgomery-form limbs.
   fn from_limbs(limbs: [u64; 4]) -> Self;
 
@@ -99,7 +99,7 @@ impl MontgomeryLimbs for T256Fq {
 ///
 /// 3. **Carry correction**: If c=1, add R_MOD and do one conditional subtract.
 #[inline]
-pub(crate) fn montgomery_reduce_9<F: FieldReductionConstants>(c: &[u64; 9]) -> [u64; 4] {
+pub fn montgomery_reduce_9<F: FieldReductionConstants>(c: &[u64; 9]) -> [u64; 4] {
   // STEP 1: Fold - reduce 9 limbs to 8 limbs + carry bit
   //
   // We have: C = L + h*R² where L = c[0..8], h = c[8]

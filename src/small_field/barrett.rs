@@ -22,7 +22,7 @@ use super::{
 ///
 /// Dispatches to Pasta 2-fold or generic μ-Barrett based on field type.
 #[inline]
-pub(crate) fn barrett_reduce_6<F: FieldReductionConstants>(c: &[u64; 6]) -> [u64; 4] {
+pub fn barrett_reduce_6<F: FieldReductionConstants>(c: &[u64; 6]) -> [u64; 4] {
   if F::PASTA_STYLE_MODULUS {
     barrett_reduce_6_pasta::<F>(c)
   } else {
@@ -308,7 +308,7 @@ fn sub_5_5(a: &[u64; 5], b: &[u64; 5]) -> [u64; 5] {
 ///
 /// Dispatches to Pasta 2-fold or generic fold+μ-Barrett based on field type.
 #[inline]
-pub(crate) fn barrett_reduce_7<F: FieldReductionConstants>(c: &[u64; 7]) -> [u64; 4] {
+pub fn barrett_reduce_7<F: FieldReductionConstants>(c: &[u64; 7]) -> [u64; 4] {
   if F::PASTA_STYLE_MODULUS {
     barrett_reduce_7_pasta::<F>(c)
   } else {

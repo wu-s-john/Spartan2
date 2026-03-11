@@ -12,11 +12,16 @@
 //! (i32/i64 values), so we can perform many operations in native integers before
 //! converting to field elements.
 
-pub(crate) mod barrett;
+#[allow(unsafe_code)]
+pub mod aarch64;
+pub mod barrett;
 mod delayed_reduction;
-pub(crate) mod field_reduction_constants;
-pub(crate) mod limbs;
-pub(crate) mod montgomery;
+pub mod field_reduction_constants;
+pub mod limbs;
+#[allow(unsafe_code)]
+pub mod limbs32;
+pub mod limbs52;
+pub mod montgomery;
 mod small_value_field;
 mod wide_mul;
 

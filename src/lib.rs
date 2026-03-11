@@ -18,7 +18,7 @@
 #![allow(clippy::upper_case_acronyms)]
 #![allow(clippy::type_complexity)]
 #![allow(clippy::too_many_arguments)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 // private modules
 mod csr;
