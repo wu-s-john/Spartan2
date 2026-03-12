@@ -11,6 +11,7 @@
 //!   cargo run --release --example field_asm_bench -- case fi32
 //!   cargo run --release --example field_asm_bench -- case ilp
 //!   cargo run --release --example field_asm_bench -- case reduce
+//!   cargo run --release --example field_asm_bench -- case batch
 //!   cargo run --release --example field_asm_bench -- profile <variant>
 
 use clap::{Parser, Subcommand};
@@ -1233,6 +1234,278 @@ fn verify_correctness() {
 }
 
 // ============================================================================
+// Case 8: Batched MAC Benchmark (K=1,2,3,4,8)
+// ============================================================================
+
+fn bench_batching(sizes: &[usize]) {
+  println!("\n=== Batched MAC Benchmark ===");
+
+  // --- Field×Field ---
+  println!("\n--- Field×Field ---");
+  println!(
+    "{:<10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+    "N", "naive", "5x52_K1", "5x52_K2", "5x52_K3", "5x52_K4", "5x52_K8",
+    "4x64_K1", "4x64_K2", "4x64_K3", "4x64_K4", "4x64_K8"
+  );
+  println!("{}", "-".repeat(130));
+
+  for &n in sizes {
+    let data = gen_field_pairs(n);
+    let data_52: Vec<_> = data.iter().map(|(a, b)| (to_52(a), to_52(b))).collect();
+    let field_data: Vec<_> = data
+      .iter()
+      .map(|(a, b)| (Bn254Fr::from_limbs(*a), Bn254Fr::from_limbs(*b)))
+      .collect();
+
+    // Naive
+    let t_naive = bench(
+      || {
+        let mut acc = Bn254Fr::ZERO;
+        for (a, b) in &field_data {
+          acc += a * b;
+        }
+        black_box(&acc);
+      },
+      3, 10,
+    );
+
+    // 5x52 K=1..8
+    let ks: [usize; 5] = [1, 2, 3, 4, 8];
+    let mut t_52 = [Duration::ZERO; 5];
+    for (ki, &k) in ks.iter().enumerate() {
+      t_52[ki] = bench(
+        || {
+          let mut cols = [[0u128; 9]; 8];
+          let chunk = data_52.len() / k;
+          for i in 0..chunk {
+            for j in 0..k {
+              let (a, b) = &data_52[k * i + j];
+              mac_ff_52(&mut cols[j], a, b);
+            }
+          }
+          for j in 0..k {
+            let _ = carry_propagate_52_to_9limb(black_box(&cols[j]));
+          }
+        },
+        3, 10,
+      );
+    }
+
+    // 4x64 fused K=1..8
+    let mut t_64 = [Duration::ZERO; 5];
+    for (ki, &k) in ks.iter().enumerate() {
+      t_64[ki] = bench(
+        || {
+          let mut accs = [[0u64; 9]; 8];
+          let chunk = data.len() / k;
+          for i in 0..chunk {
+            for j in 0..k {
+              let (a, b) = &data[k * i + j];
+              mac_4x4_into_fused(&mut accs[j], a, b);
+            }
+          }
+          black_box(&accs);
+        },
+        3, 10,
+      );
+    }
+
+    let ns = |t: Duration| t.as_nanos() as f64 / n as f64;
+    println!(
+      "{:<10} {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns",
+      n, ns(t_naive),
+      ns(t_52[0]), ns(t_52[1]), ns(t_52[2]), ns(t_52[3]), ns(t_52[4]),
+      ns(t_64[0]), ns(t_64[1]), ns(t_64[2]), ns(t_64[3]), ns(t_64[4]),
+    );
+  }
+
+  // --- Field×i64 ---
+  println!("\n--- Field×i64 ---");
+  println!(
+    "{:<10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+    "N", "naive", "5x52_K1", "5x52_K2", "5x52_K3", "5x52_K4", "5x52_K8",
+    "4x64_K1", "4x64_K2", "4x64_K3", "4x64_K4", "4x64_K8"
+  );
+  println!("{}", "-".repeat(130));
+
+  for &n in sizes {
+    let data = gen_field_i64_pairs(n);
+    let data_52: Vec<_> = data.iter().map(|(a, b)| (to_52(a), *b)).collect();
+    let field_data: Vec<_> = data
+      .iter()
+      .map(|(a, b)| {
+        (Bn254Fr::from_limbs(*a), Bn254Fr::from_limbs([*b, 0, 0, 0]))
+      })
+      .collect();
+
+    // Naive
+    let t_naive = bench(
+      || {
+        let mut acc = Bn254Fr::ZERO;
+        for (a, b) in &field_data {
+          acc += a * b;
+        }
+        black_box(&acc);
+      },
+      3, 10,
+    );
+
+    // 5x52 K=1..8
+    let ks: [usize; 5] = [1, 2, 3, 4, 8];
+    let mut t_52 = [Duration::ZERO; 5];
+    for (ki, &k) in ks.iter().enumerate() {
+      t_52[ki] = bench(
+        || {
+          let mut cols = [[0u128; 5]; 8];
+          let chunk = data_52.len() / k;
+          for i in 0..chunk {
+            for j in 0..k {
+              let (a, b) = &data_52[k * i + j];
+              mac_fi64_52(&mut cols[j], a, *b);
+            }
+          }
+          for j in 0..k {
+            let _ = carry_propagate_52_to_6limb(black_box(&cols[j]));
+          }
+        },
+        3, 10,
+      );
+    }
+
+    // 4x64 mac K=1..8
+    let mut t_64 = [Duration::ZERO; 5];
+    for (ki, &k) in ks.iter().enumerate() {
+      t_64[ki] = bench(
+        || {
+          let mut accs = [[0u64; 6]; 8];
+          let chunk = data.len() / k;
+          for i in 0..chunk {
+            for j in 0..k {
+              let (a, b) = &data[k * i + j];
+              let acc = &mut accs[j];
+              let (r0, c) = mac(acc[0], a[0], *b, 0);
+              let (r1, c) = mac(acc[1], a[1], *b, c);
+              let (r2, c) = mac(acc[2], a[2], *b, c);
+              let (r3, c) = mac(acc[3], a[3], *b, c);
+              let (r4, of) = acc[4].overflowing_add(c);
+              acc[0] = r0; acc[1] = r1; acc[2] = r2; acc[3] = r3;
+              acc[4] = r4; acc[5] = acc[5].wrapping_add(of as u64);
+            }
+          }
+          black_box(&accs);
+        },
+        3, 10,
+      );
+    }
+
+    let ns = |t: Duration| t.as_nanos() as f64 / n as f64;
+    println!(
+      "{:<10} {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns",
+      n, ns(t_naive),
+      ns(t_52[0]), ns(t_52[1]), ns(t_52[2]), ns(t_52[3]), ns(t_52[4]),
+      ns(t_64[0]), ns(t_64[1]), ns(t_64[2]), ns(t_64[3]), ns(t_64[4]),
+    );
+  }
+
+  // --- Field×i128 ---
+  println!("\n--- Field×i128 ---");
+  println!(
+    "{:<10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+    "N", "naive", "5x52_K1", "5x52_K2", "5x52_K3", "5x52_K4", "5x52_K8",
+    "4x64_K1", "4x64_K2", "4x64_K3", "4x64_K4", "4x64_K8"
+  );
+  println!("{}", "-".repeat(130));
+
+  for &n in sizes {
+    let data = gen_field_i128_pairs(n);
+    let data_52: Vec<_> = data.iter().map(|(a, bl, bh)| (to_52(a), *bl, *bh)).collect();
+    let field_data: Vec<_> = data
+      .iter()
+      .map(|(a, b_lo, b_hi)| {
+        (Bn254Fr::from_limbs(*a), Bn254Fr::from_limbs([*b_lo, *b_hi, 0, 0]))
+      })
+      .collect();
+
+    // Naive
+    let t_naive = bench(
+      || {
+        let mut acc = Bn254Fr::ZERO;
+        for (a, b) in &field_data {
+          acc += a * b;
+        }
+        black_box(&acc);
+      },
+      3, 10,
+    );
+
+    // 5x52 K=1..8
+    let ks: [usize; 5] = [1, 2, 3, 4, 8];
+    let mut t_52 = [Duration::ZERO; 5];
+    for (ki, &k) in ks.iter().enumerate() {
+      t_52[ki] = bench(
+        || {
+          let mut cols = [[0u128; 7]; 8];
+          let chunk = data_52.len() / k;
+          for i in 0..chunk {
+            for j in 0..k {
+              let (a, bl, bh) = &data_52[k * i + j];
+              mac_fi128_52(&mut cols[j], a, *bl, *bh);
+            }
+          }
+          for j in 0..k {
+            let _ = carry_propagate_52_to_7limb(black_box(&cols[j]));
+          }
+        },
+        3, 10,
+      );
+    }
+
+    // 4x64 2-pass mac K=1..8
+    let mut t_64 = [Duration::ZERO; 5];
+    for (ki, &k) in ks.iter().enumerate() {
+      t_64[ki] = bench(
+        || {
+          let mut accs = [[0u64; 7]; 8];
+          let chunk = data.len() / k;
+          for i in 0..chunk {
+            for j in 0..k {
+              let (a, b_lo, b_hi) = &data[k * i + j];
+              let acc = &mut accs[j];
+              // Pass 1: a × b_lo → acc[0..5]
+              let (r0, c) = mac(acc[0], a[0], *b_lo, 0);
+              let (r1, c) = mac(acc[1], a[1], *b_lo, c);
+              let (r2, c) = mac(acc[2], a[2], *b_lo, c);
+              let (r3, c) = mac(acc[3], a[3], *b_lo, c);
+              let (r4, of1) = acc[4].overflowing_add(c);
+              let c1 = of1 as u64;
+              acc[0] = r0;
+              // Pass 2: a × b_hi → acc[1..6]
+              let (r1, c) = mac(r1, a[0], *b_hi, 0);
+              let (r2, c) = mac(r2, a[1], *b_hi, c);
+              let (r3, c) = mac(r3, a[2], *b_hi, c);
+              let (r4, c) = mac(r4, a[3], *b_hi, c);
+              let (r5, c) = mac(acc[5], c1, 1, c);
+              acc[1] = r1; acc[2] = r2; acc[3] = r3; acc[4] = r4;
+              acc[5] = r5; acc[6] = acc[6].wrapping_add(c);
+            }
+          }
+          black_box(&accs);
+        },
+        3, 10,
+      );
+    }
+
+    let ns = |t: Duration| t.as_nanos() as f64 / n as f64;
+    println!(
+      "{:<10} {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns {:>8.2}ns",
+      n, ns(t_naive),
+      ns(t_52[0]), ns(t_52[1]), ns(t_52[2]), ns(t_52[3]), ns(t_52[4]),
+      ns(t_64[0]), ns(t_64[1]), ns(t_64[2]), ns(t_64[3]), ns(t_64[4]),
+    );
+  }
+}
+
+// ============================================================================
 // Profile mode
 // ============================================================================
 
@@ -1340,6 +1613,7 @@ fn main() {
       bench_ilp(&sizes);
       bench_reduce();
       bench_standalone_ops();
+      bench_batching(&sizes);
     }
     Commands::Case { name } => match name.as_str() {
       "ff" => bench_ff(&sizes),
@@ -1350,9 +1624,10 @@ fn main() {
       "ilp" => bench_ilp(&sizes),
       "reduce" => bench_reduce(),
       "standalone" => bench_standalone_ops(),
+      "batch" => bench_batching(&sizes),
       _ => {
         eprintln!("Unknown case: {name}");
-        eprintln!("Available: ff, fi64, fi128, fi32, ilp, reduce, standalone");
+        eprintln!("Available: ff, fi64, fi128, fi32, ilp, reduce, standalone, batch");
         std::process::exit(1);
       }
     },
