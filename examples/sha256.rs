@@ -36,18 +36,30 @@ use tracing_subscriber::{EnvFilter, Layer as _, layer::SubscriberExt, util::Subs
 struct Args {
   #[arg(long, value_enum, default_value = "bn254-fr")]
   field: FieldChoice,
+
+  /// Message length in bytes (must be a power of 2). Defaults to 1024..2048.
+  #[arg(long)]
+  bytes: Option<usize>,
 }
 
-fn run_benchmark<E: Engine>(timing_data: &TimingData, constraints_data: &ConstraintsData)
-where
+fn run_benchmark<E: Engine>(
+  timing_data: &TimingData,
+  constraints_data: &ConstraintsData,
+  bytes: Option<usize>,
+) where
   E::Scalar: SmallValueField<i64>
     + DelayedReduction<i64>
     + DelayedReduction<i128>
     + DelayedReduction<E::Scalar>,
 {
-  // Message lengths: 2^10 … 2^11 bytes.
-  let circuits: Vec<_> = (10..=11)
-    .map(|k| SmallSha256Circuit::<E::Scalar>::new(vec![0u8; 1 << k], true))
+  let msg_lengths: Vec<usize> = match bytes {
+    Some(b) => vec![b],
+    None => vec![1024, 2048],
+  };
+
+  let circuits: Vec<_> = msg_lengths
+    .iter()
+    .map(|&len| SmallSha256Circuit::<E::Scalar>::new(vec![0u8; len], true))
     .collect();
 
   for circuit in circuits {
@@ -135,8 +147,12 @@ fn main() {
     .init();
 
   match args.field {
-    FieldChoice::Bn254Fr => run_benchmark::<Bn254Engine>(&timing_data, &constraints_data),
-    FieldChoice::PallasFq => run_benchmark::<PallasHyraxEngine>(&timing_data, &constraints_data),
-    FieldChoice::VestaFp => run_benchmark::<VestaHyraxEngine>(&timing_data, &constraints_data),
+    FieldChoice::Bn254Fr => run_benchmark::<Bn254Engine>(&timing_data, &constraints_data, args.bytes),
+    FieldChoice::PallasFq => {
+      run_benchmark::<PallasHyraxEngine>(&timing_data, &constraints_data, args.bytes)
+    }
+    FieldChoice::VestaFp => {
+      run_benchmark::<VestaHyraxEngine>(&timing_data, &constraints_data, args.bytes)
+    }
   }
 }
