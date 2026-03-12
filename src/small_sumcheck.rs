@@ -99,7 +99,7 @@ impl<Scalar: PrimeField, const D: usize> SmallValueSumCheck<Scalar, D> {
 /// Constructs s_i(X) = ℓ_i(X) · t_i(X) where:
 /// - ℓ_i(X) is the linear eq factor
 /// - t_i(X) is the degree-2 polynomial from accumulators
-pub(crate) fn build_univariate_round_polynomial<F: PrimeField>(
+pub fn build_univariate_round_polynomial<F: PrimeField>(
   li: &LagrangeEvals<F, 2>,
   t0: F,
   t1: F,
@@ -132,7 +132,7 @@ pub(crate) fn build_univariate_round_polynomial<F: PrimeField>(
 /// Instead of l0 sequential passes with field×field muls, computes:
 ///   `poly_out[s] = Σ_{p ∈ {0,1}^l0} eq(challenges, p) · poly_small[p * stride + s]`
 /// in one pass using field×int unreduced accumulation with a single final reduction.
-fn bind_three_polys_batched_small_value<F, SV>(
+pub fn bind_three_polys_batched_small_value<F, SV>(
   poly_a_small: &MultilinearPolynomial<SV>,
   poly_b_small: &MultilinearPolynomial<SV>,
   poly_c_small: &MultilinearPolynomial<SV>,

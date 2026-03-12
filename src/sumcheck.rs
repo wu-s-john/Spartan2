@@ -18,11 +18,16 @@ use crate::{
   },
   errors::SpartanError,
   polys::{
+    eq::EqPolynomial,
     multilinear::MultilinearPolynomial,
     univariate::{CompressedUniPoly, UniPoly},
   },
   r1cs::SplitMultiRoundR1CSShape,
-  small_field::DelayedReduction,
+  small_field::{
+    DelayedReduction,
+    limbs52::{ColumnAcc9, SignedColumnAcc5, mac_ff_52_mixed, mac_fi64_52, to_52},
+    montgomery::MontgomeryLimbs,
+  },
   start_span,
   traits::{Engine, transcript::TranscriptEngineTrait},
   zk::{NeutronNovaVerifierCircuit, SpartanVerifierCircuit},
@@ -34,12 +39,12 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// 4 k elements is a good cut-off on a 16-core machine.
-pub(crate) const PAR_THRESHOLD: usize = 4 << 10; // 4096
+pub const PAR_THRESHOLD: usize = 4 << 10; // 4096
 
 /// Bind three polynomials to the same challenge in one pass.
 /// More efficient than three separate bind calls - reduces Rayon dispatches
 /// and uses serial fallback for small polynomials.
-pub(crate) fn bind_three_polys_top<F: ff::PrimeField>(
+pub fn bind_three_polys_top<F: ff::PrimeField>(
   poly_a: &mut MultilinearPolynomial<F>,
   poly_b: &mut MultilinearPolynomial<F>,
   poly_c: &mut MultilinearPolynomial<F>,
@@ -93,7 +98,8 @@ pub struct SumcheckProof<E: Engine> {
 
 impl<E: Engine> SumcheckProof<E> {
   /// Create a new sumcheck proof from compressed polynomials.
-  pub(crate) fn new(compressed_polys: Vec<CompressedUniPoly<E::Scalar>>) -> Self {
+  /// Create a new sumcheck proof from compressed polynomials.
+  pub fn new(compressed_polys: Vec<CompressedUniPoly<E::Scalar>>) -> Self {
     Self { compressed_polys }
   }
 
@@ -288,6 +294,370 @@ impl<E: Engine> SumcheckProof<E> {
       },
       r,
       vec![poly_A[0], poly_B[0]],
+    ))
+  }
+
+  /// Computes evaluation points for a quadratic polynomial using 5×52 column accumulators.
+  ///
+  /// Same semantics as `compute_eval_points_quad` but uses `ColumnAcc9` with
+  /// `mac_ff_52_mixed` for the inner product, avoiding the `DelayedReduction` trait overhead.
+  #[inline]
+  fn compute_eval_points_quad_52(
+    poly_A: &MultilinearPolynomial<E::Scalar>,
+    poly_B: &MultilinearPolynomial<E::Scalar>,
+  ) -> (E::Scalar, E::Scalar)
+  where
+    E::Scalar: MontgomeryLimbs + crate::small_field::field_reduction_constants::FieldReductionConstants,
+  {
+    let len = poly_A.Z.len() / 2;
+
+    let (acc_0, acc_2) = (0..len)
+      .into_par_iter()
+      .fold(
+        || (ColumnAcc9::zero(), ColumnAcc9::zero()),
+        |mut acc, i| {
+          let a_low = &poly_A[i];
+          let a_high = &poly_A[len + i];
+          let b_low = &poly_B[i];
+          let b_high = &poly_B[len + i];
+
+          // eval 0: a_low × b_low
+          mac_ff_52_mixed(&mut acc.0 .0, &to_52(a_low.to_limbs()), b_low.to_limbs());
+
+          // eval 2: (2·a_high - a_low) × (2·b_high - b_low)
+          let a_bound = *a_high + *a_high - *a_low;
+          let b_bound = *b_high + *b_high - *b_low;
+          mac_ff_52_mixed(&mut acc.1 .0, &to_52(a_bound.to_limbs()), b_bound.to_limbs());
+
+          acc
+        },
+      )
+      .reduce(
+        || (ColumnAcc9::zero(), ColumnAcc9::zero()),
+        |mut a, b| {
+          a.0 += b.0;
+          a.1 += b.1;
+          a
+        },
+      );
+
+    (acc_0.reduce::<E::Scalar>(), acc_2.reduce::<E::Scalar>())
+  }
+
+  /// Generates a sum-check proof for a quadratic combination using 5×52 column accumulators.
+  ///
+  /// Drop-in replacement for `prove_quad` using `ColumnAcc9` MAC kernels.
+  pub fn prove_quad_52(
+    claim: &E::Scalar,
+    num_rounds: usize,
+    poly_A: &mut MultilinearPolynomial<E::Scalar>,
+    poly_B: &mut MultilinearPolynomial<E::Scalar>,
+    transcript: &mut E::TE,
+  ) -> Result<(Self, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
+  where
+    E::Scalar: MontgomeryLimbs + crate::small_field::field_reduction_constants::FieldReductionConstants,
+  {
+    let mut r: Vec<E::Scalar> = Vec::new();
+    let mut polys: Vec<CompressedUniPoly<E::Scalar>> = Vec::new();
+    let mut claim_per_round = *claim;
+    for round in 0..num_rounds {
+      let (_round_span, round_t) = start_span!("sumcheck_quad_round", round = round);
+
+      let poly = {
+        let (_eval_span, eval_t) = start_span!("compute_eval_points_quad");
+        let (eval_point_0, eval_point_2) = Self::compute_eval_points_quad_52(poly_A, poly_B);
+        if eval_t.elapsed().as_millis() > 0 {
+          info!(elapsed_ms = %eval_t.elapsed().as_millis(), "compute_eval_points_quad_52");
+        }
+
+        let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
+        UniPoly::from_evals(&evals)?
+      };
+
+      transcript.absorb(b"p", &poly);
+      let r_i = transcript.squeeze(b"c")?;
+      r.push(r_i);
+      polys.push(poly.compress());
+      claim_per_round = poly.evaluate(&r_i);
+
+      let (_bind_span, bind_t) = start_span!("bind_poly_vars_quad");
+      rayon::join(
+        || poly_A.bind_poly_var_top(&r_i),
+        || poly_B.bind_poly_var_top(&r_i),
+      );
+      info!(elapsed_ms = %bind_t.elapsed().as_millis(), "bind_poly_vars_quad");
+      info!(elapsed_ms = %round_t.elapsed().as_millis(), round = round, "sumcheck_quad_round");
+    }
+
+    Ok((
+      SumcheckProof {
+        compressed_polys: polys,
+      },
+      r,
+      vec![poly_A[0], poly_B[0]],
+    ))
+  }
+
+  /// Computes eval points for the deferred-Z inner sumcheck rounds.
+  ///
+  /// During deferred rounds, poly_ABC has been bound but poly_Z is still in i64 form.
+  /// For each prefix p, we compute the full inner product Σ_s ABC[s] × Z_small[p*stride+s]
+  /// across all suffixes using field×i64 MAC (one reduction per prefix), then combine
+  /// across prefixes with eq weights using field×field MAC.
+  ///
+  /// `z_stride` = original Z length / 2^j where j is the current deferred round index.
+  /// `half_abc` = poly_ABC.len() / 2 = z_stride / 2.
+  fn compute_eval_points_quad_deferred_52(
+    poly_ABC: &MultilinearPolynomial<E::Scalar>,
+    poly_Z_small: &[i64],
+    eq_table_52: &[[u64; 5]],
+    z_stride: usize,
+  ) -> (E::Scalar, E::Scalar)
+  where
+    E::Scalar: MontgomeryLimbs + crate::small_field::field_reduction_constants::FieldReductionConstants,
+  {
+    let half_abc = poly_ABC.Z.len() / 2;
+    let num_prefixes = eq_table_52.len();
+
+    // Pre-convert ABC lo/hi to 5×52 form (reused across all prefixes)
+    let abc_lo_52: Vec<[u64; 5]> = (0..half_abc)
+      .map(|s| to_52(poly_ABC[s].to_limbs()))
+      .collect();
+    // (2·ABC_hi - ABC_lo) pre-computed
+    let abc_bound_52: Vec<[u64; 5]> = (0..half_abc)
+      .map(|s| {
+        let abc_bound = poly_ABC[half_abc + s] + poly_ABC[half_abc + s] - poly_ABC[s];
+        to_52(abc_bound.to_limbs())
+      })
+      .collect();
+
+    // For each prefix, compute inner product across all suffixes, then weight by eq
+    let mut outer_0 = ColumnAcc9::zero();
+    let mut outer_2 = ColumnAcc9::zero();
+
+    for p in 0..num_prefixes {
+      let z_base = p * z_stride;
+
+      // Inner product: Σ_s ABC_lo[s] × Z_lo[s] using field×i64 MAC
+      let (ip_0, ip_2) = if half_abc >= PAR_THRESHOLD {
+        (0..half_abc)
+          .into_par_iter()
+          .fold(
+            || (SignedColumnAcc5::zero(), SignedColumnAcc5::zero()),
+            |mut acc, s| {
+              let z_lo = poly_Z_small[z_base + s];
+              if z_lo >= 0 {
+                mac_fi64_52(&mut acc.0.pos, &abc_lo_52[s], z_lo as u64);
+              } else {
+                mac_fi64_52(&mut acc.0.neg, &abc_lo_52[s], (-z_lo) as u64);
+              }
+
+              let z_bound = 2 * poly_Z_small[z_base + half_abc + s] - z_lo;
+              if z_bound >= 0 {
+                mac_fi64_52(&mut acc.1.pos, &abc_bound_52[s], z_bound as u64);
+              } else {
+                mac_fi64_52(&mut acc.1.neg, &abc_bound_52[s], (-z_bound) as u64);
+              }
+
+              acc
+            },
+          )
+          .reduce(
+            || (SignedColumnAcc5::zero(), SignedColumnAcc5::zero()),
+            |mut a, b| {
+              a.0 += b.0;
+              a.1 += b.1;
+              a
+            },
+          )
+      } else {
+        let mut acc = (SignedColumnAcc5::zero(), SignedColumnAcc5::zero());
+        for s in 0..half_abc {
+          let z_lo = poly_Z_small[z_base + s];
+          if z_lo >= 0 {
+            mac_fi64_52(&mut acc.0.pos, &abc_lo_52[s], z_lo as u64);
+          } else {
+            mac_fi64_52(&mut acc.0.neg, &abc_lo_52[s], (-z_lo) as u64);
+          }
+
+          let z_bound = 2 * poly_Z_small[z_base + half_abc + s] - z_lo;
+          if z_bound >= 0 {
+            mac_fi64_52(&mut acc.1.pos, &abc_bound_52[s], z_bound as u64);
+          } else {
+            mac_fi64_52(&mut acc.1.neg, &abc_bound_52[s], (-z_bound) as u64);
+          }
+        }
+        acc
+      };
+
+      // Reduce once per prefix, then weight by eq[p] (field × field — only num_prefixes times)
+      let ip_0_f: E::Scalar = ip_0.reduce();
+      let ip_2_f: E::Scalar = ip_2.reduce();
+
+      let eq_52 = &eq_table_52[p];
+      mac_ff_52_mixed(&mut outer_0.0, eq_52, ip_0_f.to_limbs());
+      mac_ff_52_mixed(&mut outer_2.0, eq_52, ip_2_f.to_limbs());
+    }
+
+    (outer_0.reduce::<E::Scalar>(), outer_2.reduce::<E::Scalar>())
+  }
+
+  /// Batch-bind Z from i64 to field elements using eq-weighted accumulation.
+  ///
+  /// Computes: Z_field[s] = Σ_p eq(r[0..l0], p) × Z_small[p·stride + s]
+  /// using `SignedColumnAcc5` + `mac_fi64_52` for field×i64 MAC.
+  fn bind_poly_batched_small_52(
+    poly_Z_small: &[i64],
+    challenges: &[E::Scalar],
+  ) -> MultilinearPolynomial<E::Scalar>
+  where
+    E::Scalar: MontgomeryLimbs + crate::small_field::field_reduction_constants::FieldReductionConstants,
+  {
+    let l0 = challenges.len();
+    let n = poly_Z_small.len();
+    debug_assert_eq!(n % (1 << l0), 0);
+
+    let num_prefixes = 1usize << l0;
+    let stride = n >> l0;
+
+    // Precompute eq(challenges, p) for all p ∈ {0,1}^l0, converted to 5×52
+    let eq_table_field = EqPolynomial::evals_from_points(challenges);
+    let eq_table_52: Vec<[u64; 5]> = eq_table_field.iter().map(|e| to_52(e.to_limbs())).collect();
+
+    let compute = |s: usize| -> E::Scalar {
+      let mut acc = SignedColumnAcc5::zero();
+      for p in 0..num_prefixes {
+        let idx = p * stride + s;
+        let val = poly_Z_small[idx];
+        let eq_52 = &eq_table_52[p];
+
+        if val >= 0 {
+          mac_fi64_52(&mut acc.pos, eq_52, val as u64);
+        } else {
+          mac_fi64_52(&mut acc.neg, eq_52, (-val) as u64);
+        }
+      }
+      acc.reduce::<E::Scalar>()
+    };
+
+    let results: Vec<E::Scalar> = if stride >= PAR_THRESHOLD {
+      (0..stride).into_par_iter().map(compute).collect()
+    } else {
+      (0..stride).map(compute).collect()
+    };
+
+    MultilinearPolynomial::new(results)
+  }
+
+  /// Generates a sum-check proof for the inner (quadratic) sumcheck with deferred Z binding.
+  ///
+  /// For the first `l0` rounds, Z remains in i64 form and we use field×i64 MAC (~1ns)
+  /// instead of field×field (~5.4ns). After `l0` rounds, Z is batch-bound to field elements
+  /// and the remaining rounds use standard 5×52 field×field MAC.
+  ///
+  /// `poly_Z_small` contains the original small witness values (i64).
+  /// `poly_ABC` contains field elements (linear combination of A, B, C evaluations).
+  pub fn prove_quad_deferred_z_52(
+    claim: &E::Scalar,
+    num_rounds: usize,
+    poly_ABC: &mut MultilinearPolynomial<E::Scalar>,
+    poly_Z_small: &[i64],
+    transcript: &mut E::TE,
+  ) -> Result<(Self, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
+  where
+    E::Scalar: MontgomeryLimbs + crate::small_field::field_reduction_constants::FieldReductionConstants,
+  {
+    let l0 = std::cmp::min(2usize, num_rounds.saturating_sub(1));
+    let mut r: Vec<E::Scalar> = Vec::new();
+    let mut polys: Vec<CompressedUniPoly<E::Scalar>> = Vec::new();
+    let mut claim_per_round = *claim;
+
+    let n_z = poly_Z_small.len();
+    // z_stride starts at n_z / 2^0 = n_z (before any deferred rounds)
+    // After deferred round j, ABC has been bound but Z hasn't, so:
+    // z_stride = n_z / num_prefixes where num_prefixes = 2^(j rounds so far)
+
+    // ===== Deferred Z rounds (0 to l0-1) =====
+    // During these rounds, we bind ABC but NOT Z.
+    // eq_table tracks the product of challenges seen so far.
+    for round in 0..l0 {
+      let (_round_span, round_t) = start_span!("sumcheck_quad_deferred_round", round = round);
+
+      // Build eq table from challenges so far (for weighting Z prefixes)
+      let eq_table_field = if r.is_empty() {
+        vec![E::Scalar::ONE] // No challenges yet, single prefix weight = 1
+      } else {
+        EqPolynomial::evals_from_points(&r)
+      };
+      let eq_table_52: Vec<[u64; 5]> = eq_table_field.iter().map(|e| to_52(e.to_limbs())).collect();
+      let z_stride = n_z / eq_table_52.len();
+
+      let poly = {
+        let (_eval_span, eval_t) = start_span!("compute_eval_points_quad_deferred");
+        let (eval_point_0, eval_point_2) =
+          Self::compute_eval_points_quad_deferred_52(poly_ABC, poly_Z_small, &eq_table_52, z_stride);
+        if eval_t.elapsed().as_millis() > 0 {
+          info!(elapsed_ms = %eval_t.elapsed().as_millis(), "compute_eval_points_quad_deferred");
+        }
+
+        let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
+        UniPoly::from_evals(&evals)?
+      };
+
+      transcript.absorb(b"p", &poly);
+      let r_i = transcript.squeeze(b"c")?;
+      r.push(r_i);
+      polys.push(poly.compress());
+      claim_per_round = poly.evaluate(&r_i);
+
+      // Bind ABC only (Z stays as i64)
+      let (_bind_span, bind_t) = start_span!("bind_poly_ABC_only");
+      poly_ABC.bind_poly_var_top(&r_i);
+      info!(elapsed_ms = %bind_t.elapsed().as_millis(), "bind_poly_ABC_only");
+      info!(elapsed_ms = %round_t.elapsed().as_millis(), round = round, "sumcheck_quad_deferred_round");
+    }
+
+    // ===== Transition: batch-bind Z from i64 to field =====
+    let (_bind_span, bind_t) = start_span!("bind_z_small_to_field");
+    let mut poly_Z = Self::bind_poly_batched_small_52(poly_Z_small, &r[..l0]);
+    info!(elapsed_ms = %bind_t.elapsed().as_millis(), "bind_z_small_to_field");
+
+    // ===== Remaining rounds (l0 to num_rounds-1): standard 5×52 field×field =====
+    for round in l0..num_rounds {
+      let (_round_span, round_t) = start_span!("sumcheck_quad_round", round = round);
+
+      let poly = {
+        let (_eval_span, eval_t) = start_span!("compute_eval_points_quad");
+        let (eval_point_0, eval_point_2) = Self::compute_eval_points_quad_52(poly_ABC, &poly_Z);
+        if eval_t.elapsed().as_millis() > 0 {
+          info!(elapsed_ms = %eval_t.elapsed().as_millis(), "compute_eval_points_quad_52");
+        }
+
+        let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
+        UniPoly::from_evals(&evals)?
+      };
+
+      transcript.absorb(b"p", &poly);
+      let r_i = transcript.squeeze(b"c")?;
+      r.push(r_i);
+      polys.push(poly.compress());
+      claim_per_round = poly.evaluate(&r_i);
+
+      let (_bind_span, bind_t) = start_span!("bind_poly_vars_quad");
+      rayon::join(
+        || poly_ABC.bind_poly_var_top(&r_i),
+        || poly_Z.bind_poly_var_top(&r_i),
+      );
+      info!(elapsed_ms = %bind_t.elapsed().as_millis(), "bind_poly_vars_quad");
+      info!(elapsed_ms = %round_t.elapsed().as_millis(), round = round, "sumcheck_quad_round");
+    }
+
+    Ok((
+      SumcheckProof {
+        compressed_polys: polys,
+      },
+      r,
+      vec![poly_ABC[0], poly_Z[0]],
     ))
   }
 
@@ -1033,7 +1403,7 @@ impl<E: Engine> SumcheckProof<E> {
   }
 }
 
-pub(crate) mod eq_sumcheck {
+pub mod eq_sumcheck {
   //! This module implements the sumcheck optimization for equality polynomials.
   //! The optimization is described in Section 5 of <https://eprint.iacr.org/2025/1117> algorithm 5.
   use crate::{
@@ -1043,6 +1413,7 @@ pub(crate) mod eq_sumcheck {
   use num_traits::Zero;
   use rayon::{iter::ZipEq, prelude::*, slice::Iter};
 
+  /// Optimized sumcheck instance using split equality polynomials.
   pub struct EqSumCheckInstance<E: Engine> {
     // number of variables at first
     init_num_vars: usize,
@@ -1406,6 +1777,7 @@ pub(crate) mod eq_sumcheck {
     }
 
     #[inline]
+    /// Bind the current round variable to verifier challenge `r`.
     pub fn bound(&mut self, r: &E::Scalar) {
       // Invariant: self.round is always >= 1 when bound is called
       // as it's initialized to 1 in new() and only incremented here
@@ -1497,7 +1869,7 @@ pub(crate) mod eq_sumcheck {
   /// # Returns
   /// A tuple `(eval_0, eval_2, eval_3)` containing the evaluation points.
   #[inline]
-  fn eval_one_case_cubic_three_inputs<Scalar: PrimeField>(
+  pub fn eval_one_case_cubic_three_inputs<Scalar: PrimeField>(
     _round_idx: usize,
     zero_a: &Scalar,
     one_a: &Scalar,

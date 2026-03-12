@@ -40,7 +40,8 @@ use serde::{Deserialize, Serialize};
 /// but can also be any type with ring operations (add, sub, mul, zero).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MultilinearPolynomial<T> {
-  pub(crate) Z: Vec<T>, // evaluations of the polynomial in all the 2^num_vars Boolean inputs
+  /// Evaluations of the polynomial in all the 2^num_vars Boolean inputs.
+  pub Z: Vec<T>,
 }
 
 impl<T> MultilinearPolynomial<T> {

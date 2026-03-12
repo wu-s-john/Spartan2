@@ -279,6 +279,133 @@ pub fn carry_propagate_52_to_7limb(cols: &[u128; 7]) -> [u64; 7] {
   result
 }
 
+/// MAC with one pre-converted 5×52 operand and one raw 4×64 operand.
+/// Converts the raw side inline. Used when one side is from a pre-converted
+/// eq table and the other is computed fresh.
+#[inline(always)]
+pub fn mac_ff_52_mixed(cols: &mut [u128; 9], a_52: &[u64; 5], b_64: &[u64; 4]) {
+  let b_52 = to_52(b_64);
+  mac_ff_52(cols, a_52, &b_52);
+}
+
+// ==========================================================================
+// Column accumulator newtypes for 5×52 dot products
+// ==========================================================================
+
+/// 9-column accumulator for field×field dot products (5×52 representation).
+///
+/// Each column accumulates products independently without carry propagation.
+/// Reduce via `carry_propagate_52_to_9limb` + `montgomery_reduce_9`.
+#[derive(Clone, Copy, Default)]
+pub struct ColumnAcc9(pub [u128; 9]);
+
+impl std::ops::Add for ColumnAcc9 {
+  type Output = Self;
+  #[inline(always)]
+  fn add(mut self, rhs: Self) -> Self {
+    for i in 0..9 {
+      self.0[i] += rhs.0[i];
+    }
+    self
+  }
+}
+
+impl std::ops::AddAssign for ColumnAcc9 {
+  #[inline(always)]
+  fn add_assign(&mut self, rhs: Self) {
+    for i in 0..9 {
+      self.0[i] += rhs.0[i];
+    }
+  }
+}
+
+impl num_traits::Zero for ColumnAcc9 {
+  #[inline(always)]
+  fn zero() -> Self {
+    Self([0u128; 9])
+  }
+  #[inline(always)]
+  fn is_zero(&self) -> bool {
+    self.0.iter().all(|&x| x == 0)
+  }
+}
+
+impl ColumnAcc9 {
+  /// Reduce to a field element via carry propagation + Montgomery REDC.
+  #[inline]
+  pub fn reduce<F: FieldReductionConstants + super::montgomery::MontgomeryLimbs>(&self) -> F {
+    let wide = carry_propagate_52_to_9limb(&self.0);
+    F::from_limbs(montgomery_reduce_9::<F>(&wide))
+  }
+}
+
+/// 5-column accumulator for field×i64 dot products (5×52 representation).
+///
+/// Tracks positive and negative contributions separately, then subtracts
+/// at reduction time. Reduce via `carry_propagate_52_to_6limb` + `barrett_reduce_6`.
+#[derive(Clone, Copy, Default)]
+pub struct SignedColumnAcc5 {
+  /// Positive contribution columns.
+  pub pos: [u128; 5],
+  /// Negative contribution columns.
+  pub neg: [u128; 5],
+}
+
+impl std::ops::Add for SignedColumnAcc5 {
+  type Output = Self;
+  #[inline(always)]
+  fn add(mut self, rhs: Self) -> Self {
+    for i in 0..5 {
+      self.pos[i] += rhs.pos[i];
+      self.neg[i] += rhs.neg[i];
+    }
+    self
+  }
+}
+
+impl std::ops::AddAssign for SignedColumnAcc5 {
+  #[inline(always)]
+  fn add_assign(&mut self, rhs: Self) {
+    for i in 0..5 {
+      self.pos[i] += rhs.pos[i];
+      self.neg[i] += rhs.neg[i];
+    }
+  }
+}
+
+impl num_traits::Zero for SignedColumnAcc5 {
+  #[inline(always)]
+  fn zero() -> Self {
+    Self {
+      pos: [0u128; 5],
+      neg: [0u128; 5],
+    }
+  }
+  #[inline(always)]
+  fn is_zero(&self) -> bool {
+    self.pos.iter().all(|&x| x == 0) && self.neg.iter().all(|&x| x == 0)
+  }
+}
+
+impl SignedColumnAcc5 {
+  /// Reduce to a field element via carry propagation + Barrett reduction.
+  #[inline]
+  pub fn reduce<F: FieldReductionConstants + super::montgomery::MontgomeryLimbs + ff::PrimeField>(
+    &self,
+  ) -> F {
+    use super::barrett::barrett_reduce_6;
+    use super::limbs::{SubMagResult, sub_mag};
+
+    let pos_limbs = carry_propagate_52_to_6limb(&self.pos);
+    let neg_limbs = carry_propagate_52_to_6limb(&self.neg);
+
+    match sub_mag::<6>(&pos_limbs, &neg_limbs) {
+      SubMagResult::Positive(mag) => F::from_limbs(barrett_reduce_6::<F>(&mag)),
+      SubMagResult::Negative(mag) => -F::from_limbs(barrett_reduce_6::<F>(&mag)),
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
