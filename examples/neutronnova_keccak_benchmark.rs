@@ -82,7 +82,7 @@ fn generate_instances_and_witnesses<E, C>(
   pk: &NeutronNovaProverKey<E>,
   prep: &NeutronNovaPrepZkSNARK<E>,
   step_circuits: &[C],
-  is_small: bool,
+  l0: usize,
 ) -> (Vec<R1CSInstance<E>>, Vec<R1CSWitness<E>>)
 where
   E: Engine,
@@ -111,7 +111,7 @@ where
         &pk.S_step,
         &pk.ck,
         circuit,
-        is_small,
+        l0 > 0,
         &mut transcript,
       )
       .expect("r1cs_instance_and_witness failed")
@@ -131,7 +131,7 @@ fn nifs_prove_single<E: Engine>(
   pk: &NeutronNovaProverKey<E>,
   instances: &[R1CSInstance<E>],
   witnesses: &[R1CSWitness<E>],
-  is_small: bool,
+  l0: usize,
 ) where
   E::PCS: FoldingEngineTrait<E>,
   E::Scalar: SmallValueField<i64>
@@ -156,12 +156,12 @@ fn nifs_prove_single<E: Engine>(
     &pk.S_step,
     instances,
     witnesses,
+    l0,
     &mut vc,
     &mut vc_state,
     &pk.vc_shape,
     &pk.vc_ck,
     &mut transcript,
-    is_small,
   )
   .expect("NeutronNovaNIFS::prove failed");
 }
@@ -173,7 +173,7 @@ fn verify_snark<E: Engine>(
   circuits: &[KeccakChainCircuit<E::Scalar>],
   core_circuit: &KeccakChainCircuit<E::Scalar>,
   num_instances: usize,
-  is_small: bool,
+  l0: usize,
 ) where
   E::PCS: FoldingEngineTrait<E>,
   E::Scalar: SmallValueField<i64>
@@ -181,11 +181,11 @@ fn verify_snark<E: Engine>(
     + DelayedReduction<i128>
     + DelayedReduction<E::Scalar>,
 {
-  let mode = if is_small { "small-value" } else { "large-value" };
+  let mode = if l0 > 0 { "small-value" } else { "large-value" };
   let prep =
-    NeutronNovaZkSNARK::<E>::prep_prove(pk, circuits, core_circuit, is_small).expect("prep_prove");
+    NeutronNovaZkSNARK::<E>::prep_prove(pk, circuits, core_circuit, l0).expect("prep_prove");
   let snark =
-    NeutronNovaZkSNARK::<E>::prove(pk, circuits, core_circuit, &prep, is_small).expect("prove");
+    NeutronNovaZkSNARK::<E>::prove(pk, circuits, core_circuit, &prep, l0).expect("prove");
   let res = snark.verify(vk, num_instances);
   assert!(res.is_ok(), "Verification failed: {:?}", res.err());
   eprintln!("  verified: yes ({})", mode);
@@ -223,11 +223,13 @@ fn benchmark_nifs_prove<E: Engine>(
   let setup_ms = t0.elapsed().as_millis();
   eprintln!("Setup done in {} ms", setup_ms);
 
+  let ell_b = num_instances.next_power_of_two().trailing_zeros() as usize;
   let mut small_timings = HashMap::new();
   let mut large_timings = HashMap::new();
 
-  for is_small in [true, false] {
-    let mode = if is_small { "small" } else { "large" };
+  // l0 = ell_b for small (all rounds small-value), l0 = 0 for large
+  for l0 in [ell_b, 0] {
+    let mode = if l0 > 0 { "small" } else { "large" };
     let _mode_span = info_span!("mode", mode).entered();
 
     clear_timings(timing_data);
@@ -235,15 +237,15 @@ fn benchmark_nifs_prove<E: Engine>(
     let t_total = Instant::now();
 
     // Witness generation: prep_prove
-    let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, is_small)
+    let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0)
       .expect("prep_prove");
 
     // Witness generation: synthesize instances
     let (instances, witnesses) =
-      generate_instances_and_witnesses(&pk, &prep, &circuits, is_small);
+      generate_instances_and_witnesses(&pk, &prep, &circuits, l0);
 
     // NIFS prove
-    nifs_prove_single(&pk, &instances, &witnesses, is_small);
+    nifs_prove_single(&pk, &instances, &witnesses, l0);
 
     let total_ms = t_total.elapsed().as_millis();
     info!(elapsed_ms = total_ms as u64, "end_to_end_total");
@@ -251,7 +253,7 @@ fn benchmark_nifs_prove<E: Engine>(
     let mut timings = snapshot_timings(timing_data, NEUTRONNOVA_PHASES);
     // Normalize parallel spans to approximate wall-clock time
     normalize_parallel_timings(&mut timings, PARALLEL_SPANS, parallel_divisor);
-    if is_small {
+    if l0 > 0 {
       small_timings = timings;
     } else {
       large_timings = timings;
@@ -259,8 +261,8 @@ fn benchmark_nifs_prove<E: Engine>(
   }
 
   // Verify using the full ZkSNARK pipeline
-  verify_snark(&pk, &vk, &circuits, &core_circuit, num_instances, true);
-  verify_snark(&pk, &vk, &circuits, &core_circuit, num_instances, false);
+  verify_snark(&pk, &vk, &circuits, &core_circuit, num_instances, ell_b);
+  verify_snark(&pk, &vk, &circuits, &core_circuit, num_instances, 0);
 
   let header = format!(
     "===== NeutronNova Keccak NIFS: instances={}, chain_length={}, constraints={}, cores={} =====",
@@ -297,11 +299,13 @@ fn benchmark_zk_prove<E: Engine>(
   let setup_ms = t0.elapsed().as_millis();
   eprintln!("Setup done in {} ms", setup_ms);
 
+  let ell_b = num_instances.next_power_of_two().trailing_zeros() as usize;
   let mut small_timings = HashMap::new();
   let mut large_timings = HashMap::new();
 
-  for is_small in [true, false] {
-    let mode = if is_small { "small" } else { "large" };
+  // l0 = ell_b for small (all rounds small-value), l0 = 0 for large
+  for l0 in [ell_b, 0] {
+    let mode = if l0 > 0 { "small" } else { "large" };
     let _mode_span = info_span!("mode", mode).entered();
 
     clear_timings(timing_data);
@@ -309,9 +313,9 @@ fn benchmark_zk_prove<E: Engine>(
     let t_total = Instant::now();
 
     // Full ZK prove
-    let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, is_small)
+    let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0)
       .expect("prep_prove");
-    let snark = NeutronNovaZkSNARK::<E>::prove(&pk, &circuits, &core_circuit, &prep, is_small)
+    let snark = NeutronNovaZkSNARK::<E>::prove(&pk, &circuits, &core_circuit, &prep, l0)
       .expect("prove");
 
     let total_ms = t_total.elapsed().as_millis();
@@ -320,7 +324,7 @@ fn benchmark_zk_prove<E: Engine>(
     let mut timings = snapshot_timings(timing_data, NEUTRONNOVA_ZK_PROVE_PHASES);
     // Normalize parallel spans to approximate wall-clock time
     normalize_parallel_timings(&mut timings, PARALLEL_SPANS, parallel_divisor);
-    if is_small {
+    if l0 > 0 {
       small_timings = timings;
     } else {
       large_timings = timings;

@@ -263,9 +263,80 @@ pub(super) fn mul_4_by_1(a: &[u64; 4], b: u64) -> [u64; 5] {
   result
 }
 
+/// Multiply 3-limb by 5-limb, producing an 8-limb result.
+///
+/// Used in Barrett reduction: q2 = q1 × μ where q1 is 3 limbs and μ is 5 limbs.
+#[inline(always)]
+pub(super) fn mul_3x5_to_8(a: &[u64; 3], b: &[u64; 5]) -> [u64; 8] {
+  let mut result = [0u64; 8];
+  for i in 0..3 {
+    let mut carry = 0u128;
+    for j in 0..5 {
+      let prod = (a[i] as u128) * (b[j] as u128) + (result[i + j] as u128) + carry;
+      result[i + j] = prod as u64;
+      carry = prod >> 64;
+    }
+    result[i + 5] = carry as u64;
+  }
+  result
+}
+
+/// Multiply 3-limb by 4-limb, returning only low 4 limbs.
+///
+/// Used in Barrett reduction for Pasta/BN254 where 2p < b⁴.
+/// Only computes contributions to limbs 0-3, skipping higher limbs.
+///
+/// This saves ~3 multiplications compared to `mul_3x4_lo5`.
+#[inline(always)]
+pub(super) fn mul_3x4_lo4(a: &[u64; 3], b: &[u64; 4]) -> [u64; 4] {
+  let mut result = [0u64; 4];
+
+  // a[0] * b[0..4] → contributes to limbs 0-3 (carry into 4 is discarded)
+  let mut carry = 0u128;
+  for j in 0..4 {
+    let prod = (a[0] as u128) * (b[j] as u128) + carry;
+    result[j] = prod as u64;
+    carry = prod >> 64;
+  }
+  // carry into limb 4 is discarded
+
+  // a[1] * b[0..3] → contributes to limbs 1-3
+  carry = 0;
+  for j in 0..3 {
+    let prod = (a[1] as u128) * (b[j] as u128) + (result[1 + j] as u128) + carry;
+    result[1 + j] = prod as u64;
+    carry = prod >> 64;
+  }
+  // a[1] * b[3] would go to limb 4, discarded
+
+  // a[2] * b[0..2] → contributes to limbs 2-3
+  carry = 0;
+  for j in 0..2 {
+    let prod = (a[2] as u128) * (b[j] as u128) + (result[2 + j] as u128) + carry;
+    result[2 + j] = prod as u64;
+    carry = prod >> 64;
+  }
+  // a[2] * b[2..3] would go to limbs 4+, discarded
+
+  result
+}
+
 // ============================================================================
 // Limb subtraction operations
 // ============================================================================
+
+/// Add two 4-limb values, returning 4 limbs + carry (0 or 1).
+#[inline(always)]
+pub(super) fn add_4_4(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], u64) {
+  let mut result = [0u64; 4];
+  let mut carry = 0u128;
+  for i in 0..4 {
+    let sum = (a[i] as u128) + (b[i] as u128) + carry;
+    result[i] = sum as u64;
+    carry = sum >> 64;
+  }
+  (result, carry as u64)
+}
 
 /// Subtract two 4-limb values: a - b.
 #[inline(always)]
@@ -294,6 +365,52 @@ pub(super) fn sub_5_4(a: &[u64; 5], b: &[u64; 4]) -> [u64; 5] {
   }
   let (diff, _) = a[4].overflowing_sub(borrow);
   result[4] = diff;
+  result
+}
+
+/// Subtract two 4-limb values with borrow output: a - b → (result, borrow).
+///
+/// Used for branchless canonicalization patterns.
+#[inline(always)]
+pub(super) fn sub_4_4_with_borrow(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], u64) {
+  let mut result = [0u64; 4];
+  let mut borrow = 0u64;
+  for i in 0..4 {
+    let (diff, b1) = a[i].overflowing_sub(b[i]);
+    let (diff2, b2) = diff.overflowing_sub(borrow);
+    result[i] = diff2;
+    borrow = (b1 as u64) + (b2 as u64);
+  }
+  (result, borrow)
+}
+
+/// Constant-time select: if cond { a } else { b }
+///
+/// Used for branchless canonicalization to avoid data-dependent branches.
+#[inline(always)]
+pub(super) fn select_4(cond: bool, a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+  let mask = (cond as u64).wrapping_neg(); // 0xFFFF...FFFF if true, 0 if false
+  [
+    (a[0] & mask) | (b[0] & !mask),
+    (a[1] & mask) | (b[1] & !mask),
+    (a[2] & mask) | (b[2] & !mask),
+    (a[3] & mask) | (b[3] & !mask),
+  ]
+}
+
+/// Multiply 2-limb by 1-limb, producing a 3-limb result.
+///
+/// Used in Pasta 2-fold Barrett reduction for x_hi × c where c is 2 limbs.
+#[inline(always)]
+pub(super) fn mul_2_by_1(a: &[u64; 2], b: u64) -> [u64; 3] {
+  let mut result = [0u64; 3];
+  let mut carry = 0u128;
+  for i in 0..2 {
+    let prod = (a[i] as u128) * (b as u128) + carry;
+    result[i] = prod as u64;
+    carry = prod >> 64;
+  }
+  result[2] = carry as u64;
   result
 }
 
