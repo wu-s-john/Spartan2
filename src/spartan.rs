@@ -405,6 +405,23 @@ impl<E: Engine> SpartanSNARK<E> {
     z
   }
 
+  /// Build z = [W | 1 | public_values | challenges] converting i8 binary values to field elements.
+  fn build_z_field(w_i8: &[i8], pub_i8: &[i8], challenges: &[E::Scalar]) -> Vec<E::Scalar> {
+    let i8_to_field = |&v: &i8| {
+      if v == 0 {
+        E::Scalar::ZERO
+      } else {
+        E::Scalar::ONE
+      }
+    };
+    let mut z = Vec::with_capacity(w_i8.len() + 1 + pub_i8.len() + challenges.len());
+    z.extend(w_i8.iter().map(i8_to_field));
+    z.push(E::Scalar::ONE);
+    z.extend(pub_i8.iter().map(i8_to_field));
+    z.extend_from_slice(challenges);
+    z
+  }
+
   /// Common transcript setup for prove and prove_small.
   /// Returns initialized transcript with vk and public values absorbed.
   fn prove_transcript_setup<C: SpartanCircuit<E>>(
@@ -745,46 +762,50 @@ impl<E: Engine> SpartanSNARK<E> {
     transcript.absorb(b"claims_outer", &[claim_Az, claim_Bz, claim_Cz].as_slice());
     info!(elapsed_ms = %sc_t.elapsed().as_millis(), "outer_sumcheck");
 
-    // Convert i8 witnesses → field elements for inner sumcheck and PCS
-    let W_field: Vec<E::Scalar> = W_i8
-      .W
-      .iter()
-      .map(|&v| {
-        if v == 0 {
-          E::Scalar::ZERO
-        } else {
-          E::Scalar::ONE
-        }
-      })
-      .collect();
-    let W_field_witness = R1CSWitness::<E> {
-      is_small: false,
-      W: W_field,
-      r_W: W_i8.r_W.clone(),
-    };
+    // --- Inner sumcheck preparation ---
+    let num_rounds_y = usize::try_from(num_vars.ilog2()).expect("num_vars log2 fits in usize") + 1;
 
-    // Build field z for inner sumcheck
-    let z_field = {
-      let pub_field_ext: Vec<E::Scalar> = pub_i8
-        .iter()
-        .map(|&v| {
-          if v == 0 {
-            E::Scalar::ZERO
-          } else {
-            E::Scalar::ONE
-          }
-        })
-        .collect();
-      [
-        W_field_witness.W.clone(),
-        vec![E::Scalar::ONE],
-        pub_field_ext,
-        U_i8.challenges.clone(),
-      ]
-      .concat()
-    };
+    let r = transcript.squeeze(b"r")?;
+    let claim_inner_joint = claim_Az + r * claim_Bz + r * r * claim_Cz;
 
-    // Build field U for inner sumcheck
+    let (_eval_rx_span, eval_rx_t) = start_span!("compute_eval_rx");
+    let evals_rx = EqPolynomial::evals_from_points(&r_x);
+    info!(elapsed_ms = %eval_rx_t.elapsed().as_millis(), "compute_eval_rx");
+
+    // Use i32-optimized bind_row_vars (cheaper than field × field)
+    let (_sparse_span, sparse_t) = start_span!("compute_eval_table_sparse");
+    let poly_ABC = S_int.bind_row_vars_combined_int(&evals_rx, r);
+    info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
+
+    // Inner sumcheck: use binary z when no challenges (SHA-256 fast path)
+    let (_sc2_span, sc2_t) = start_span!("inner_sumcheck");
+    let (sc_proof_inner, r_y, claims_inner) = if U_i8.challenges.is_empty() {
+      // z_i8 is purely binary — use optimized path (zero field multiplies in round 0)
+      let mut z_bin = z_i8;
+      z_bin.resize(num_vars * 2, 0i8);
+      crate::small_sumcheck::prove_quad_with_binary_z::<E>(
+        &claim_inner_joint,
+        num_rounds_y,
+        &mut MultilinearPolynomial::new(poly_ABC),
+        &z_bin,
+        &mut transcript,
+      )?
+    } else {
+      // Challenges present — fall back to field conversion (rare case)
+      let mut z_field = Self::build_z_field(&W_i8.W, &pub_i8, &U_i8.challenges);
+      z_field.resize(num_vars * 2, E::Scalar::ZERO);
+      SumcheckProof::prove_quad(
+        &claim_inner_joint,
+        num_rounds_y,
+        &mut MultilinearPolynomial::new(poly_ABC),
+        &mut MultilinearPolynomial::new(z_field),
+        &mut transcript,
+      )?
+    };
+    let eval_Z = claims_inner[1];
+    info!(elapsed_ms = %sc2_t.elapsed().as_millis(), "inner_sumcheck");
+
+    // Build field U for eval_X computation
     let U_field = SplitR1CSInstance::<E> {
       comm_W_shared: U_i8.comm_W_shared.clone(),
       comm_W_precommitted: U_i8.comm_W_precommitted.clone(),
@@ -792,71 +813,7 @@ impl<E: Engine> SpartanSNARK<E> {
       public_values: pub_field,
       challenges: U_i8.challenges.clone(),
     };
-
-    // Inner sumcheck and PCS using i32 shape for faster evaluation
-    let snark = Self::prove_inner_and_pcs_int(
-      S_int,
-      pk,
-      U_field,
-      W_field_witness,
-      z_field,
-      r_x,
-      (claim_Az, claim_Bz, claim_Cz),
-      sc_proof_outer,
-      &mut transcript,
-    )?;
-
-    info!(elapsed_ms = %prove_t.elapsed().as_millis(), "spartan_snark_prove");
-    Ok(snark)
-  }
-
-  /// Inner sumcheck + PCS proof using the i32 shape for fast matrix evaluation.
-  #[allow(clippy::too_many_arguments)]
-  fn prove_inner_and_pcs_int(
-    S_int: &SplitR1CSShape<E, i32>,
-    pk: &SpartanProverKey<E>,
-    U: SplitR1CSInstance<E>,
-    W: R1CSWitness<E>,
-    mut z: Vec<E::Scalar>,
-    r_x: Vec<E::Scalar>,
-    claims_outer: (E::Scalar, E::Scalar, E::Scalar),
-    sc_proof_outer: SumcheckProof<E>,
-    transcript: &mut E::TE,
-  ) -> Result<Self, SpartanError>
-  where
-    E::Scalar: DelayedReduction<E::Scalar>,
-  {
-    let (claim_Az, claim_Bz, claim_Cz) = claims_outer;
-    let num_vars = S_int.num_shared + S_int.num_precommitted + S_int.num_rest;
-    let num_rounds_y = usize::try_from(num_vars.ilog2()).expect("num_vars log2 fits in usize") + 1;
-
-    let r = transcript.squeeze(b"r")?;
-    let claim_inner_joint = claim_Az + r * claim_Bz + r * r * claim_Cz;
-
-    let evals_rx = EqPolynomial::evals_from_points(&r_x);
-
-    // Use i32-optimized bind_row_vars (cheaper than field × field)
-    let (_sparse_span, sparse_t) = start_span!("compute_eval_table_sparse");
-    let poly_ABC = S_int.bind_row_vars_combined_int(&evals_rx, r);
-    info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
-
-    let poly_z = {
-      z.resize(num_vars * 2, E::Scalar::ZERO);
-      z
-    };
-
-    let (_sc2_span, sc2_t) = start_span!("inner_sumcheck");
-    let (sc_proof_inner, r_y, claims_inner) = SumcheckProof::prove_quad(
-      &claim_inner_joint,
-      num_rounds_y,
-      &mut MultilinearPolynomial::new(poly_ABC),
-      &mut MultilinearPolynomial::new(poly_z),
-      transcript,
-    )?;
-    let eval_Z = claims_inner[1];
-    info!(elapsed_ms = %sc2_t.elapsed().as_millis(), "inner_sumcheck");
-
-    let U_regular = U.to_regular_instance()?;
+    let U_regular = U_field.to_regular_instance()?;
     let eval_X = {
       let X = vec![E::Scalar::ONE]
         .into_iter()
@@ -870,24 +827,38 @@ impl<E: Engine> SpartanSNARK<E> {
         .invert()
         .expect("1 - r_y[0] is non-zero");
 
+    // PCS: Convert W_i8 → field ONLY HERE (deferred, single conversion)
     let (_pcs_span, pcs_t) = start_span!("pcs_prove");
+    let W_field: Vec<E::Scalar> = W_i8
+      .W
+      .iter()
+      .map(|&v| {
+        if v == 0 {
+          E::Scalar::ZERO
+        } else {
+          E::Scalar::ONE
+        }
+      })
+      .collect();
+
     let blind_eval_W = E::PCS::blind(&pk.ck_s, 1);
     let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W, false)?;
     let eval_arg = E::PCS::prove(
       &pk.ck,
       &pk.ck_s,
-      transcript,
+      &mut transcript,
       &U_regular.comm_W,
-      &W.W,
-      &W.r_W,
+      &W_field,
+      &W_i8.r_W,
       &r_y[1..],
       &comm_eval_W,
       &blind_eval_W,
     )?;
     info!(elapsed_ms = %pcs_t.elapsed().as_millis(), "pcs_prove");
 
+    info!(elapsed_ms = %prove_t.elapsed().as_millis(), "spartan_snark_prove");
     Ok(SpartanSNARK {
-      U,
+      U: U_field,
       sc_proof_outer,
       claims_outer: (claim_Az, claim_Bz, claim_Cz),
       sc_proof_inner,

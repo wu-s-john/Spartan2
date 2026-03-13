@@ -38,7 +38,7 @@ use crate::{
   sumcheck::{SumcheckProof, eq_sumcheck},
   traits::{Engine, transcript::TranscriptEngineTrait},
 };
-use ff::PrimeField;
+use ff::{Field, PrimeField};
 use num_traits::Zero;
 use rayon::prelude::*;
 use tracing::info;
@@ -365,6 +365,156 @@ where
     SumcheckProof::new(polys),
     r,
     vec![poly_A[0], poly_B[0], poly_C[0]],
+  ))
+}
+
+/// Compute eval points for the quadratic sumcheck `poly_A × z` when z is binary (0/1).
+///
+/// For binary z, `a × z` reduces to conditional addition (no field multiply):
+/// - `eval_0 = Σ_{i: z_lo[i]=1} a_lo[i]`
+/// - `eval_2`: uses `b_bound = 2·z_hi - z_lo` which is in {-1, 0, 1, 2} for binary inputs
+fn compute_eval_points_quad_binary_z<E: Engine>(
+  poly_A: &MultilinearPolynomial<E::Scalar>,
+  z_bin: &[i8],
+) -> (E::Scalar, E::Scalar) {
+  let len = poly_A.Z.len() / 2;
+  debug_assert_eq!(z_bin.len(), poly_A.Z.len());
+
+  let (acc_0, acc_2) = (0..len)
+    .into_par_iter()
+    .fold(
+      || (E::Scalar::ZERO, E::Scalar::ZERO),
+      |mut acc, i| {
+        let a_low = poly_A[i];
+        let z_lo = z_bin[i];
+        let a_high = poly_A[len + i];
+        let z_hi = z_bin[len + i];
+
+        // eval 0: conditional add (z_lo is 0 or 1)
+        if z_lo != 0 {
+          acc.0 += a_low;
+        }
+
+        // eval 2: a_bound × b_bound where b_bound = 2·z_hi - z_lo ∈ {-1, 0, 1, 2}
+        let a_bound = a_high + a_high - a_low;
+        match (z_lo, z_hi) {
+          (0, 0) => {}                      // b_bound = 0: skip
+          (1, 0) => acc.1 -= a_bound,       // b_bound = -1
+          (0, 1) => acc.1 += a_bound.double(), // b_bound = 2 (workaround: add twice)
+          (_, _) => acc.1 += a_bound,        // b_bound = 1
+        }
+
+        acc
+      },
+    )
+    .reduce(
+      || (E::Scalar::ZERO, E::Scalar::ZERO),
+      |mut a, b| {
+        a.0 += b.0;
+        a.1 += b.1;
+        a
+      },
+    );
+
+  (acc_0, acc_2)
+}
+
+/// Bind a binary z polynomial with challenge r, producing field elements.
+///
+/// For binary inputs, each output is one of four precomputed values:
+/// - (0,0) → 0
+/// - (0,1) → r
+/// - (1,0) → 1-r
+/// - (1,1) → 1
+fn bind_binary_z<F: PrimeField>(z_bin: &[i8], r: &F) -> Vec<F> {
+  let len = z_bin.len() / 2;
+  let one_minus_r = F::ONE - *r;
+
+  let compute = |i: usize| -> F {
+    match (z_bin[i], z_bin[len + i]) {
+      (0, 0) => F::ZERO,
+      (0, _) => *r,
+      (_, 0) => one_minus_r,
+      _ => F::ONE,
+    }
+  };
+
+  if len >= PAR_THRESHOLD {
+    (0..len).into_par_iter().map(compute).collect()
+  } else {
+    (0..len).map(compute).collect()
+  }
+}
+
+/// Prove a quadratic sumcheck `poly_A × z` where z is binary (i8 of 0/1).
+///
+/// Round 0 uses `compute_eval_points_quad_binary_z` (zero field multiplies),
+/// then `bind_binary_z` to convert z to field elements. Rounds 1+ use
+/// standard `compute_eval_points_quad` with delayed reduction.
+pub fn prove_quad_with_binary_z<E: Engine>(
+  claim: &E::Scalar,
+  num_rounds: usize,
+  poly_A: &mut MultilinearPolynomial<E::Scalar>,
+  z_bin: &[i8],
+  transcript: &mut E::TE,
+) -> Result<(SumcheckProof<E>, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
+where
+  E::Scalar: DelayedReduction<E::Scalar>,
+{
+  let mut r: Vec<E::Scalar> = Vec::with_capacity(num_rounds);
+  let mut polys: Vec<crate::polys::univariate::CompressedUniPoly<E::Scalar>> =
+    Vec::with_capacity(num_rounds);
+  let mut claim_per_round = *claim;
+
+  // === Round 0: binary z fast path ===
+  let (eval_point_0, eval_point_2) =
+    compute_eval_points_quad_binary_z::<E>(poly_A, z_bin);
+
+  let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
+  let poly = UniPoly::from_evals(&evals)?;
+
+  transcript.absorb(b"p", &poly);
+  let r_0 = transcript.squeeze(b"c")?;
+  r.push(r_0);
+  polys.push(poly.compress());
+  claim_per_round = poly.evaluate(&r_0);
+
+  // Bind: binary z → field, poly_A standard bind
+  let poly_B_vec = bind_binary_z(z_bin, &r_0);
+  let mut poly_B = MultilinearPolynomial::new(poly_B_vec);
+  poly_A.bind_poly_var_top(&r_0);
+
+  // === Rounds 1..num_rounds: standard quad sumcheck ===
+  for round in 1..num_rounds {
+    let (_round_span, round_t) = start_span!("sumcheck_quad_round", round = round);
+
+    let poly = {
+      let (eval_point_0, eval_point_2) =
+        SumcheckProof::<E>::compute_eval_points_quad(poly_A, &poly_B);
+
+      let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
+      UniPoly::from_evals(&evals)?
+    };
+
+    transcript.absorb(b"p", &poly);
+    let r_i = transcript.squeeze(b"c")?;
+    r.push(r_i);
+    polys.push(poly.compress());
+    claim_per_round = poly.evaluate(&r_i);
+
+    let (_bind_span, bind_t) = start_span!("bind_poly_vars_quad");
+    rayon::join(
+      || poly_A.bind_poly_var_top(&r_i),
+      || poly_B.bind_poly_var_top(&r_i),
+    );
+    info!(elapsed_ms = %bind_t.elapsed().as_millis(), "bind_poly_vars_quad");
+    info!(elapsed_ms = %round_t.elapsed().as_millis(), round = round, "sumcheck_quad_round");
+  }
+
+  Ok((
+    SumcheckProof::new(polys),
+    r,
+    vec![poly_A[0], poly_B[0]],
   ))
 }
 

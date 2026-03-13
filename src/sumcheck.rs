@@ -169,7 +169,7 @@ impl<E: Engine> SumcheckProof<E> {
   /// # Returns
   /// A tuple `(eval_0, eval_2)` containing evaluations at points 0 and 2.
   #[inline]
-  fn compute_eval_points_quad(
+  pub(crate) fn compute_eval_points_quad(
     poly_A: &MultilinearPolynomial<E::Scalar>,
     poly_B: &MultilinearPolynomial<E::Scalar>,
   ) -> (E::Scalar, E::Scalar)
