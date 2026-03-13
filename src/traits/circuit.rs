@@ -52,6 +52,47 @@ pub trait SpartanCircuit<E: Engine>: Send + Sync + Clone {
   ) -> Result<(), SynthesisError>;
 }
 
+/// A helper trait for circuits that use the pure-integer small-value path.
+///
+/// Unlike `SpartanCircuit<E>`, this trait works over integer values without field
+/// arithmetic. `V` is the value type:
+/// - `V = i32` for shape extraction (`SmallShapeCS`) — records i32 constraint coefficients
+/// - `V = i8` for witness generation (`SmallSatisfyingAssignment<i8>`) — records i8 witnesses
+///
+/// All SHA-256 witnesses are bits (0/1), so `i8` is sufficient. Matrix coefficients
+/// (powers of 2 up to 2^18) fit in `i32`.
+pub trait SmallSpartanCircuit<E: Engine, V>: Send + Sync + Clone {
+  /// Returns the public values of the circuit as V (usually i8 bit-values).
+  fn public_values(&self) -> Result<Vec<V>, bellpepper_core::SynthesisError>;
+
+  /// Allocates shared variables in the constraint system.
+  fn shared<CS: crate::small_constraint_system::SmallConstraintSystem<V>>(
+    &self,
+    cs: &mut CS,
+  ) -> Result<Vec<bellpepper_core::Variable>, bellpepper_core::SynthesisError>;
+
+  /// Allocates precommitted variables.
+  fn precommitted<CS: crate::small_constraint_system::SmallConstraintSystem<V>>(
+    &self,
+    cs: &mut CS,
+    shared: &[bellpepper_core::Variable],
+  ) -> Result<Vec<bellpepper_core::Variable>, bellpepper_core::SynthesisError>;
+
+  /// Returns the number of verifier challenges this circuit expects.
+  fn num_challenges(&self) -> usize;
+
+  /// Allocates remaining variables and constraints.
+  ///
+  /// `challenges` remain field-typed since they come from the transcript.
+  fn synthesize<CS: crate::small_constraint_system::SmallConstraintSystem<V>>(
+    &self,
+    cs: &mut CS,
+    shared: &[bellpepper_core::Variable],
+    precommitted: &[bellpepper_core::Variable],
+    challenges: Option<&[E::Scalar]>,
+  ) -> Result<(), bellpepper_core::SynthesisError>;
+}
+
 /// A helper trait for defining a multi-round randomized circuit that Spartan proves.
 /// Unlike the standard SpartanCircuit, this trait allows the circuit to be processed in multiple rounds,
 /// where each round can allocate different constraints and witness variables based on the round index.

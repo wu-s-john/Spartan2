@@ -25,9 +25,9 @@ use std::{
 /// CSR format sparse matrix, We follow the names used by scipy.
 /// Detailed explanation here: https://stackoverflow.com/questions/52299420/scipy-csr-matrix-understand-indptr
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SparseMatrix<F: PrimeField> {
+pub struct SparseMatrix<V> {
   /// all non-zero values in the matrix
-  pub data: Vec<F>,
+  pub data: Vec<V>,
   /// column indices
   pub indices: Vec<usize>,
   /// row information
@@ -36,7 +36,9 @@ pub struct SparseMatrix<F: PrimeField> {
   pub cols: usize,
 }
 
-impl<F: PrimeField> SparseMatrix<F> {
+// ---- Generic methods (no bounds on V) ----
+
+impl<V> SparseMatrix<V> {
   /// 0x0 empty matrix
   pub fn empty() -> Self {
     SparseMatrix {
@@ -47,6 +49,42 @@ impl<F: PrimeField> SparseMatrix<F> {
     }
   }
 
+  /// Retrieves the data for row slice [i..j] from `ptrs`.
+  /// We assume that `ptrs` is indexed from `indptrs` and do not check if the
+  /// returned slice is actually a valid row.
+  pub fn get_row_unchecked(&self, ptrs: &[usize; 2]) -> impl Iterator<Item = (&V, &usize)> {
+    self.data[ptrs[0]..ptrs[1]]
+      .iter()
+      .zip(&self.indices[ptrs[0]..ptrs[1]])
+  }
+}
+
+// ---- Methods requiring V: Copy ----
+
+impl<V: Copy> SparseMatrix<V> {
+  /// returns a custom iterator
+  pub fn iter(&self) -> Iter<'_, V> {
+    let mut row = 0;
+    while row + 1 < self.indptr.len() && self.indptr[row + 1] == 0 {
+      row += 1;
+    }
+    let nnz = if self.indptr.is_empty() {
+      0
+    } else {
+      self.indptr[self.indptr.len() - 1]
+    };
+    Iter {
+      matrix: self,
+      row,
+      i: 0,
+      nnz,
+    }
+  }
+}
+
+// ---- PrimeField-specific methods ----
+
+impl<F: PrimeField> SparseMatrix<F> {
   /// Construct from the COO representation; Vec<usize(row), usize(col), F>.
   /// We assume that the rows are sorted during construction.
   #[cfg(test)]
@@ -79,15 +117,6 @@ impl<F: PrimeField> SparseMatrix<F> {
       indptr,
       cols,
     }
-  }
-
-  /// Retrieves the data for row slice [i..j] from `ptrs`.
-  /// We assume that `ptrs` is indexed from `indptrs` and do not check if the
-  /// returned slice is actually a valid row.
-  pub fn get_row_unchecked(&self, ptrs: &[usize; 2]) -> impl Iterator<Item = (&F, &usize)> {
-    self.data[ptrs[0]..ptrs[1]]
-      .iter()
-      .zip(&self.indices[ptrs[0]..ptrs[1]])
   }
 
   /// Multiply by a dense vector; uses rayon/gpu.
@@ -207,37 +236,63 @@ impl<F: PrimeField> SparseMatrix<F> {
       })
       .collect()
   }
+}
 
-  /// returns a custom iterator
-  pub fn iter(&self) -> Iter<'_, F> {
-    let mut row = 0;
-    while row + 1 < self.indptr.len() && self.indptr[row + 1] == 0 {
-      row += 1;
+// ---- Pure integer methods for i32 matrices ----
+
+impl SparseMatrix<i32> {
+  /// Pure integer matrix-vector multiply for the small-value path.
+  ///
+  /// Computes M × z where M has i32 coefficients and z has i8 values (bits 0/1).
+  /// Since witnesses are bits, this is conditional addition: for each nonzero z[col],
+  /// add data[i] to the accumulator. No multiply needed.
+  ///
+  /// # Safety assumptions
+  /// The caller must ensure z contains only 0 or 1 values (bit witnesses).
+  /// For SHA-256 with NoBatchEq (max coeff ~2^18) and ~200 nonzeros per row,
+  /// each row result is at most ~200 × 2^18 ≈ 2^26, well within i32 range.
+  ///
+  /// # Errors
+  /// Returns `SpartanError::InvalidInputLength` if vector length doesn't match.
+  pub fn multiply_vec_int(&self, z: &[i8]) -> Result<Vec<i32>, SpartanError> {
+    if self.cols != z.len() {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!(
+          "SparseMatrix::multiply_vec_int: Expected {} elements, got {}",
+          self.cols,
+          z.len()
+        ),
+      });
     }
-    let nnz = if self.indptr.is_empty() {
-      0
-    } else {
-      self.indptr[self.indptr.len() - 1]
-    };
-    Iter {
-      matrix: self,
-      row,
-      i: 0,
-      nnz,
-    }
+
+    Ok(
+      self
+        .indptr
+        .par_windows(2)
+        .map(|ptrs| {
+          let mut acc: i32 = 0;
+          for i in ptrs[0]..ptrs[1] {
+            if z[self.indices[i]] != 0 {
+              acc += self.data[i];
+            }
+          }
+          acc
+        })
+        .collect(),
+    )
   }
 }
 
 /// Iterator for sparse matrix
-pub struct Iter<'a, F: PrimeField> {
-  matrix: &'a SparseMatrix<F>,
+pub struct Iter<'a, V> {
+  matrix: &'a SparseMatrix<V>,
   row: usize,
   i: usize,
   nnz: usize,
 }
 
-impl<'a, F: PrimeField> Iterator for Iter<'a, F> {
-  type Item = (usize, usize, F);
+impl<V: Copy> Iterator for Iter<'_, V> {
+  type Item = (usize, usize, V);
 
   fn next(&mut self) -> Option<Self::Item> {
     // are we at the end?
@@ -359,5 +414,31 @@ mod tests {
 
         prop_assert_eq!(coo_matrix, matrix.iter().collect::<Vec<_>>());
     }
+  }
+
+  #[test]
+  fn test_multiply_vec_int_basic() {
+    // Build a 3×3 i32 matrix manually in CSR format
+    // z is bit-valued (0/1), so this tests conditional addition
+    let matrix = SparseMatrix::<i32> {
+      data: vec![2, 7, 3, 4],
+      indices: vec![1, 2, 2, 0],
+      indptr: vec![0, 2, 3, 4],
+      cols: 3,
+    };
+    let z: Vec<i8> = vec![1, 1, 1]; // all bits set
+    let result = matrix.multiply_vec_int(&z).unwrap();
+    // Row 0: 2*1 + 7*1 = 9
+    // Row 1: 3*1 = 3
+    // Row 2: 4*1 = 4
+    assert_eq!(result, vec![9, 3, 4]);
+
+    // Test with zeros
+    let z2: Vec<i8> = vec![0, 1, 0]; // only bit 1 set
+    let result2 = matrix.multiply_vec_int(&z2).unwrap();
+    // Row 0: 2*1 = 2
+    // Row 1: 0
+    // Row 2: 0
+    assert_eq!(result2, vec![2, 0, 0]);
   }
 }

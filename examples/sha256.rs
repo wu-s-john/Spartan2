@@ -16,6 +16,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::Parser;
 use spartan2::{
+  bellpepper::r1cs::small_r1cs_shape,
   cli::FieldChoice,
   provider::{Bn254Engine, PallasHyraxEngine, VestaHyraxEngine},
   sha256_circuits::SmallSha256Circuit,
@@ -47,10 +48,13 @@ fn run_benchmark<E: Engine>(
   constraints_data: &ConstraintsData,
   bytes: Option<usize>,
 ) where
-  E::Scalar: SmallValueField<i64>
+  E::Scalar: SmallValueField<i32>
+    + SmallValueField<i64>
+    + DelayedReduction<i32>
     + DelayedReduction<i64>
     + DelayedReduction<i128>
-    + DelayedReduction<E::Scalar>,
+    + DelayedReduction<E::Scalar>
+    + ff::PrimeFieldBits,
 {
   let msg_lengths: Vec<usize> = match bytes {
     Some(b) => vec![b],
@@ -75,30 +79,34 @@ fn run_benchmark<E: Engine>(
 
     let mut small_timings = HashMap::new();
     let mut large_timings = HashMap::new();
+    let mut int_timings = HashMap::new();
 
     for is_small in [true, false] {
       let mode = if is_small { "small" } else { "large" };
       let _mode_span = info_span!("mode", mode).entered();
       info!("--- is_small={} ---", is_small);
 
-      // Clear timing data before prove
       clear_timings(timing_data);
 
-      // PREPARE
       let t0 = Instant::now();
       let prep_snark =
         SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), is_small).expect("prep_prove failed");
-      let prep_ms = t0.elapsed().as_millis();
+      let prep_ms = t0.elapsed().as_millis() as u64;
       info!(elapsed_ms = prep_ms, "prep_prove");
 
-      // PROVE
       let t0 = Instant::now();
       let proof = SpartanSNARK::<E>::prove(&pk, circuit.clone(), &prep_snark, is_small)
         .expect("prove failed");
-      let prove_ms = t0.elapsed().as_millis();
+      let prove_ms = t0.elapsed().as_millis() as u64;
       info!(elapsed_ms = prove_ms, "prove");
 
-      // Snapshot timings from prove
+      // Inject wall-clock prep/prove times for the table
+      {
+        let mut map = timing_data.lock().unwrap();
+        map.insert("__prep__".to_string(), prep_ms);
+        map.insert("__prove__".to_string(), prove_ms);
+      }
+
       let timings = snapshot_timings(timing_data, SPARTAN_PHASES);
       if is_small {
         small_timings = timings;
@@ -106,7 +114,6 @@ fn run_benchmark<E: Engine>(
         large_timings = timings;
       }
 
-      // VERIFY
       let t0 = Instant::now();
       proof.verify(&vk).expect("verify errored");
       let verify_ms = t0.elapsed().as_millis();
@@ -118,6 +125,46 @@ fn run_benchmark<E: Engine>(
       );
     }
 
+    // prove_int path: pure-integer i32/i8
+    {
+      let _mode_span = info_span!("mode", mode = "int").entered();
+      info!("--- prove_int ---");
+
+      clear_timings(timing_data);
+
+      // Prep: extract i32 shape (A, B, C matrices)
+      let t0 = Instant::now();
+      let S_int = small_r1cs_shape::<E, _>(&circuit).expect("small_r1cs_shape");
+      let prep_ms = t0.elapsed().as_millis() as u64;
+      info!(elapsed_ms = prep_ms, "shape_int");
+
+      // Prove: witness gen + mat_vec + sumcheck + PCS
+      let t0 = Instant::now();
+      let proof = SpartanSNARK::<E>::prove_int(&S_int, &pk, circuit.clone())
+        .expect("prove_int failed");
+      let prove_ms = t0.elapsed().as_millis() as u64;
+      info!(elapsed_ms = prove_ms, "prove_int");
+
+      // Inject wall-clock prep/prove times
+      {
+        let mut map = timing_data.lock().unwrap();
+        map.insert("__prep__".to_string(), prep_ms);
+        map.insert("__prove__".to_string(), prove_ms);
+      }
+
+      int_timings = snapshot_timings(timing_data, SPARTAN_PHASES);
+
+      let t0 = Instant::now();
+      proof.verify(&vk).expect("verify_int errored");
+      let verify_ms = t0.elapsed().as_millis();
+      info!(elapsed_ms = verify_ms, "verify_int");
+
+      info!(
+        "SUMMARY msg={}B, prove_int, setup={} ms, prep={} ms, prove={} ms, verify={} ms",
+        msg_len, setup_ms, prep_ms, prove_ms, verify_ms
+      );
+    }
+
     // Print comparison table
     let constraints = constraints_data.lock().unwrap().take();
     let header = match constraints {
@@ -125,6 +172,7 @@ fn run_benchmark<E: Engine>(
       None => format!("===== msg={}B =====", msg_len),
     };
     print_table(&header, SPARTAN_PHASES, &small_timings, &large_timings);
+    print_table(&format!("{} [int vs large]", header), SPARTAN_PHASES, &int_timings, &large_timings);
 
     drop(root_span);
   }

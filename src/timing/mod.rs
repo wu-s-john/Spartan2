@@ -112,15 +112,30 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for TimingLayer {
 
 /// Extract timing values for the given phases from collected data.
 /// Returns a map keyed by short_name for easier access.
+/// Special entries:
+/// - `"__computed_total__"`: computed as the sum of all real span phases
+/// - `"__prep__"`, `"__prove__"`: wall-clock times, looked up in the map but NOT summed into total
 pub fn snapshot_timings(
   data: &TimingData,
   phases: &[(&str, &'static str)],
 ) -> HashMap<&'static str, u64> {
   let map = data.lock().unwrap();
-  phases
-    .iter()
-    .map(|(phase, short_name)| (*short_name, map.get(*phase).copied().unwrap_or(0)))
-    .collect()
+  let mut result = HashMap::new();
+  let mut sum: u64 = 0;
+  for (phase, short_name) in phases {
+    if *phase == "__computed_total__" {
+      result.insert(*short_name, sum);
+    } else if phase.starts_with("__") {
+      // Wall-clock entries (e.g. __prep__, __prove__) — lookup but don't sum
+      let v = map.get(*phase).copied().unwrap_or(0);
+      result.insert(*short_name, v);
+    } else {
+      let v = map.get(*phase).copied().unwrap_or(0);
+      sum += v;
+      result.insert(*short_name, v);
+    }
+  }
+  result
 }
 
 /// Clear all collected timing data.
@@ -170,6 +185,8 @@ pub fn collect_timings(
 // ============================================================================
 
 /// Spartan prove phases: (tracing_name, short_display_name).
+/// `"__computed_total__"` is a computed sum of all preceding phases (not a span).
+/// `"__prep__"` and `"__prove__"` are wall-clock times injected by the benchmark.
 pub const SPARTAN_PHASES: &[(&str, &str)] = &[
   ("precommitted_witness_synthesize", "synth_pre"),
   ("commit_witness_precommitted", "commit_pre"),
@@ -183,7 +200,9 @@ pub const SPARTAN_PHASES: &[(&str, &str)] = &[
   ("prepare_poly_z", "poly_z"),
   ("inner_sumcheck", "inner_sc"),
   ("pcs_prove", "pcs"),
-  ("spartan_snark_prove", "prove_total"),
+  ("__prep__", "prep"),
+  ("__prove__", "prove"),
+  ("__computed_total__", "total"),
 ];
 
 // ============================================================================

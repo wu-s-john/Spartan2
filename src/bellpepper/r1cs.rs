@@ -231,6 +231,213 @@ impl<E: Engine> SpartanShape<E> for ShapeCS<E> {
   }
 }
 
+/// Extract a `SplitR1CSShape<E, i32>` from a `SmallSpartanCircuit`.
+///
+/// Uses `SmallShapeCS` to record i32-coefficient constraints directly,
+/// without creating any field elements.
+pub fn small_r1cs_shape<E: Engine, C: crate::traits::circuit::SmallSpartanCircuit<E, i32>>(
+  circuit: &C,
+) -> Result<SplitR1CSShape<E, i32>, SpartanError> {
+  use crate::small_constraint_system::SmallShapeCS;
+
+  let num_challenges = circuit.num_challenges();
+  let mut cs = SmallShapeCS::new();
+
+  let shared = circuit
+    .shared(&mut cs)
+    .map_err(|e| SpartanError::SynthesisError {
+      reason: format!("small_r1cs_shape: shared: {e}"),
+    })?;
+  let num_shared = cs.num_vars();
+
+  let precommitted = circuit
+    .precommitted(&mut cs, &shared)
+    .map_err(|e| SpartanError::SynthesisError {
+      reason: format!("small_r1cs_shape: precommitted: {e}"),
+    })?;
+  let num_precommitted = cs.num_vars() - num_shared;
+
+  circuit
+    .synthesize(&mut cs, &shared, &precommitted, None)
+    .map_err(|e| SpartanError::SynthesisError {
+      reason: format!("small_r1cs_shape: synthesize: {e}"),
+    })?;
+
+  let num_vars = cs.num_vars();
+  let num_inputs = cs.num_inputs(); // includes ONE at index 0
+  let num_rest = num_vars - num_shared - num_precommitted;
+  let num_public = num_inputs - 1 - num_challenges; // subtract ONE and challenges
+
+  // Convert SmallShapeCS constraints to SparseMatrix<i32>
+  let (mut A, mut B, mut C) = cs.to_matrices();
+  A.cols = num_vars + num_inputs;
+  B.cols = num_vars + num_inputs;
+  C.cols = num_vars + num_inputs;
+
+  let num_constraints = cs.num_constraints();
+
+  SplitR1CSShape::<E, i32>::new_int(
+    num_constraints,
+    num_shared,
+    num_precommitted,
+    num_rest,
+    num_public,
+    num_challenges,
+    A,
+    B,
+    C,
+  )
+  .map_err(|e| SpartanError::SynthesisError {
+    reason: format!("small_r1cs_shape: new_int: {e:?}"),
+  })
+}
+
+/// Generate a witness (`SplitR1CSInstance<E, i8>` + `R1CSWitness<E, i8>`) for a `SmallSpartanCircuit`.
+///
+/// Uses `SmallSatisfyingAssignment<i8>` — no field arithmetic during synthesis.
+/// Commitments are made by converting i8 → E::Scalar at PCS time (one conversion).
+pub fn small_r1cs_instance_and_witness<E: Engine, C: crate::traits::circuit::SmallSpartanCircuit<E, i8>>(
+  circuit: &C,
+  S: &SplitR1CSShape<E, i32>,
+  ck: &CommitmentKey<E>,
+  transcript: &mut E::TE,
+) -> Result<(SplitR1CSInstance<E, i8>, crate::r1cs::R1CSWitness<E, i8>), SpartanError>
+where
+  E::Scalar: ff::Field,
+{
+  use crate::small_constraint_system::SmallSatisfyingAssignment;
+  use crate::traits::transcript::TranscriptEngineTrait;
+
+  // Synthesize witness (shared + precommitted) — matches large path's "precommitted_witness_synthesize"
+  let (_synth_span, synth_t) = start_span!("precommitted_witness_synthesize");
+  let mut cs = SmallSatisfyingAssignment::<i8>::new();
+
+  let shared = circuit
+    .shared(&mut cs)
+    .map_err(|e| SpartanError::SynthesisError {
+      reason: format!("small_witness: shared: {e}"),
+    })?;
+
+  let precommitted = circuit
+    .precommitted(&mut cs, &shared)
+    .map_err(|e| SpartanError::SynthesisError {
+      reason: format!("small_witness: precommitted: {e}"),
+    })?;
+  info!(elapsed_ms = %synth_t.elapsed().as_millis(), "precommitted_witness_synthesize");
+
+  // Challenges remain field-typed: squeeze from transcript
+  let challenges_field: Vec<E::Scalar> = (0..circuit.num_challenges())
+    .map(|_| transcript.squeeze(b"c"))
+    .collect::<Result<Vec<_>, _>>()?;
+
+  // Rest synthesis — uses same span name as large path for table consistency
+  let (_rest_span, rest_t) = start_span!("r1cs_instance_and_witness");
+  circuit
+    .synthesize(&mut cs, &shared, &precommitted, Some(&challenges_field))
+    .map_err(|e| SpartanError::SynthesisError {
+      reason: format!("small_witness: synthesize: {e}"),
+    })?;
+  info!(elapsed_ms = %rest_t.elapsed().as_millis(), "r1cs_instance_and_witness");
+
+  // Build the full witness vector W_i8 with padding
+  let num_vars = S.num_shared + S.num_precommitted + S.num_rest;
+  let mut W_i8 = vec![0i8; num_vars];
+  let aux = &cs.aux_assignment;
+
+  // Copy shared variables
+  let shared_copy = aux.len().min(S.num_shared_unpadded);
+  W_i8[..shared_copy].copy_from_slice(&aux[..shared_copy]);
+
+  // Copy precommitted variables (after padding gap for shared)
+  let precommitted_start_aux = S.num_shared_unpadded;
+  let precommitted_copy = (aux.len().saturating_sub(precommitted_start_aux))
+    .min(S.num_precommitted_unpadded);
+  let dst_start = S.num_shared;
+  W_i8[dst_start..dst_start + precommitted_copy]
+    .copy_from_slice(&aux[precommitted_start_aux..precommitted_start_aux + precommitted_copy]);
+
+  // Copy rest variables
+  let rest_start_aux = S.num_shared_unpadded + S.num_precommitted_unpadded;
+  let rest_copy = (aux.len().saturating_sub(rest_start_aux)).min(S.num_rest_unpadded);
+  let dst_rest = S.num_shared + S.num_precommitted;
+  W_i8[dst_rest..dst_rest + rest_copy]
+    .copy_from_slice(&aux[rest_start_aux..rest_start_aux + rest_copy]);
+
+  // Helper: convert i8 slice to E::Scalar
+  let to_field = |slice: &[i8]| -> Vec<E::Scalar> {
+    slice.iter().map(|&v| if v == 0 { E::Scalar::ZERO } else { E::Scalar::ONE }).collect()
+  };
+
+  // Commit shared portion (if any)
+  let (comm_W_shared, r_W_shared) = if S.num_shared_unpadded > 0 {
+    let r = PCS::<E>::blind(ck, S.num_shared);
+    let field = to_field(&W_i8[..S.num_shared]);
+    let comm = PCS::<E>::commit(ck, &field, &r, true)?;
+    (Some(comm), Some(r))
+  } else {
+    (None, None)
+  };
+
+  // Commit precommitted portion (if any)
+  let (_commit_pre_span, commit_pre_t) = start_span!("commit_witness_precommitted");
+  let (comm_W_precommitted, r_W_precommitted) = if S.num_precommitted_unpadded > 0 {
+    let r = PCS::<E>::blind(ck, S.num_precommitted);
+    let field = to_field(&W_i8[S.num_shared..S.num_shared + S.num_precommitted]);
+    let comm = PCS::<E>::commit(ck, &field, &r, true)?;
+    (Some(comm), Some(r))
+  } else {
+    (None, None)
+  };
+  info!(elapsed_ms = %commit_pre_t.elapsed().as_millis(), "commit_witness_precommitted");
+
+  // Commit rest portion
+  let (_commit_rest_span, commit_rest_t) = start_span!("commit_witness_rest");
+  let r_W_rest = PCS::<E>::blind(ck, S.num_rest);
+  let field_rest = to_field(&W_i8[S.num_shared + S.num_precommitted..]);
+  let comm_W_rest = PCS::<E>::commit(ck, &field_rest, &r_W_rest, true)?;
+  info!(elapsed_ms = %commit_rest_t.elapsed().as_millis(), "commit_witness_rest");
+
+  // Absorb commitments into transcript in the same order as SplitR1CSInstance::validate
+  if let Some(ref comm) = comm_W_shared {
+    transcript.absorb(b"comm_W_shared", comm);
+  }
+  if let Some(ref comm) = comm_W_precommitted {
+    transcript.absorb(b"comm_W_precommitted", comm);
+  }
+  // (squeeze challenges here if num_challenges > 0)
+  transcript.absorb(b"comm_W_rest", &comm_W_rest);
+
+  // Combine blinds in same order as field path
+  let mut blinds = Vec::with_capacity(3);
+  if let Some(r) = &r_W_shared { blinds.push(r.clone()); }
+  if let Some(r) = &r_W_precommitted { blinds.push(r.clone()); }
+  blinds.push(r_W_rest);
+  let r_W = PCS::<E>::combine_blinds(&blinds)?;
+
+  // Public values (i8)
+  let pub_i8: Vec<i8> = circuit
+    .public_values()
+    .map_err(|e| SpartanError::SynthesisError {
+      reason: format!("small_witness: public_values: {e}"),
+    })?;
+
+  let U = SplitR1CSInstance {
+    comm_W_shared,
+    comm_W_precommitted,
+    comm_W_rest,
+    public_values: pub_i8,
+    challenges: challenges_field,
+  };
+
+  let W = crate::r1cs::R1CSWitness {
+    is_small: true,
+    W: W_i8,
+    r_W,
+  };
+
+  Ok((U, W))
+}
+
 pub(crate) fn add_constraint<S: PrimeField>(
   X: &mut (
     &mut SparseMatrix<S>,

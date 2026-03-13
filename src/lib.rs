@@ -52,6 +52,7 @@ pub mod bellpepper;
 pub mod errors;
 pub mod gadgets;
 pub mod provider;
+pub mod small_constraint_system;
 pub mod traits;
 
 // public modules for different proof systems

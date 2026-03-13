@@ -27,7 +27,7 @@ use crate::{
   sumcheck::SumcheckProof,
   traits::{
     Engine,
-    circuit::SpartanCircuit,
+    circuit::{SmallSpartanCircuit, SpartanCircuit},
     pcs::PCSEngineTrait,
     snark::{DigestHelperTrait, R1CSSNARKTrait, SpartanDigest},
     transcript::TranscriptEngineTrait,
@@ -647,6 +647,256 @@ impl<E: Engine> SpartanSNARK<E> {
     Ok(snark)
   }
 
+  /// Proves satisfiability using the pure-integer path (i32 coefficients, i8 witnesses).
+  ///
+  /// This is the fastest proving path:
+  /// - Witness generation: `SmallSatisfyingAssignment<i8>` — no field elements
+  /// - Mat-vec: `i32 × i8 → i32` conditional addition (no multiply)
+  /// - Outer sumcheck: `Vec<i32>` polynomials via `prove_cubic_small_value`
+  /// - Conversion to field at inner sumcheck boundary
+  ///
+  /// # Requirements
+  /// The circuit must implement both `SmallSpartanCircuit<E, i32>` (for shape)
+  /// and `SmallSpartanCircuit<E, i8>` (for witness generation).
+  /// The `pk` must have been set up with a matching `SplitR1CSShape<E, i32>`.
+  pub fn prove_int<C>(
+    S_int: &SplitR1CSShape<E, i32>,
+    pk: &SpartanProverKey<E>,
+    circuit: C,
+  ) -> Result<Self, SpartanError>
+  where
+    C: SmallSpartanCircuit<E, i32> + SmallSpartanCircuit<E, i8>,
+    E::Scalar: SmallValueField<i32>
+      + DelayedReduction<i32>
+      + DelayedReduction<i64>
+      + DelayedReduction<E::Scalar>,
+  {
+    use crate::bellpepper::r1cs::small_r1cs_instance_and_witness;
+
+    let (_prove_span, prove_t) = start_span!("spartan_snark_prove");
+
+    // Transcript setup: absorb vk and public values
+    let mut transcript = E::TE::new(b"SpartanSNARK");
+    transcript.absorb(b"vk", &pk.vk_digest);
+    let pub_i8: Vec<i8> =
+      <C as SmallSpartanCircuit<E, i8>>::public_values(&circuit).map_err(|e| {
+        SpartanError::SynthesisError {
+          reason: format!("prove_int: public_values: {e}"),
+        }
+      })?;
+    // Absorb as field elements (same as field path for transcript compatibility)
+    let pub_field: Vec<E::Scalar> = pub_i8
+      .iter()
+      .map(|&v| {
+        if v == 0 {
+          E::Scalar::ZERO
+        } else {
+          E::Scalar::ONE
+        }
+      })
+      .collect();
+    transcript.absorb(b"public_values", &pub_field.as_slice());
+
+    // Generate witness using SmallSatisfyingAssignment<i8>
+    // Sub-spans (precommitted_witness_synthesize, commit_witness_precommitted, commit_witness_rest)
+    // are emitted inside small_r1cs_instance_and_witness for timing breakdown.
+    let (U_i8, W_i8) =
+      small_r1cs_instance_and_witness::<E, C>(&circuit, S_int, &pk.ck, &mut transcript)?;
+
+    // Build z_i8 = [W | 1 | public_values | challenges_as_zero]
+    // Challenges are field-typed; we use 0i8 placeholders (challenges don't affect outer sumcheck
+    // since they're always absorbed from the transcript, not matrix-multiplied)
+    let challenges_i8 = vec![0i8; U_i8.challenges.len()];
+    let z_i8 = Self::build_z_small(&W_i8.W, &pub_i8, &challenges_i8);
+
+    let num_vars = S_int.num_shared + S_int.num_precommitted + S_int.num_rest;
+    let num_rounds_x =
+      usize::try_from(S_int.num_cons.ilog2()).expect("constraint count log2 fits in usize");
+
+    // Outer sumcheck preparation
+    let tau = (0..num_rounds_x)
+      .map(|_| transcript.squeeze(b"t"))
+      .collect::<Result<Vec<_>, SpartanError>>()?;
+
+    // Pure-integer mat-vec: i32 × i8 → i32
+    let (_mv_span, mv_t) = start_span!("matrix_vector_multiply");
+    let (Az_i32, Bz_i32, Cz_i32) = S_int.multiply_vec_int(&z_i8)?;
+
+    info!(
+      elapsed_ms = %mv_t.elapsed().as_millis(),
+      constraints = %S_int.num_cons,
+      vars = %num_vars,
+      "matrix_vector_multiply"
+    );
+
+    // Outer sumcheck with i32 polynomials
+    let (_sc_span, sc_t) = start_span!("outer_sumcheck");
+    let (sc_proof_outer, r_x, claims_outer) = prove_cubic_small_value::<E, i32, 3>(
+      &E::Scalar::ZERO,
+      tau,
+      &MultilinearPolynomial::new(Az_i32),
+      &MultilinearPolynomial::new(Bz_i32),
+      &MultilinearPolynomial::new(Cz_i32),
+      &mut transcript,
+    )?;
+
+    let (claim_Az, claim_Bz, claim_Cz): (E::Scalar, E::Scalar, E::Scalar) =
+      (claims_outer[0], claims_outer[1], claims_outer[2]);
+    transcript.absorb(b"claims_outer", &[claim_Az, claim_Bz, claim_Cz].as_slice());
+    info!(elapsed_ms = %sc_t.elapsed().as_millis(), "outer_sumcheck");
+
+    // Convert i8 witnesses → field elements for inner sumcheck and PCS
+    let W_field: Vec<E::Scalar> = W_i8
+      .W
+      .iter()
+      .map(|&v| {
+        if v == 0 {
+          E::Scalar::ZERO
+        } else {
+          E::Scalar::ONE
+        }
+      })
+      .collect();
+    let W_field_witness = R1CSWitness::<E> {
+      is_small: false,
+      W: W_field,
+      r_W: W_i8.r_W.clone(),
+    };
+
+    // Build field z for inner sumcheck
+    let z_field = {
+      let pub_field_ext: Vec<E::Scalar> = pub_i8
+        .iter()
+        .map(|&v| {
+          if v == 0 {
+            E::Scalar::ZERO
+          } else {
+            E::Scalar::ONE
+          }
+        })
+        .collect();
+      [
+        W_field_witness.W.clone(),
+        vec![E::Scalar::ONE],
+        pub_field_ext,
+        U_i8.challenges.clone(),
+      ]
+      .concat()
+    };
+
+    // Build field U for inner sumcheck
+    let U_field = SplitR1CSInstance::<E> {
+      comm_W_shared: U_i8.comm_W_shared.clone(),
+      comm_W_precommitted: U_i8.comm_W_precommitted.clone(),
+      comm_W_rest: U_i8.comm_W_rest.clone(),
+      public_values: pub_field,
+      challenges: U_i8.challenges.clone(),
+    };
+
+    // Inner sumcheck and PCS using i32 shape for faster evaluation
+    let snark = Self::prove_inner_and_pcs_int(
+      S_int,
+      pk,
+      U_field,
+      W_field_witness,
+      z_field,
+      r_x,
+      (claim_Az, claim_Bz, claim_Cz),
+      sc_proof_outer,
+      &mut transcript,
+    )?;
+
+    info!(elapsed_ms = %prove_t.elapsed().as_millis(), "spartan_snark_prove");
+    Ok(snark)
+  }
+
+  /// Inner sumcheck + PCS proof using the i32 shape for fast matrix evaluation.
+  #[allow(clippy::too_many_arguments)]
+  fn prove_inner_and_pcs_int(
+    S_int: &SplitR1CSShape<E, i32>,
+    pk: &SpartanProverKey<E>,
+    U: SplitR1CSInstance<E>,
+    W: R1CSWitness<E>,
+    mut z: Vec<E::Scalar>,
+    r_x: Vec<E::Scalar>,
+    claims_outer: (E::Scalar, E::Scalar, E::Scalar),
+    sc_proof_outer: SumcheckProof<E>,
+    transcript: &mut E::TE,
+  ) -> Result<Self, SpartanError>
+  where
+    E::Scalar: DelayedReduction<E::Scalar>,
+  {
+    let (claim_Az, claim_Bz, claim_Cz) = claims_outer;
+    let num_vars = S_int.num_shared + S_int.num_precommitted + S_int.num_rest;
+    let num_rounds_y = usize::try_from(num_vars.ilog2()).expect("num_vars log2 fits in usize") + 1;
+
+    let r = transcript.squeeze(b"r")?;
+    let claim_inner_joint = claim_Az + r * claim_Bz + r * r * claim_Cz;
+
+    let evals_rx = EqPolynomial::evals_from_points(&r_x);
+
+    // Use i32-optimized bind_row_vars (cheaper than field × field)
+    let (_sparse_span, sparse_t) = start_span!("compute_eval_table_sparse");
+    let poly_ABC = S_int.bind_row_vars_combined_int(&evals_rx, r);
+    info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
+
+    let poly_z = {
+      z.resize(num_vars * 2, E::Scalar::ZERO);
+      z
+    };
+
+    let (_sc2_span, sc2_t) = start_span!("inner_sumcheck");
+    let (sc_proof_inner, r_y, claims_inner) = SumcheckProof::prove_quad(
+      &claim_inner_joint,
+      num_rounds_y,
+      &mut MultilinearPolynomial::new(poly_ABC),
+      &mut MultilinearPolynomial::new(poly_z),
+      transcript,
+    )?;
+    let eval_Z = claims_inner[1];
+    info!(elapsed_ms = %sc2_t.elapsed().as_millis(), "inner_sumcheck");
+
+    let U_regular = U.to_regular_instance()?;
+    let eval_X = {
+      let X = vec![E::Scalar::ONE]
+        .into_iter()
+        .chain(U_regular.X.iter().cloned())
+        .collect::<Vec<E::Scalar>>();
+      SparsePolynomial::new(num_rounds_y - 1, X).evaluate(&r_y[1..])
+    };
+
+    let eval_W = (eval_Z - r_y[0] * eval_X)
+      * (E::Scalar::ONE - r_y[0])
+        .invert()
+        .expect("1 - r_y[0] is non-zero");
+
+    let (_pcs_span, pcs_t) = start_span!("pcs_prove");
+    let blind_eval_W = E::PCS::blind(&pk.ck_s, 1);
+    let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W, false)?;
+    let eval_arg = E::PCS::prove(
+      &pk.ck,
+      &pk.ck_s,
+      transcript,
+      &U_regular.comm_W,
+      &W.W,
+      &W.r_W,
+      &r_y[1..],
+      &comm_eval_W,
+      &blind_eval_W,
+    )?;
+    info!(elapsed_ms = %pcs_t.elapsed().as_millis(), "pcs_prove");
+
+    Ok(SpartanSNARK {
+      U,
+      sc_proof_outer,
+      claims_outer: (claim_Az, claim_Bz, claim_Cz),
+      sc_proof_inner,
+      eval_W,
+      blind_eval_W,
+      eval_arg,
+    })
+  }
+
   /// Extract the Az, Bz, Cz polynomials and tau challenges from a circuit.
   ///
   /// This is useful for testing sumcheck methods with real circuit-derived data.
@@ -986,5 +1236,50 @@ mod tests {
 
     assert_prove_and_verify(false, "prove_regular");
     assert_prove_and_verify(true, "prove_small");
+  }
+
+  // ─── prove_int tests ─────────────────────────────────────────────────────
+
+  #[test]
+  fn test_prove_int_sha256() {
+    let _ = tracing_subscriber::fmt()
+      .with_target(false)
+      .with_ansi(true)
+      .with_env_filter(EnvFilter::from_default_env())
+      .try_init();
+
+    type E = crate::provider::PallasHyraxEngine;
+    test_prove_int_sha256_with::<E>();
+  }
+
+  fn test_prove_int_sha256_with<E: Engine>()
+  where
+    E::Scalar: SmallValueField<i32>
+      + SmallValueField<i64>
+      + DelayedReduction<i32>
+      + DelayedReduction<i64>
+      + DelayedReduction<i128>
+      + DelayedReduction<E::Scalar>
+      + ff::PrimeFieldBits,
+  {
+    use crate::{bellpepper::r1cs::small_r1cs_shape, sha256_circuits::SmallSha256Circuit};
+
+    let preimage = b"hello world".to_vec();
+    let circuit = SmallSha256Circuit::<E::Scalar>::new(preimage.clone(), false);
+
+    // Extract i32 shape
+    let S_int = small_r1cs_shape::<E, _>(&circuit).expect("small_r1cs_shape");
+    assert!(S_int.num_cons > 0, "should have constraints");
+
+    // Setup using the field shape (for commitment key and verifier key)
+    let field_circuit = circuit.clone();
+    let (pk, vk) = SpartanSNARK::<E>::setup(field_circuit).expect("setup");
+
+    // prove_int
+    let snark = SpartanSNARK::<E>::prove_int(&S_int, &pk, circuit.clone()).expect("prove_int");
+
+    // verify using existing verifier
+    let result = snark.verify(&vk);
+    assert!(result.is_ok(), "verify failed: {:?}", result.err());
   }
 }
