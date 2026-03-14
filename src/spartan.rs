@@ -9,7 +9,7 @@
 use crate::{
   Blind, CommitmentKey, MULTIROUND_COMMITMENT_WIDTH,
   bellpepper::{
-    r1cs::{PrecommittedState, SpartanShape, SpartanWitness},
+    r1cs::{PrecommittedState, SmallPrepSNARK, SpartanShape, SpartanWitness},
     shape_cs::ShapeCS,
     solver::SatisfyingAssignment,
   },
@@ -40,13 +40,17 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 /// A type that represents the prover's key
+///
+/// The type parameter `V` controls the coefficient type of the R1CS matrices:
+/// - `V = E::Scalar` (default) — field-element coefficients (standard path)
+/// - `V = i32` — integer coefficients (small-value path)
 #[derive(Serialize, Deserialize)]
-#[serde(bound = "")]
-pub struct SpartanProverKey<E: Engine> {
-  ck: CommitmentKey<E>,
-  ck_s: CommitmentKey<E>,
-  S: SplitR1CSShape<E>,
-  vk_digest: SpartanDigest, // digest of the verifier's key
+#[serde(bound = "V: Serialize + for<'a> Deserialize<'a>")]
+pub struct SpartanProverKey<E: Engine, V = <E as Engine>::Scalar> {
+  pub(crate) ck: CommitmentKey<E>,
+  pub(crate) ck_s: CommitmentKey<E>,
+  pub(crate) S: SplitR1CSShape<E, V>,
+  pub(crate) vk_digest: SpartanDigest, // digest of the verifier's key
 }
 
 impl<E: Engine> SpartanProverKey<E> {
@@ -850,6 +854,372 @@ impl<E: Engine> SpartanSNARK<E> {
       &U_regular.comm_W,
       &W_field,
       &W_i8.r_W,
+      &r_y[1..],
+      &comm_eval_W,
+      &blind_eval_W,
+    )?;
+    info!(elapsed_ms = %pcs_t.elapsed().as_millis(), "pcs_prove");
+
+    info!(elapsed_ms = %prove_t.elapsed().as_millis(), "spartan_snark_prove");
+    Ok(SpartanSNARK {
+      U: U_field,
+      sc_proof_outer,
+      claims_outer: (claim_Az, claim_Bz, claim_Cz),
+      sc_proof_inner,
+      eval_W,
+      blind_eval_W,
+      eval_arg,
+    })
+  }
+
+  /// Sets up a prover key with i32 coefficient matrices for the small-value path.
+  ///
+  /// Caches the shape so that `prep_prove_small` and `prove_small_value` don't
+  /// need to re-synthesize it.
+  pub fn setup_small<C>(
+    circuit: &C,
+    vk: &SpartanVerifierKey<E>,
+  ) -> Result<SpartanProverKey<E, i32>, SpartanError>
+  where
+    C: SmallSpartanCircuit<E, i32>,
+  {
+    use crate::{DEFAULT_COMMITMENT_WIDTH, bellpepper::r1cs::small_r1cs_shape};
+
+    let S = small_r1cs_shape::<E, _>(circuit)?;
+    let num_vars = S.num_shared + S.num_precommitted + S.num_rest;
+    let (ck, _) = E::PCS::setup(b"ck", num_vars, DEFAULT_COMMITMENT_WIDTH);
+    let (ck_s, _) = E::PCS::setup(b"ck_s", 1, MULTIROUND_COMMITMENT_WIDTH);
+    Ok(SpartanProverKey {
+      ck,
+      ck_s,
+      S,
+      vk_digest: vk.digest()?,
+    })
+  }
+
+  /// Prepares the small-value SNARK: synthesizes witness (shared + precommitted)
+  /// and commits to those portions.
+  ///
+  /// Returns a `SmallPrepSNARK` that can be passed to `prove_small_value`.
+  pub fn prep_prove_small<C>(
+    pk: &SpartanProverKey<E, i32>,
+    circuit: &C,
+  ) -> Result<SmallPrepSNARK<E, i8>, SpartanError>
+  where
+    C: SmallSpartanCircuit<E, i8>,
+  {
+    use crate::{
+      PCS, bellpepper::r1cs::SmallPrepSNARK, small_constraint_system::SmallSatisfyingAssignment,
+    };
+
+    // Synthesis span — matches "precommitted_witness_synthesize" from field path
+    let (_synth_span, synth_t) = start_span!("precommitted_witness_synthesize");
+
+    let mut cs = SmallSatisfyingAssignment::<i8>::new();
+
+    let shared = circuit
+      .shared(&mut cs)
+      .map_err(|e| SpartanError::SynthesisError {
+        reason: format!("prep_prove_small: shared: {e}"),
+      })?;
+
+    let num_vars = pk.S.num_shared + pk.S.num_precommitted + pk.S.num_rest;
+    let mut witness = vec![0i8; num_vars];
+    let shared_copy = cs.aux_assignment.len().min(pk.S.num_shared_unpadded);
+    witness[..shared_copy].copy_from_slice(&cs.aux_assignment[..shared_copy]);
+
+    // Commit shared
+    let (comm_W_shared, r_W_shared) = if pk.S.num_shared_unpadded > 0 {
+      let r = PCS::<E>::blind(&pk.ck, pk.S.num_shared);
+      let comm = PCS::<E>::commit_i8(&pk.ck, &witness[..pk.S.num_shared], &r)?;
+      (Some(comm), Some(r))
+    } else {
+      (None, None)
+    };
+
+    let precommitted =
+      circuit
+        .precommitted(&mut cs, &shared)
+        .map_err(|e| SpartanError::SynthesisError {
+          reason: format!("prep_prove_small: precommitted: {e}"),
+        })?;
+
+    // Copy precommitted witness
+    let precommitted_start_aux = pk.S.num_shared_unpadded;
+    let precommitted_copy = (cs
+      .aux_assignment
+      .len()
+      .saturating_sub(precommitted_start_aux))
+    .min(pk.S.num_precommitted_unpadded);
+    let dst_start = pk.S.num_shared;
+    witness[dst_start..dst_start + precommitted_copy].copy_from_slice(
+      &cs.aux_assignment[precommitted_start_aux..precommitted_start_aux + precommitted_copy],
+    );
+
+    info!(elapsed_ms = %synth_t.elapsed().as_millis(), "precommitted_witness_synthesize");
+
+    // Commit precommitted
+    let (_commit_pre_span, commit_pre_t) = start_span!("commit_witness_precommitted");
+    let (comm_W_precommitted, r_W_precommitted) = if pk.S.num_precommitted_unpadded > 0 {
+      let r = PCS::<E>::blind(&pk.ck, pk.S.num_precommitted);
+      let comm = PCS::<E>::commit_i8(
+        &pk.ck,
+        &witness[pk.S.num_shared..pk.S.num_shared + pk.S.num_precommitted],
+        &r,
+      )?;
+      (Some(comm), Some(r))
+    } else {
+      (None, None)
+    };
+    info!(elapsed_ms = %commit_pre_t.elapsed().as_millis(), "commit_witness_precommitted");
+
+    Ok(SmallPrepSNARK {
+      cs,
+      shared,
+      precommitted,
+      comm_W_shared,
+      r_W_shared,
+      comm_W_precommitted,
+      r_W_precommitted,
+      W: witness,
+    })
+  }
+
+  /// Proves satisfiability using the prep/prove split for the pure-integer path.
+  ///
+  /// Takes a cached `SpartanProverKey<E, i32>` and a `SmallPrepSNARK<E, i8>` from
+  /// `prep_prove_small`, synthesizes the rest, commits, and runs mat-vec + sumcheck + PCS.
+  pub fn prove_small_value<C>(
+    pk: &SpartanProverKey<E, i32>,
+    circuit: C,
+    prep: &SmallPrepSNARK<E, i8>,
+  ) -> Result<Self, SpartanError>
+  where
+    C: SmallSpartanCircuit<E, i32> + SmallSpartanCircuit<E, i8>,
+    E::Scalar: SmallValueField<i32>
+      + DelayedReduction<i32>
+      + DelayedReduction<i64>
+      + DelayedReduction<E::Scalar>,
+  {
+    use crate::PCS;
+
+    let (_prove_span, prove_t) = start_span!("spartan_snark_prove");
+
+    // Transcript setup
+    let mut transcript = E::TE::new(b"SpartanSNARK");
+    transcript.absorb(b"vk", &pk.vk_digest);
+    let pub_i8: Vec<i8> =
+      <C as SmallSpartanCircuit<E, i8>>::public_values(&circuit).map_err(|e| {
+        SpartanError::SynthesisError {
+          reason: format!("prove_small_value: public_values: {e}"),
+        }
+      })?;
+    let pub_field: Vec<E::Scalar> = pub_i8
+      .iter()
+      .map(|&v| {
+        if v == 0 {
+          E::Scalar::ZERO
+        } else {
+          E::Scalar::ONE
+        }
+      })
+      .collect();
+    transcript.absorb(b"public_values", &pub_field.as_slice());
+
+    // Clone prep state so we can mutate it
+    let mut prep = prep.clone();
+
+    // Absorb shared/precommitted commitments
+    if let Some(ref comm) = prep.comm_W_shared {
+      transcript.absorb(b"comm_W_shared", comm);
+    }
+    if let Some(ref comm) = prep.comm_W_precommitted {
+      transcript.absorb(b"comm_W_precommitted", comm);
+    }
+
+    // Challenges
+    let challenges_field: Vec<E::Scalar> =
+      (0..<C as SmallSpartanCircuit<E, i8>>::num_challenges(&circuit))
+        .map(|_| transcript.squeeze(b"c"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Synthesize rest
+    let (_rest_span, rest_t) = start_span!("r1cs_instance_and_witness");
+    circuit
+      .synthesize(
+        &mut prep.cs,
+        &prep.shared,
+        &prep.precommitted,
+        Some(&challenges_field),
+      )
+      .map_err(|e| SpartanError::SynthesisError {
+        reason: format!("prove_small_value: synthesize: {e}"),
+      })?;
+
+    // Copy rest witness
+    let rest_start_aux = pk.S.num_shared_unpadded + pk.S.num_precommitted_unpadded;
+    let rest_copy =
+      (prep.cs.aux_assignment.len().saturating_sub(rest_start_aux)).min(pk.S.num_rest_unpadded);
+    let dst_rest = pk.S.num_shared + pk.S.num_precommitted;
+    prep.W[dst_rest..dst_rest + rest_copy]
+      .copy_from_slice(&prep.cs.aux_assignment[rest_start_aux..rest_start_aux + rest_copy]);
+    info!(elapsed_ms = %rest_t.elapsed().as_millis(), "r1cs_instance_and_witness");
+
+    // Commit rest
+    let (_commit_rest_span, commit_rest_t) = start_span!("commit_witness_rest");
+    let r_W_rest = PCS::<E>::blind(&pk.ck, pk.S.num_rest);
+    let comm_W_rest = PCS::<E>::commit_i8(
+      &pk.ck,
+      &prep.W[pk.S.num_shared + pk.S.num_precommitted..],
+      &r_W_rest,
+    )?;
+    info!(elapsed_ms = %commit_rest_t.elapsed().as_millis(), "commit_witness_rest");
+    transcript.absorb(b"comm_W_rest", &comm_W_rest);
+
+    // Combine blinds
+    let mut blinds = Vec::with_capacity(3);
+    if let Some(r) = &prep.r_W_shared {
+      blinds.push(r.clone());
+    }
+    if let Some(r) = &prep.r_W_precommitted {
+      blinds.push(r.clone());
+    }
+    blinds.push(r_W_rest);
+    let r_W = PCS::<E>::combine_blinds(&blinds)?;
+
+    // Build U_i8 instance
+    let U_i8 = SplitR1CSInstance::<E, i8> {
+      comm_W_shared: prep.comm_W_shared.clone(),
+      comm_W_precommitted: prep.comm_W_precommitted.clone(),
+      comm_W_rest: comm_W_rest.clone(),
+      public_values: pub_i8.clone(),
+      challenges: challenges_field,
+    };
+
+    // Build z_i8 for mat-vec
+    let challenges_i8 = vec![0i8; U_i8.challenges.len()];
+    let z_i8 = Self::build_z_small(&prep.W, &pub_i8, &challenges_i8);
+
+    let num_vars = pk.S.num_shared + pk.S.num_precommitted + pk.S.num_rest;
+    let num_rounds_x =
+      usize::try_from(pk.S.num_cons.ilog2()).expect("constraint count log2 fits in usize");
+
+    // Outer sumcheck preparation
+    let tau = (0..num_rounds_x)
+      .map(|_| transcript.squeeze(b"t"))
+      .collect::<Result<Vec<_>, SpartanError>>()?;
+
+    // Pure-integer mat-vec
+    let (_mv_span, mv_t) = start_span!("matrix_vector_multiply");
+    let (Az_i32, Bz_i32, Cz_i32) = pk.S.multiply_vec_int(&z_i8)?;
+    info!(
+      elapsed_ms = %mv_t.elapsed().as_millis(),
+      constraints = %pk.S.num_cons,
+      vars = %num_vars,
+      "matrix_vector_multiply"
+    );
+
+    // Outer sumcheck with i32 polynomials
+    let (_sc_span, sc_t) = start_span!("outer_sumcheck");
+    let (sc_proof_outer, r_x, claims_outer) = prove_cubic_small_value::<E, i32, 3>(
+      &E::Scalar::ZERO,
+      tau,
+      &MultilinearPolynomial::new(Az_i32),
+      &MultilinearPolynomial::new(Bz_i32),
+      &MultilinearPolynomial::new(Cz_i32),
+      &mut transcript,
+    )?;
+
+    let (claim_Az, claim_Bz, claim_Cz): (E::Scalar, E::Scalar, E::Scalar) =
+      (claims_outer[0], claims_outer[1], claims_outer[2]);
+    transcript.absorb(b"claims_outer", &[claim_Az, claim_Bz, claim_Cz].as_slice());
+    info!(elapsed_ms = %sc_t.elapsed().as_millis(), "outer_sumcheck");
+
+    // Inner sumcheck preparation
+    let num_rounds_y = usize::try_from(num_vars.ilog2()).expect("num_vars log2 fits in usize") + 1;
+
+    let r = transcript.squeeze(b"r")?;
+    let claim_inner_joint = claim_Az + r * claim_Bz + r * r * claim_Cz;
+
+    let (_eval_rx_span, eval_rx_t) = start_span!("compute_eval_rx");
+    let evals_rx = EqPolynomial::evals_from_points(&r_x);
+    info!(elapsed_ms = %eval_rx_t.elapsed().as_millis(), "compute_eval_rx");
+
+    let (_sparse_span, sparse_t) = start_span!("compute_eval_table_sparse");
+    let poly_ABC = pk.S.bind_row_vars_combined_int(&evals_rx, r);
+    info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
+
+    // Inner sumcheck
+    let (_sc2_span, sc2_t) = start_span!("inner_sumcheck");
+    let (sc_proof_inner, r_y, claims_inner) = if U_i8.challenges.is_empty() {
+      let mut z_bin = z_i8;
+      z_bin.resize(num_vars * 2, 0i8);
+      crate::small_sumcheck::prove_quad_with_binary_z::<E>(
+        &claim_inner_joint,
+        num_rounds_y,
+        &mut MultilinearPolynomial::new(poly_ABC),
+        &z_bin,
+        &mut transcript,
+      )?
+    } else {
+      let mut z_field = Self::build_z_field(&prep.W, &pub_i8, &U_i8.challenges);
+      z_field.resize(num_vars * 2, E::Scalar::ZERO);
+      SumcheckProof::prove_quad(
+        &claim_inner_joint,
+        num_rounds_y,
+        &mut MultilinearPolynomial::new(poly_ABC),
+        &mut MultilinearPolynomial::new(z_field),
+        &mut transcript,
+      )?
+    };
+    let eval_Z = claims_inner[1];
+    info!(elapsed_ms = %sc2_t.elapsed().as_millis(), "inner_sumcheck");
+
+    // Build field U for eval_X computation
+    let U_field = SplitR1CSInstance::<E> {
+      comm_W_shared: U_i8.comm_W_shared.clone(),
+      comm_W_precommitted: U_i8.comm_W_precommitted.clone(),
+      comm_W_rest: U_i8.comm_W_rest.clone(),
+      public_values: pub_field,
+      challenges: U_i8.challenges.clone(),
+    };
+    let U_regular = U_field.to_regular_instance()?;
+    let eval_X = {
+      let X = vec![E::Scalar::ONE]
+        .into_iter()
+        .chain(U_regular.X.iter().cloned())
+        .collect::<Vec<E::Scalar>>();
+      SparsePolynomial::new(num_rounds_y - 1, X).evaluate(&r_y[1..])
+    };
+
+    let eval_W = (eval_Z - r_y[0] * eval_X)
+      * (E::Scalar::ONE - r_y[0])
+        .invert()
+        .expect("1 - r_y[0] is non-zero");
+
+    // PCS
+    let (_pcs_span, pcs_t) = start_span!("pcs_prove");
+    let W_field: Vec<E::Scalar> = prep
+      .W
+      .iter()
+      .map(|&v| {
+        if v == 0 {
+          E::Scalar::ZERO
+        } else {
+          E::Scalar::ONE
+        }
+      })
+      .collect();
+
+    let blind_eval_W = E::PCS::blind(&pk.ck_s, 1);
+    let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W, false)?;
+    let eval_arg = E::PCS::prove(
+      &pk.ck,
+      &pk.ck_s,
+      &mut transcript,
+      &U_regular.comm_W,
+      &W_field,
+      &r_W,
       &r_y[1..],
       &comm_eval_W,
       &blind_eval_W,

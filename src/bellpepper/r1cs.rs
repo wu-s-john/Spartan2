@@ -441,6 +441,23 @@ where
   Ok((U, W))
 }
 
+/// A type that holds the pre-processed state for proving with the small-value (integer) path.
+///
+/// Contains the witness assignment, partial commitments, and the full witness vector.
+/// The type parameter `W` controls the witness value type (e.g., `i8` for binary witnesses).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SmallPrepSNARK<E: Engine, W> {
+  pub(crate) cs: crate::small_constraint_system::SmallSatisfyingAssignment<W>,
+  pub(crate) shared: Vec<bellpepper_core::Variable>,
+  pub(crate) precommitted: Vec<bellpepper_core::Variable>,
+  pub(crate) comm_W_shared: Option<Commitment<E>>,
+  pub(crate) r_W_shared: Option<Blind<E>>,
+  pub(crate) comm_W_precommitted: Option<Commitment<E>>,
+  pub(crate) r_W_precommitted: Option<Blind<E>>,
+  pub(crate) W: Vec<W>,
+}
+
 pub(crate) fn add_constraint<S: PrimeField>(
   X: &mut (
     &mut SparseMatrix<S>,

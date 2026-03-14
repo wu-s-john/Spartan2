@@ -165,6 +165,53 @@ fn run_benchmark<E: Engine>(
       );
     }
 
+    // prep_int path: setup_small + prep_prove_small + prove_small_value
+    let mut prep_int_timings = HashMap::new();
+    {
+      let _mode_span = info_span!("mode", mode = "prep_int").entered();
+      info!("--- prep_int (setup_small + prep/prove split) ---");
+
+      clear_timings(timing_data);
+
+      // Setup small (once, cached)
+      let t0 = Instant::now();
+      let pk_small = SpartanSNARK::<E>::setup_small(&circuit, &vk).expect("setup_small failed");
+      let setup_small_ms = t0.elapsed().as_millis() as u64;
+      info!(elapsed_ms = setup_small_ms, "setup_small");
+
+      // Prep: witness gen (shared + precommitted) + commit
+      let t0 = Instant::now();
+      let prep = SpartanSNARK::<E>::prep_prove_small(&pk_small, &circuit).expect("prep_prove_small failed");
+      let prep_ms = t0.elapsed().as_millis() as u64;
+      info!(elapsed_ms = prep_ms, "prep_prove_small");
+
+      // Prove: synthesize rest + commit + sumcheck + PCS
+      let t0 = Instant::now();
+      let proof = SpartanSNARK::<E>::prove_small_value(&pk_small, circuit.clone(), &prep)
+        .expect("prove_small_value failed");
+      let prove_ms = t0.elapsed().as_millis() as u64;
+      info!(elapsed_ms = prove_ms, "prove_small_value");
+
+      // Inject wall-clock prep/prove times
+      {
+        let mut map = timing_data.lock().unwrap();
+        map.insert("__prep__".to_string(), prep_ms);
+        map.insert("__prove__".to_string(), prove_ms);
+      }
+
+      prep_int_timings = snapshot_timings(timing_data, SPARTAN_PHASES);
+
+      let t0 = Instant::now();
+      proof.verify(&vk).expect("verify prep_int errored");
+      let verify_ms = t0.elapsed().as_millis();
+      info!(elapsed_ms = verify_ms, "verify_prep_int");
+
+      info!(
+        "SUMMARY msg={}B, prep_int, setup_small={} ms, prep={} ms, prove={} ms, verify={} ms",
+        msg_len, setup_small_ms, prep_ms, prove_ms, verify_ms
+      );
+    }
+
     // Print comparison table
     let constraints = constraints_data.lock().unwrap().take();
     let header = match constraints {
@@ -173,6 +220,7 @@ fn run_benchmark<E: Engine>(
     };
     print_table(&header, SPARTAN_PHASES, &small_timings, &large_timings);
     print_table(&format!("{} [int vs large]", header), SPARTAN_PHASES, &int_timings, &large_timings);
+    print_table(&format!("{} [prep_int vs large]", header), SPARTAN_PHASES, &prep_int_timings, &large_timings);
 
     drop(root_span);
   }

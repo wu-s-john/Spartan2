@@ -710,6 +710,24 @@ pub struct SplitR1CSShape<E: Engine, V = <E as Engine>::Scalar> {
 
 impl<E: Engine, V: Serialize> SimpleDigestible for SplitR1CSShape<E, V> {}
 
+impl<E: Engine, V> SplitR1CSShape<E, V> {
+  /// Returns sizes associated with the SplitR1CSShape.
+  pub fn sizes(&self) -> [usize; 10] {
+    [
+      self.num_cons_unpadded,
+      self.num_shared_unpadded,
+      self.num_precommitted_unpadded,
+      self.num_rest_unpadded,
+      self.num_cons,
+      self.num_shared,
+      self.num_precommitted,
+      self.num_rest,
+      self.num_public,
+      self.num_challenges,
+    ]
+  }
+}
+
 /// A type that holds a split R1CS instance
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound = "V: Serialize + for<'a> Deserialize<'a>")]
@@ -894,41 +912,6 @@ impl<E: Engine> SplitR1CSShape<E> {
       C: self.C.clone(),
       digest: OnceCell::new(),
     }
-  }
-
-  /// Returns statistics about the shape of the R1CS matrices.
-  ///
-  /// This function returns an array of 10 elements, where each element represents a specific
-  /// statistic about the R1CS matrices. The elements are as follows:
-  /// - `num_cons_unpadded`: The number of constraints in the unpadded R1CS matrix.
-  /// - `num_shared_unpadded`: The number of shared variables in the unpadded R1CS matrix.
-  /// - `num_precommitted_unpadded`: The number of precommitted variables in the unpadded R1CS matrix.
-  /// - `num_rest_unpadded`: The number of remaining variables in the unpadded R1CS matrix.
-  /// - `num_cons`: The number of constraints in the padded R1CS matrix.
-  /// - `num_shared`: The number of shared variables in the padded R1CS matrix.
-  /// - `num_precommitted`: The number of precommitted variables in the padded R1CS matrix.
-  /// - `num_rest`: The number of remaining variables in the padded R1CS matrix.
-  /// - `num_public`: The number of public inputs/outputs in the R1CS matrix.
-  /// - `num_challenges`: The number of challenges in the R1CS matrix.
-  ///
-  /// The terms "unpadded" and "padded" refer to the state of the R1CS matrices:
-  /// - "Unpadded" values represent the original dimensions of the matrices before any padding
-  ///   is applied to meet alignment or size requirements.
-  /// - "Padded" values represent the dimensions of the matrices after padding has been applied.
-  ///
-  pub fn sizes(&self) -> [usize; 10] {
-    [
-      self.num_cons_unpadded,
-      self.num_shared_unpadded,
-      self.num_precommitted_unpadded,
-      self.num_rest_unpadded,
-      self.num_cons,
-      self.num_shared,
-      self.num_precommitted,
-      self.num_rest,
-      self.num_public,
-      self.num_challenges,
-    ]
   }
 
   /// Generates public parameters for a Rank-1 Constraint System (R1CS).
