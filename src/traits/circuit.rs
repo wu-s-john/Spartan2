@@ -5,7 +5,7 @@
 // Source repository: https://github.com/Microsoft/Spartan2
 
 //! This module defines traits that a circuit provider must implement to be used with Spartan.
-use crate::traits::Engine;
+use crate::{small_constraint_system::SmallConstraintSystem, traits::Engine};
 use bellpepper_core::{ConstraintSystem, SynthesisError, num::AllocatedNum};
 
 /// A helper trait for defining a randomized circuit that Spartan proves.
@@ -66,13 +66,13 @@ pub trait SmallSpartanCircuit<E: Engine, V>: Send + Sync + Clone {
   fn public_values(&self) -> Result<Vec<V>, bellpepper_core::SynthesisError>;
 
   /// Allocates shared variables in the constraint system.
-  fn shared<CS: crate::small_constraint_system::SmallConstraintSystem<V>>(
+  fn shared<CS: SmallConstraintSystem<V>>(
     &self,
     cs: &mut CS,
   ) -> Result<Vec<bellpepper_core::Variable>, bellpepper_core::SynthesisError>;
 
   /// Allocates precommitted variables.
-  fn precommitted<CS: crate::small_constraint_system::SmallConstraintSystem<V>>(
+  fn precommitted<CS: SmallConstraintSystem<V>>(
     &self,
     cs: &mut CS,
     shared: &[bellpepper_core::Variable],
@@ -84,7 +84,7 @@ pub trait SmallSpartanCircuit<E: Engine, V>: Send + Sync + Clone {
   /// Allocates remaining variables and constraints.
   ///
   /// `challenges` remain field-typed since they come from the transcript.
-  fn synthesize<CS: crate::small_constraint_system::SmallConstraintSystem<V>>(
+  fn synthesize<CS: SmallConstraintSystem<V>>(
     &self,
     cs: &mut CS,
     shared: &[bellpepper_core::Variable],

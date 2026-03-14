@@ -63,6 +63,14 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
     is_small: bool,
   ) -> Result<Self::Commitment, SpartanError>;
 
+  /// Commits to a vector of signed small integers (e.g. i8 witnesses in {-1, 0, 1, 2})
+  /// without converting to field elements first.
+  fn commit_i8(
+    ck: &Self::CommitmentKey,
+    v: &[i8],
+    r: &Self::Blind,
+  ) -> Result<Self::Commitment, SpartanError>;
+
   /// Checks if the provided commitment commits to a vector of the specified length
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError>;
 

@@ -429,6 +429,96 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
   }
 }
 
+/// Multi-scalar multiplication for signed small scalars (e.g. {-1, 0, 1, 2}).
+///
+/// Uses separate positive/negative bucket accumulators with summation-by-parts.
+/// For witnesses in {-1, 0, 1, 2}, this uses only 3 buckets total.
+///
+/// # Errors
+/// Returns `SpartanError::InvalidInputLength` if bases and scalars have different lengths.
+pub fn msm_signed_small<C: CurveAffine>(
+  scalars: &[i8],
+  bases: &[C],
+  use_parallelism_internally: bool,
+) -> Result<C::Curve, SpartanError> {
+  if bases.len() != scalars.len() {
+    return Err(SpartanError::InvalidInputLength {
+      reason: "MSM Signed Small: Coefficients and bases must have the same length".to_string(),
+    });
+  }
+
+  if scalars.is_empty() {
+    return Ok(C::Curve::identity());
+  }
+
+  let num_threads = if use_parallelism_internally {
+    current_num_threads()
+  } else {
+    1
+  };
+
+  if scalars.len() > num_threads {
+    let chunk_size = scalars.len() / num_threads;
+    Ok(
+      scalars
+        .par_chunks(chunk_size)
+        .zip(bases.par_chunks(chunk_size))
+        .map(|(s, b)| msm_signed_small_serial(s, b))
+        .reduce(C::Curve::identity, |sum, evl| sum + evl),
+    )
+  } else {
+    Ok(msm_signed_small_serial(scalars, bases))
+  }
+}
+
+fn msm_signed_small_serial<C: CurveAffine>(scalars: &[i8], bases: &[C]) -> C::Curve {
+  let mut max_pos: i8 = 0;
+  let mut max_neg: i8 = 0;
+  for &s in scalars {
+    if s > max_pos {
+      max_pos = s;
+    } else if s < max_neg {
+      max_neg = s;
+    }
+  }
+
+  if max_pos == 0 && max_neg == 0 {
+    return C::Curve::identity();
+  }
+
+  let num_pos_buckets = max_pos as usize;
+  let num_neg_buckets = (-max_neg) as usize;
+
+  let mut pos_buckets = vec![Bucket::<C>::None; num_pos_buckets];
+  let mut neg_buckets = vec![Bucket::<C>::None; num_neg_buckets];
+
+  for (&scalar, base) in scalars.iter().zip(bases.iter()) {
+    if scalar > 0 {
+      pos_buckets[(scalar - 1) as usize].add_assign(base);
+    } else if scalar < 0 {
+      neg_buckets[(-scalar - 1) as usize].add_assign(base);
+    }
+  }
+
+  // Summation-by-parts for positive buckets
+  let mut pos_sum = C::Curve::identity();
+  let mut running_sum = C::Curve::identity();
+  for bucket in pos_buckets.into_iter().rev() {
+    running_sum = bucket.add(running_sum);
+    pos_sum += &running_sum;
+  }
+
+  // Summation-by-parts for negative buckets
+  let mut neg_sum = C::Curve::identity();
+  running_sum = C::Curve::identity();
+  for bucket in neg_buckets.into_iter().rev() {
+    running_sum = bucket.add(running_sum);
+    neg_sum += &running_sum;
+  }
+
+  pos_sum - neg_sum
+}
+
 #[inline(always)]
 fn compute_ln(a: usize) -> usize {
   // log2(a) * ln(2)
@@ -503,5 +593,59 @@ mod tests {
   fn test_msm_ux() {
     test_msm_ux_with::<pallas::Scalar, pallas::Affine>();
     test_msm_ux_with::<vesta::Scalar, vesta::Affine>();
+  }
+
+  fn test_msm_signed_small_with<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
+    let n = 64;
+    let bases = (0..n)
+      .map(|_| A::from(A::generator() * F::random(OsRng)))
+      .collect::<Vec<_>>();
+
+    // Test {-1, 0, 1, 2} scalars
+    let scalars: Vec<i8> = (0..n).map(|i| (i % 4) as i8 - 1).collect(); // -1, 0, 1, 2, -1, 0, ...
+
+    let naive = scalars
+      .iter()
+      .zip(bases.iter())
+      .fold(A::CurveExt::identity(), |acc, (&s, base)| {
+        if s == 0 {
+          acc
+        } else if s > 0 {
+          acc + *base * F::from(s as u64)
+        } else {
+          acc - *base * F::from((-s) as u64)
+        }
+      });
+
+    let result = msm_signed_small(&scalars, &bases, false).unwrap();
+    assert_eq!(naive, result);
+
+    // Also test with parallelism
+    let result_par = msm_signed_small(&scalars, &bases, true).unwrap();
+    assert_eq!(naive, result_par);
+
+    // Test all zeros
+    let zeros = vec![0i8; n];
+    assert_eq!(
+      msm_signed_small(&zeros, &bases, false).unwrap(),
+      A::CurveExt::identity()
+    );
+
+    // Test all positive
+    let pos = vec![1i8; n];
+    let naive_pos = bases
+      .iter()
+      .fold(A::CurveExt::identity(), |acc, base| acc + base);
+    assert_eq!(msm_signed_small(&pos, &bases, false).unwrap(), naive_pos);
+
+    // Test all negative
+    let neg = vec![-1i8; n];
+    assert_eq!(msm_signed_small(&neg, &bases, false).unwrap(), -naive_pos);
+  }
+
+  #[test]
+  fn test_msm_signed_small() {
+    test_msm_signed_small_with::<pallas::Scalar, pallas::Affine>();
+    test_msm_signed_small_with::<vesta::Scalar, vesta::Affine>();
   }
 }

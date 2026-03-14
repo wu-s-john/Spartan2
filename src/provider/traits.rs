@@ -140,6 +140,13 @@ pub trait DlogGroupExt: DlogGroup {
       .map(|scalar| Self::vartime_multiscalar_mul_small(scalar, &bases[..scalar.len()], false))
       .collect::<Result<Vec<_>, _>>()
   }
+
+  /// A method to compute a multiexponentation with signed small scalars (e.g. {-1, 0, 1, 2})
+  fn vartime_multiscalar_mul_signed_small(
+    scalars: &[i8],
+    bases: &[Self::AffineGroupElement],
+    use_parallelism_internally: bool,
+  ) -> Result<Self, SpartanError>;
 }
 
 /// Implements Spartan's traits except DlogGroupExt so that the MSM can be implemented differently
@@ -310,6 +317,14 @@ macro_rules! impl_traits {
         use_parallelism_internally: bool,
       ) -> Result<Self, $crate::errors::SpartanError> {
         msm_small(scalars, bases, use_parallelism_internally)
+      }
+
+      fn vartime_multiscalar_mul_signed_small(
+        scalars: &[i8],
+        bases: &[Self::AffineGroupElement],
+        use_parallelism_internally: bool,
+      ) -> Result<Self, $crate::errors::SpartanError> {
+        msm_signed_small(scalars, bases, use_parallelism_internally)
       }
     }
   };

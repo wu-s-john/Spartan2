@@ -173,6 +173,38 @@ where
     Ok(HyraxCommitment { comm })
   }
 
+  fn commit_i8(
+    ck: &Self::CommitmentKey,
+    v: &[i8],
+    r: &Self::Blind,
+  ) -> Result<Self::Commitment, SpartanError> {
+    let n = v.len();
+    let num_cols = ck.num_cols;
+    let num_rows = div_ceil(n, num_cols);
+
+    let comm = (0..num_rows)
+      .into_par_iter()
+      .map(|i| {
+        let upper = i.saturating_mul(num_cols).saturating_add(num_cols);
+        let lower = i.saturating_mul(num_cols);
+        let scalars = if upper > n {
+          &v[lower..]
+        } else {
+          &v[lower..upper]
+        };
+
+        let msm_result = E::GE::vartime_multiscalar_mul_signed_small(
+          scalars,
+          &ck.ck[..scalars.len()],
+          false,
+        )?;
+        Ok(msm_result + ck.h * r.blind[i])
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(HyraxCommitment { comm })
+  }
+
   fn rerandomize_commitment(
     ck: &Self::CommitmentKey,
     comm: &Self::Commitment,
