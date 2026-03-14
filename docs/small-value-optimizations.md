@@ -2,97 +2,78 @@
 
 ## Status
 
-The end-to-end i32/i8 pipeline (`prove_int`) is working and produces valid proofs.
+The end-to-end i32/i8 pipeline is working with two APIs:
+- **`prove_int`**: monolithic (shape + witness + prove in one call)
+- **`prove_small_value`**: prep/prove split via `setup_small` + `prep_prove_small` + `prove_small_value`
+
 Current benchmark at 128B message (262K constraints):
 
 ```
                  synth_pre  commit_pre  r1cs_rest  commit_rest  mat_vec  outer_sc  eval_rx  eval_sparse  inner_sc  pcs   prep   prove   total
-int                    6         3         0          1          0        5         0         9           5        10     24      47      39
-large                 35         3         1          0          2       11         1         8           6        11     38      43      78
-speedup             5.8×      1.0×         -        0.0×          -     2.2×         -      0.9×        1.2×     1.1×   1.6×    0.9×    2.0×
+prep_int              7          3          0          0          0        5         2           6          3       10    10     30     36
+int                   7          3          0          0          0        4         1          10          3       10    23     44     38
+large                38          3          1          0          2       11         1           7          4       10    41     40     77
+prep_int speedup   5.4×      1.0×          -          -          -     2.2×      0.5×        1.2×       1.3×    1.0×  4.1×   1.3×   2.1×
 ```
 
-At 1024B message (1M constraints):
+**Overall speedup: ~2.1×.** The prep/prove split (`prep_int`) moves shape extraction to
+a one-time `setup_small` cost (25ms), giving 4.1× faster prep.
 
-```
-                 synth_pre  commit_pre  r1cs_rest  commit_rest  mat_vec  outer_sc  eval_rx  eval_sparse  inner_sc  pcs   prep   prove   total
-int                   49        25         0         13          2       16         0        59           26       14    166     234     204
-large                234        18        12          9         16       38         6        50           26       14    258     182     432
-speedup             4.8×      0.7×         -        0.7×       8.0×    2.4×         -      0.8×         1.0×     1.0×   1.6×    0.8×    2.1×
-```
-
-**Overall speedup: ~2×.** Goal: ≥2.5× (ideally 3×+).
+Goal: ≥2.5× (ideally 3×+).
 
 ---
 
-## Redundant i8 → Field Conversions
+## Remaining i8 → Field Conversions in `prove_small_value`
 
-The witness vector is currently converted from `Vec<i8>` to `Vec<E::Scalar>` multiple times.
-Each conversion allocates a new `Vec<E::Scalar>` (32 bytes per element vs 1 byte for i8).
-At 1M constraints, that's ~32MB per conversion.
+Three places in `prove_small_value` (spartan.rs) still convert i8 to field elements.
+Only one is a bulk conversion; the other two are small or reuse already-converted data.
 
-### Conversion #1-3: For PCS commits (bellpepper/r1cs.rs)
-
-In `small_r1cs_instance_and_witness`, three `to_field()` calls convert witness slices for commits:
+### Conversion #1: pub_i8 → pub_field for transcript (small, unavoidable)
 
 ```rust
-// Line ~374: shared portion
-let field = to_field(&W_i8[..S.num_shared]);
-let comm = PCS::<E>::commit(ck, &field, &r, true)?;
-
-// Line ~385: precommitted portion
-let field = to_field(&W_i8[S.num_shared..S.num_shared + S.num_precommitted]);
-let comm = PCS::<E>::commit(ck, &field, &r, true)?;
-
-// Line ~396: rest portion
-let field_rest = to_field(&W_i8[S.num_shared + S.num_precommitted..]);
-let comm_W_rest = PCS::<E>::commit(ck, &field_rest, &r_W_rest, true)?;
-```
-
-**Fix:** Add `PCS::commit_bits` that accepts `&[i8]` directly.
-Since witnesses are 0/1, the MSM can skip the scalar multiplication for 0-entries and use
-the generator directly for 1-entries: `if bit { acc += generator[i]; }`.
-This avoids both the conversion AND the expensive scalar-multiply in the MSM.
-
-### Conversion #4: Public values for transcript (spartan.rs)
-
-```rust
-// Line ~690
 let pub_field: Vec<E::Scalar> = pub_i8.iter()
     .map(|&v| if v == 0 { E::Scalar::ZERO } else { E::Scalar::ONE })
     .collect();
 transcript.absorb(b"public_values", &pub_field.as_slice());
 ```
 
-**Fix:** Add `transcript.absorb_bits` or absorb the i8 bytes directly.
-Public values are tiny (32 bytes for SHA-256 hash output), so this is low priority.
+Required for transcript compatibility with the verifier, which absorbs field elements.
+Only `num_public` elements (32 for SHA-256 hash output). Low priority to optimize.
 
-### Conversion #5: Entire witness for inner sumcheck + PCS (spartan.rs)
+### Conversion #2: W_i8 → W_field for PCS prove (bulk, unavoidable with current PCS)
 
 ```rust
-// Lines ~742-767: convert FULL witness Vec<i8> → Vec<E::Scalar>
-let W_field: Vec<E::Scalar> = W_i8.W.iter()
+let W_field: Vec<E::Scalar> = prep.W.iter()
     .map(|&v| if v == 0 { E::Scalar::ZERO } else { E::Scalar::ONE })
     .collect();
-
-// Then CLONE it into z_field (another full allocation)
-let z_field = [W_field_witness.W.clone(), vec![E::Scalar::ONE], ...].concat();
 ```
 
-This is the most expensive conversion — two full-size `Vec<E::Scalar>` allocations.
+**This is the only bulk conversion** — converts the entire witness (131K elements at 128B)
+to field elements for `E::PCS::prove()`. The Hyrax evaluation argument
+(`hyrax_prove_bind` + `hyrax_prove_commit` + `hyrax_prove_ipa`) needs the polynomial as
+field elements because it does L·Z matrix-vector multiply and IPA with field scalars.
 
-**Fix:** Build `z_field` once, in-place, without the intermediate `W_field`:
+The commitment itself is already optimized with `commit_i8` (subset-sum of generators).
+This conversion is only for the *evaluation proof*, which is separate from the commitment.
+
+**Fix:** Add a `PCS::prove_binary` that accepts `&[i8]` and does the IPA inner products
+with conditional addition instead of scalar multiplication. Same idea as `commit_i8` but
+for the evaluation argument path.
+
+### Conversion #3: U_field construction for eval_X (small, reuses pub_field)
+
 ```rust
-let mut z_field = vec![E::Scalar::ZERO; num_vars * 2];
-for (i, &v) in W_i8.W.iter().enumerate() {
-    if v != 0 { z_field[i] = E::Scalar::ONE; }
-}
-z_field[num_vars] = E::Scalar::ONE; // the "1" separator
-// copy public values and challenges into their positions
+let U_field = SplitR1CSInstance::<E> { ..., public_values: pub_field, ... };
+let U_regular = U_field.to_regular_instance()?;
 ```
 
-If conversion #1-3 is fixed with `commit_bits`, the `W_field` for PCS prove can also
-use the in-place `z_field` slice instead of a separate allocation.
+Reuses the already-converted `pub_field` from conversion #1. No additional allocation.
+
+### PCS commits (already optimized)
+
+The three witness portion commits (shared, precommitted, rest) use `PCS::commit_i8`
+which does subset-sum of generators directly from `&[i8]` — no field conversion needed.
+This was the previous conversion #1-3 bottleneck, now eliminated.
 
 ---
 
@@ -123,14 +104,13 @@ conditional point-addition should be ~4-8× faster for the commit step.
 
 ---
 
-## Shape extraction caching
+## Shape extraction caching (DONE)
 
-`small_r1cs_shape` (24ms at 128B, 166ms at 1024B) re-runs the full SHA-256 circuit
-through `SmallShapeCS` every time. The shape only depends on the circuit structure
-(message length), not the witness values.
+`setup_small` now caches the `SplitR1CSShape<E, i32>` in `SpartanProverKey<E, i32>`,
+computed once during setup. This moves shape extraction from per-proof to per-circuit cost.
 
-**Fix:** Cache the `SplitR1CSShape<E, i32>` in the prover key or compute it once during setup.
-This moves shape extraction from per-proof to per-circuit cost.
+At 128B: `setup_small` = 25ms (one-time), eliminates 22ms per proof from `prove_int`'s
+shape re-extraction. The prep phase drops from 23ms → 10ms (4.1× faster).
 
 ---
 
@@ -166,9 +146,8 @@ sequential dependency between blocks). Gadget-level could go further but is more
 
 ## Priority Order
 
-1. **Conversion #5** (high impact, easy): eliminate redundant allocation in prove_int
-2. **Conversion #1-3** (high impact, moderate): `commit_bits` for binary witnesses
-3. **Shape caching** (moderate impact, easy): compute i32 shape once during setup
-4. **Parallel witness synthesis** (high impact, moderate): multi-threaded i8 witness gen
-5. **eval_sparse batching** (moderate impact, moderate): coefficient-grouped accumulation
-6. **Conversion #4** (low impact, easy): absorb bits directly in transcript
+1. ~~**Shape caching** (DONE): `setup_small` caches i32 shape in prover key~~
+2. **PCS prove_binary** (high impact, moderate): `PCS::prove_binary(&[i8])` for evaluation argument — eliminates the only bulk i8→field conversion remaining
+3. **Parallel witness synthesis** (high impact, moderate): multi-threaded i8 witness gen
+4. **eval_sparse batching** (moderate impact, moderate): coefficient-grouped accumulation
+5. **Transcript absorb_bits** (low impact, easy): absorb i8 public values directly

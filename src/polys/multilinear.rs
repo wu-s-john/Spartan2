@@ -102,6 +102,40 @@ impl<T: Field> MultilinearPolynomial<T> {
   }
 }
 
+impl<T: PrimeField> MultilinearPolynomial<T> {
+  /// Binds the polynomial's top variables where the polynomial coefficients are i8.
+  /// Uses conditional add/sub instead of field multiply for small values.
+  pub fn bind_with_i8(poly: &[i8], l: &[T], r_len: usize) -> Vec<T> {
+    assert_eq!(
+      poly.len(),
+      l.len() * r_len,
+      "poly length ({}) must equal L.len() * r_len ({} * {}) = {}",
+      poly.len(),
+      l.len(),
+      r_len,
+      l.len() * r_len
+    );
+
+    (0..r_len)
+      .into_par_iter()
+      .map(|i| {
+        let mut acc = T::ZERO;
+        for j in 0..l.len() {
+          let v = poly[j * r_len + i];
+          match v {
+            0 => {}
+            1 => acc += l[j],
+            -1 => acc -= l[j],
+            v if v > 0 => acc += l[j] * T::from(v as u64),
+            v => acc -= l[j] * T::from((-v) as u64),
+          }
+        }
+        acc
+      })
+      .collect()
+  }
+}
+
 // ============================================================================
 // Small-value polynomial operations (MultilinearPolynomial<i32>)
 // ============================================================================

@@ -349,6 +349,91 @@ where
     Ok(HyraxEvaluationArgument { ipa })
   }
 
+  fn prove_i8(
+    ck: &Self::CommitmentKey,
+    ck_eval: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    comm: &Self::Commitment,
+    poly: &[i8],
+    blind: &Self::Blind,
+    point: &[E::Scalar],
+    comm_eval: &Self::Commitment,
+    blind_eval: &Self::Blind,
+  ) -> Result<Self::EvaluationArgument, SpartanError> {
+    let n = poly.len();
+    let (_setup_span, setup_t) = start_span!("hyrax_prove_i8_prep");
+    if n != (2usize).pow(point.len() as u32) {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!(
+          "Hyrax prove_i8: Expected {} elements in poly, got {}",
+          (2_usize).pow(point.len() as u32),
+          n
+        ),
+      });
+    }
+
+    transcript.absorb(b"poly_com", comm);
+
+    let num_cols = ck.num_cols;
+    let num_rows = div_ceil(n, num_cols);
+
+    let (num_vars_rows, _) = (num_rows.log_2(), num_cols.log_2());
+
+    let (comm_LZ, R, LZ, r_LZ) = if num_vars_rows == 0 {
+      let comm_LZ = comm.comm[0];
+      let R = EqPolynomial::new(point.to_vec()).evals();
+      let LZ: Vec<E::Scalar> = poly.iter().map(|&v| match v {
+        0 => E::Scalar::ZERO,
+        1 => E::Scalar::ONE,
+        v if v > 0 => E::Scalar::from(v as u64),
+        v => -E::Scalar::from((-v) as u64),
+      }).collect();
+      let r_LZ = blind.blind[0];
+
+      (comm_LZ, R, LZ, r_LZ)
+    } else {
+      let (L, R) = rayon::join(
+        || EqPolynomial::new(point[..num_vars_rows].to_vec()).evals(),
+        || EqPolynomial::new(point[num_vars_rows..].to_vec()).evals(),
+      );
+
+      info!(elapsed_ms = %setup_t.elapsed().as_millis(), "hyrax_prove_i8_prep");
+
+      let (_bind_span, bind_t) = start_span!("hyrax_prove_i8_bind");
+      let LZ = MultilinearPolynomial::bind_with_i8(poly, &L, R.len());
+      info!(elapsed_ms = %bind_t.elapsed().as_millis(), "hyrax_prove_i8_bind");
+
+      let (_commit_span, commit_t) = start_span!("hyrax_prove_i8_commit");
+
+      let r_LZ = (0..L.len())
+        .into_par_iter()
+        .map(|i| L[i] * blind.blind[i])
+        .reduce(|| E::Scalar::ZERO, |acc, x| acc + x);
+      let comm_LZ = E::GE::vartime_multiscalar_mul(&LZ, &ck.ck[..LZ.len()], true)? + ck.h * r_LZ;
+
+      info!(elapsed_ms = %commit_t.elapsed().as_millis(), "hyrax_prove_i8_commit");
+
+      (comm_LZ, R, LZ, r_LZ)
+    };
+
+    // a dot product argument (IPA) of size R_size
+    let (_ipa_span, ipa_t) = start_span!("hyrax_prove_i8_ipa");
+    let ipa_instance = InnerProductInstance::<E>::new(&comm_LZ, &R, &comm_eval.comm[0]);
+    let ipa_witness = InnerProductWitness::<E>::new(&LZ, &r_LZ, &blind_eval.blind[0]);
+    let ipa = InnerProductArgumentLinear::<E>::prove(
+      &ck.ck,
+      &ck.h,
+      &ck_eval.ck[0],
+      &ck_eval.h,
+      &ipa_instance,
+      &ipa_witness,
+      transcript,
+    )?;
+    info!(elapsed_ms = %ipa_t.elapsed().as_millis(), "hyrax_prove_i8_ipa");
+
+    Ok(HyraxEvaluationArgument { ipa })
+  }
+
   fn verify(
     vk: &Self::VerifierKey,
     ck_eval: &Self::CommitmentKey,

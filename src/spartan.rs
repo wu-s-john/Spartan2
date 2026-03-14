@@ -831,28 +831,16 @@ impl<E: Engine> SpartanSNARK<E> {
         .invert()
         .expect("1 - r_y[0] is non-zero");
 
-    // PCS: Convert W_i8 → field ONLY HERE (deferred, single conversion)
     let (_pcs_span, pcs_t) = start_span!("pcs_prove");
-    let W_field: Vec<E::Scalar> = W_i8
-      .W
-      .iter()
-      .map(|&v| {
-        if v == 0 {
-          E::Scalar::ZERO
-        } else {
-          E::Scalar::ONE
-        }
-      })
-      .collect();
 
     let blind_eval_W = E::PCS::blind(&pk.ck_s, 1);
     let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W, false)?;
-    let eval_arg = E::PCS::prove(
+    let eval_arg = E::PCS::prove_i8(
       &pk.ck,
       &pk.ck_s,
       &mut transcript,
       &U_regular.comm_W,
-      &W_field,
+      &W_i8.W,
       &W_i8.r_W,
       &r_y[1..],
       &comm_eval_W,
@@ -1199,26 +1187,15 @@ impl<E: Engine> SpartanSNARK<E> {
 
     // PCS
     let (_pcs_span, pcs_t) = start_span!("pcs_prove");
-    let W_field: Vec<E::Scalar> = prep
-      .W
-      .iter()
-      .map(|&v| {
-        if v == 0 {
-          E::Scalar::ZERO
-        } else {
-          E::Scalar::ONE
-        }
-      })
-      .collect();
 
     let blind_eval_W = E::PCS::blind(&pk.ck_s, 1);
     let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W, false)?;
-    let eval_arg = E::PCS::prove(
+    let eval_arg = E::PCS::prove_i8(
       &pk.ck,
       &pk.ck_s,
       &mut transcript,
       &U_regular.comm_W,
-      &W_field,
+      &prep.W,
       &r_W,
       &r_y[1..],
       &comm_eval_W,

@@ -118,6 +118,20 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
     blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError>;
 
+  /// Proves evaluation of a polynomial whose coefficients are small signed integers.
+  /// Avoids field conversion: bind_with uses conditional add instead of field multiply.
+  fn prove_i8(
+    ck: &Self::CommitmentKey,
+    ck_eval: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    comm: &Self::Commitment,
+    poly: &[i8],
+    blind: &Self::Blind,
+    point: &[E::Scalar],
+    comm_eval: &Self::Commitment,
+    blind_eval: &Self::Blind,
+  ) -> Result<Self::EvaluationArgument, SpartanError>;
+
   /// A method to verify the purported evaluation of a multilinear polynomials
   fn verify(
     vk: &Self::VerifierKey,
