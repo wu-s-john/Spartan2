@@ -21,7 +21,7 @@ mod small_value_field;
 mod wide_mul;
 
 // Public exports
-pub use delayed_reduction::DelayedReduction;
+pub use delayed_reduction::{DelayedReduction, FieldAccumulator};
 pub use limbs::{SignedWideLimbs, SubMagResult, WideLimbs, sub_mag};
 pub use small_value_field::{SmallValueField, i64_to_field, try_field_to_i64};
 pub use wide_mul::WideMul;

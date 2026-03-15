@@ -281,6 +281,38 @@ impl SparseMatrix<i32> {
         .collect(),
     )
   }
+
+  /// Pure integer matrix-vector multiply for boolean witnesses.
+  ///
+  /// Same as `multiply_vec_int` but takes `&[bool]` directly, avoiding the
+  /// `!= 0` comparison and enabling exhaustive match patterns.
+  pub fn multiply_vec_bool(&self, z: &[bool]) -> Result<Vec<i32>, SpartanError> {
+    if self.cols != z.len() {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!(
+          "SparseMatrix::multiply_vec_bool: Expected {} elements, got {}",
+          self.cols,
+          z.len()
+        ),
+      });
+    }
+
+    Ok(
+      self
+        .indptr
+        .par_windows(2)
+        .map(|ptrs| {
+          let mut acc: i32 = 0;
+          for i in ptrs[0]..ptrs[1] {
+            if z[self.indices[i]] {
+              acc += self.data[i];
+            }
+          }
+          acc
+        })
+        .collect(),
+    )
+  }
 }
 
 /// Iterator for sparse matrix

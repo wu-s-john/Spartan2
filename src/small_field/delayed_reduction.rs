@@ -68,8 +68,45 @@ use super::{
   montgomery::{MontgomeryLimbs, montgomery_reduce_9},
   small_value_field::SupportsSmallI64,
 };
-use ff::PrimeField;
-use std::ops::AddAssign;
+use ff::{Field, PrimeField};
+use std::ops::{Add, AddAssign};
+
+/// Wrapper around a field element that implements `num_traits::Zero`.
+///
+/// `ff::Field` has its own `ZERO` but doesn't implement `num_traits::Zero`.
+/// This newtype bridges the two for use as a `DelayedReduction` accumulator.
+#[derive(Clone, Copy, Debug)]
+pub struct FieldAccumulator<F: Field + Copy>(pub F);
+
+impl<F: Field + Copy> Default for FieldAccumulator<F> {
+  fn default() -> Self {
+    Self(F::ZERO)
+  }
+}
+
+impl<F: Field + Copy> Add for FieldAccumulator<F> {
+  type Output = Self;
+
+  fn add(self, rhs: Self) -> Self {
+    Self(self.0 + rhs.0)
+  }
+}
+
+impl<F: Field + Copy> AddAssign for FieldAccumulator<F> {
+  fn add_assign(&mut self, rhs: Self) {
+    self.0 += rhs.0;
+  }
+}
+
+impl<F: Field + Copy> num_traits::Zero for FieldAccumulator<F> {
+  fn zero() -> Self {
+    Self(F::ZERO)
+  }
+
+  fn is_zero(&self) -> bool {
+    self.0 == F::ZERO
+  }
+}
 
 /// Trait for delayed modular reduction operations.
 ///
@@ -95,6 +132,29 @@ pub trait DelayedReduction<Value>: Sized {
   ///
   /// Performs the deferred modular reduction.
   fn reduce(acc: &Self::Accumulator) -> Self;
+}
+
+// ============================================================================
+// DelayedReduction<bool> - for field × bool products (conditional add)
+// ============================================================================
+
+impl<F: PrimeField + Copy> DelayedReduction<bool> for F {
+  /// Accumulator is a field element wrapped in `FieldAccumulator` for `num_traits::Zero`.
+  /// Since bool values are {0,1}, MAC reduces to conditional add.
+  /// The accumulator stays reduced throughout, so `reduce` is identity.
+  type Accumulator = FieldAccumulator<F>;
+
+  #[inline(always)]
+  fn unreduced_multiply_accumulate(acc: &mut FieldAccumulator<F>, field: &F, value: &bool) {
+    if *value {
+      acc.0 += *field;
+    }
+  }
+
+  #[inline(always)]
+  fn reduce(acc: &FieldAccumulator<F>) -> F {
+    acc.0
+  }
 }
 
 // ============================================================================

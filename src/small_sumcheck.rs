@@ -376,7 +376,7 @@ where
 /// - `eval_2`: uses `b_bound = 2·z_hi - z_lo` which is in {-1, 0, 1, 2} for binary inputs
 fn compute_eval_points_quad_binary_z<E: Engine>(
   poly_A: &MultilinearPolynomial<E::Scalar>,
-  z_bin: &[i8],
+  z_bin: &[bool],
 ) -> (E::Scalar, E::Scalar) {
   let len = poly_A.Z.len() / 2;
   debug_assert_eq!(z_bin.len(), poly_A.Z.len());
@@ -391,18 +391,18 @@ fn compute_eval_points_quad_binary_z<E: Engine>(
         let a_high = poly_A[len + i];
         let z_hi = z_bin[len + i];
 
-        // eval 0: conditional add (z_lo is 0 or 1)
-        if z_lo != 0 {
+        // eval 0: conditional add
+        if z_lo {
           acc.0 += a_low;
         }
 
         // eval 2: a_bound × b_bound where b_bound = 2·z_hi - z_lo ∈ {-1, 0, 1, 2}
         let a_bound = a_high + a_high - a_low;
         match (z_lo, z_hi) {
-          (0, 0) => {}                      // b_bound = 0: skip
-          (1, 0) => acc.1 -= a_bound,       // b_bound = -1
-          (0, 1) => acc.1 += a_bound.double(), // b_bound = 2 (workaround: add twice)
-          (_, _) => acc.1 += a_bound,        // b_bound = 1
+          (false, false) => {}
+          (true, false) => acc.1 -= a_bound,
+          (false, true) => acc.1 += a_bound.double(),
+          (true, true) => acc.1 += a_bound,
         }
 
         acc
@@ -427,16 +427,16 @@ fn compute_eval_points_quad_binary_z<E: Engine>(
 /// - (0,1) → r
 /// - (1,0) → 1-r
 /// - (1,1) → 1
-fn bind_binary_z<F: PrimeField>(z_bin: &[i8], r: &F) -> Vec<F> {
+fn bind_binary_z<F: PrimeField>(z_bin: &[bool], r: &F) -> Vec<F> {
   let len = z_bin.len() / 2;
   let one_minus_r = F::ONE - *r;
 
   let compute = |i: usize| -> F {
     match (z_bin[i], z_bin[len + i]) {
-      (0, 0) => F::ZERO,
-      (0, _) => *r,
-      (_, 0) => one_minus_r,
-      _ => F::ONE,
+      (false, false) => F::ZERO,
+      (false, true) => *r,
+      (true, false) => one_minus_r,
+      (true, true) => F::ONE,
     }
   };
 
@@ -456,7 +456,7 @@ pub fn prove_quad_with_binary_z<E: Engine>(
   claim: &E::Scalar,
   num_rounds: usize,
   poly_A: &mut MultilinearPolynomial<E::Scalar>,
-  z_bin: &[i8],
+  z_bin: &[bool],
   transcript: &mut E::TE,
 ) -> Result<(SumcheckProof<E>, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
 where
@@ -525,11 +525,11 @@ where
 /// for both M̃ and z in one pass using delayed reduction.
 fn bind_inner_polys_batched<F>(
   poly_M: &MultilinearPolynomial<F>,
-  z: &[i8],
+  z: &[bool],
   challenges: &[F],
 ) -> (MultilinearPolynomial<F>, MultilinearPolynomial<F>)
 where
-  F: PrimeField + DelayedReduction<i32> + DelayedReduction<F>,
+  F: PrimeField + DelayedReduction<bool> + DelayedReduction<F>,
 {
   let l0 = challenges.len();
   let n = poly_M.Z.len();
@@ -542,21 +542,21 @@ where
   let eq_table = EqPolynomial::evals_from_points(challenges);
 
   type AccF<F2> = <F2 as DelayedReduction<F2>>::Accumulator;
-  type AccI<F2> = <F2 as DelayedReduction<i32>>::Accumulator;
+  type AccB<F2> = <F2 as DelayedReduction<bool>>::Accumulator;
 
   let compute = |s: usize| -> (F, F) {
     let mut acc_m = AccF::<F>::zero();
-    let mut acc_z = AccI::<F>::zero();
+    let mut acc_z = AccB::<F>::default();
 
     for (p, eq_p) in eq_table.iter().enumerate() {
       let idx = p * stride + s;
       F::unreduced_multiply_accumulate(&mut acc_m, eq_p, &poly_M.Z[idx]);
-      F::unreduced_multiply_accumulate(&mut acc_z, eq_p, &(z[idx] as i32));
+      <F as DelayedReduction<bool>>::unreduced_multiply_accumulate(&mut acc_z, eq_p, &z[idx]);
     }
 
     (
       <F as DelayedReduction<F>>::reduce(&acc_m),
-      <F as DelayedReduction<i32>>::reduce(&acc_z),
+      <F as DelayedReduction<bool>>::reduce(&acc_z),
     )
   };
 
@@ -598,12 +598,12 @@ pub fn prove_quad_small_value<E: Engine>(
   claim: &E::Scalar,
   num_rounds: usize,
   poly_M: &mut MultilinearPolynomial<E::Scalar>,
-  z_i8: &[i8],
+  z_bool: &[bool],
   l0: usize,
   transcript: &mut E::TE,
 ) -> Result<(SumcheckProof<E>, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
 where
-  E::Scalar: DelayedReduction<i32> + DelayedReduction<E::Scalar>,
+  E::Scalar: DelayedReduction<bool> + DelayedReduction<i32> + DelayedReduction<E::Scalar>,
 {
   let mut r: Vec<E::Scalar> = Vec::with_capacity(num_rounds);
   let mut polys: Vec<crate::polys::univariate::CompressedUniPoly<E::Scalar>> =
@@ -615,12 +615,12 @@ where
 
   if l0 == 0 {
     // Fall back to prove_quad_with_binary_z (round 0 binary + standard)
-    return prove_quad_with_binary_z::<E>(claim, num_rounds, poly_M, z_i8, transcript);
+    return prove_quad_with_binary_z::<E>(claim, num_rounds, poly_M, z_bool, transcript);
   }
 
   // ===== Pre-computation: build accumulators =====
   let (_acc_span, acc_t) = start_span!("build_accumulators_inner");
-  let accumulators = build_accumulators_inner(poly_M, z_i8, l0);
+  let accumulators = build_accumulators_inner(poly_M, z_bool, l0);
   info!(elapsed_ms = %acc_t.elapsed().as_millis(), "build_accumulators_inner");
 
   let basis_factory =
@@ -672,7 +672,7 @@ where
   // ===== Transition: bind M̃ and z by l0 challenges =====
   let (_bind_span, bind_t) = start_span!("bind_inner_transition");
   let (mut poly_M_bound, mut poly_z_bound) =
-    bind_inner_polys_batched(poly_M, z_i8, &r[..l0]);
+    bind_inner_polys_batched(poly_M, z_bool, &r[..l0]);
   info!(elapsed_ms = %bind_t.elapsed().as_millis(), "bind_inner_transition");
 
   // ===== Remaining rounds (l0 to num_rounds-1): standard quadratic =====
@@ -1076,13 +1076,13 @@ mod tests {
 
     // Generate deterministic M̃ (field) and z (binary)
     let poly_M_vals: Vec<F> = (0..n).map(|i| F::from((i * 7 + 3) as u64)).collect();
-    let z_i8: Vec<i8> = (0..n).map(|i| ((i * 13 + 5) % 2) as i8).collect();
+    let z_bool: Vec<bool> = (0..n).map(|i| ((i * 13 + 5) % 2) != 0).collect();
 
     // Compute claim = Σ M̃(y) · z(y)
     let claim: F = poly_M_vals
       .iter()
-      .zip(z_i8.iter())
-      .map(|(&m, &z)| if z != 0 { m } else { F::ZERO })
+      .zip(z_bool.iter())
+      .map(|(&m, &z)| if z { m } else { F::ZERO })
       .sum();
 
     // Run prove_quad_with_binary_z (reference)
@@ -1092,7 +1092,7 @@ mod tests {
       &claim,
       NUM_VARS,
       &mut poly_M1,
-      &z_i8,
+      &z_bool,
       &mut transcript1,
     )
     .expect("binary_z prove should succeed");
@@ -1104,7 +1104,7 @@ mod tests {
       &claim,
       NUM_VARS,
       &mut poly_M2,
-      &z_i8,
+      &z_bool,
       3, // l0 = 3
       &mut transcript2,
     )
@@ -1126,18 +1126,18 @@ mod tests {
 
     // Generate deterministic M̃ (field) and z (binary)
     let poly_M_vals: Vec<F> = (0..n).map(|i| F::from((i * 11 + 7) as u64)).collect();
-    let z_i8: Vec<i8> = (0..n).map(|i| ((i * 3 + 1) % 2) as i8).collect();
+    let z_bool: Vec<bool> = (0..n).map(|i| ((i * 3 + 1) % 2) != 0).collect();
 
     let poly_M = MultilinearPolynomial::new(poly_M_vals.clone());
 
     // Build accumulators using our optimized function
-    let acc = build_accumulators_inner(&poly_M, &z_i8, L0);
+    let acc = build_accumulators_inner(&poly_M, &z_bool, L0);
 
     // Verify claim = Σ M̃(y) · z(y) by checking round 0
     let claim: F = poly_M_vals
       .iter()
-      .zip(z_i8.iter())
-      .map(|(&m, &z)| if z != 0 { m } else { F::ZERO })
+      .zip(z_bool.iter())
+      .map(|(&m, &z)| if z { m } else { F::ZERO })
       .sum();
 
     // Round 0: coeff = [1], t(0) + t(1) should equal claim
@@ -1160,7 +1160,7 @@ mod tests {
       &claim,
       NUM_VARS,
       &mut poly_M1,
-      &z_i8,
+      &z_bool,
       L0,
       &mut transcript1,
     )
@@ -1175,7 +1175,7 @@ mod tests {
     // Evaluate M̃ and z at r_v to check final claim
     let eq_evals = EqPolynomial::evals_from_points(&r_v);
     let m_eval: F = eq_evals.iter().zip(poly_M_vals.iter()).map(|(&e, &m)| e * m).sum();
-    let z_field: Vec<F> = z_i8.iter().map(|&z| F::from(z as u64)).collect();
+    let z_field: Vec<F> = z_bool.iter().map(|&z| F::from(z as u64)).collect();
     let z_eval: F = eq_evals.iter().zip(z_field.iter()).map(|(&e, &z)| e * z).sum();
     assert_eq!(final_claim, m_eval * z_eval, "final claim should match M̃(r) · z(r)");
   }

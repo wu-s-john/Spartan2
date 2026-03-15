@@ -71,6 +71,14 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
     r: &Self::Blind,
   ) -> Result<Self::Commitment, SpartanError>;
 
+  /// Commits to a boolean vector. Each base is conditionally added if the bit is true.
+  /// No scalar multiplication needed.
+  fn commit_bool(
+    ck: &Self::CommitmentKey,
+    v: &[bool],
+    r: &Self::Blind,
+  ) -> Result<Self::Commitment, SpartanError>;
+
   /// Checks if the provided commitment commits to a vector of the specified length
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError>;
 
@@ -126,6 +134,20 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
     transcript: &mut E::TE,
     comm: &Self::Commitment,
     poly: &[i8],
+    blind: &Self::Blind,
+    point: &[E::Scalar],
+    comm_eval: &Self::Commitment,
+    blind_eval: &Self::Blind,
+  ) -> Result<Self::EvaluationArgument, SpartanError>;
+
+  /// Proves evaluation of a boolean polynomial.
+  /// Binding uses conditional add (no field multiply or negation).
+  fn prove_bool(
+    ck: &Self::CommitmentKey,
+    ck_eval: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    comm: &Self::Commitment,
+    poly: &[bool],
     blind: &Self::Blind,
     point: &[E::Scalar],
     comm_eval: &Self::Commitment,

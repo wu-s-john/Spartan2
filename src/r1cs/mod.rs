@@ -1174,6 +1174,29 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     Ok((Az?, Bz?, Cz?))
   }
 
+  /// Pure integer matrix-vector multiply with boolean witnesses.
+  pub fn multiply_vec_bool(
+    &self,
+    z: &[bool],
+  ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>), SpartanError> {
+    let expected_len = self.num_public
+      + self.num_challenges
+      + 1
+      + self.num_shared
+      + self.num_precommitted
+      + self.num_rest;
+    if z.len() != expected_len {
+      return Err(SpartanError::InvalidWitnessLength);
+    }
+
+    let (Az, (Bz, Cz)) = rayon::join(
+      || self.A.multiply_vec_bool(z),
+      || rayon::join(|| self.B.multiply_vec_bool(z), || self.C.multiply_vec_bool(z)),
+    );
+
+    Ok((Az?, Bz?, Cz?))
+  }
+
   /// Computes poly_ABC = A·rx + r·(B·rx) + r²·(C·rx) with i32 matrix entries.
   ///
   /// Uses field × i32 multiplication (via simple scalar multiply) for each entry,

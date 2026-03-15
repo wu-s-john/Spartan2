@@ -134,6 +134,33 @@ impl<T: PrimeField> MultilinearPolynomial<T> {
       })
       .collect()
   }
+
+  /// Bind row variables for a boolean polynomial: output[i] = Σ_j L[j] * poly[j * r_len + i]
+  /// Since poly values are {0,1}, this is pure conditional add — no field multiply.
+  pub fn bind_with_bool(poly: &[bool], l: &[T], r_len: usize) -> Vec<T> {
+    assert_eq!(
+      poly.len(),
+      l.len() * r_len,
+      "poly length ({}) must equal L.len() * r_len ({} * {}) = {}",
+      poly.len(),
+      l.len(),
+      r_len,
+      l.len() * r_len
+    );
+
+    (0..r_len)
+      .into_par_iter()
+      .map(|i| {
+        let mut acc = T::ZERO;
+        for j in 0..l.len() {
+          if poly[j * r_len + i] {
+            acc += l[j];
+          }
+        }
+        acc
+      })
+      .collect()
+  }
 }
 
 // ============================================================================

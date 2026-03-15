@@ -332,6 +332,9 @@ impl SmallShapeCS {
         let lc = get_lc(constraint);
         let row_start = data.len();
         for (var, coeff) in &lc.terms {
+          if *coeff == 0 {
+            continue;
+          }
           let col = match var.get_unchecked() {
             Index::Aux(i) => i,
             Index::Input(i) => self.num_aux + i,

@@ -366,10 +366,11 @@ where
   W_i8[dst_rest..dst_rest + rest_copy]
     .copy_from_slice(&aux[rest_start_aux..rest_start_aux + rest_copy]);
 
-  // Commit shared portion (if any) — directly from i8, no field conversion
+  // Commit shared portion (if any) — use msm_bool (no scalar multiply)
   let (comm_W_shared, r_W_shared) = if S.num_shared_unpadded > 0 {
     let r = PCS::<E>::blind(ck, S.num_shared);
-    let comm = PCS::<E>::commit_i8(ck, &W_i8[..S.num_shared], &r)?;
+    let w_bool: Vec<bool> = W_i8[..S.num_shared].iter().map(|&v| v != 0).collect();
+    let comm = PCS::<E>::commit_bool(ck, &w_bool, &r)?;
     (Some(comm), Some(r))
   } else {
     (None, None)
@@ -379,11 +380,11 @@ where
   let (_commit_pre_span, commit_pre_t) = start_span!("commit_witness_precommitted");
   let (comm_W_precommitted, r_W_precommitted) = if S.num_precommitted_unpadded > 0 {
     let r = PCS::<E>::blind(ck, S.num_precommitted);
-    let comm = PCS::<E>::commit_i8(
-      ck,
-      &W_i8[S.num_shared..S.num_shared + S.num_precommitted],
-      &r,
-    )?;
+    let w_bool: Vec<bool> = W_i8[S.num_shared..S.num_shared + S.num_precommitted]
+      .iter()
+      .map(|&v| v != 0)
+      .collect();
+    let comm = PCS::<E>::commit_bool(ck, &w_bool, &r)?;
     (Some(comm), Some(r))
   } else {
     (None, None)
@@ -393,7 +394,11 @@ where
   // Commit rest portion
   let (_commit_rest_span, commit_rest_t) = start_span!("commit_witness_rest");
   let r_W_rest = PCS::<E>::blind(ck, S.num_rest);
-  let comm_W_rest = PCS::<E>::commit_i8(ck, &W_i8[S.num_shared + S.num_precommitted..], &r_W_rest)?;
+  let w_rest_bool: Vec<bool> = W_i8[S.num_shared + S.num_precommitted..]
+    .iter()
+    .map(|&v| v != 0)
+    .collect();
+  let comm_W_rest = PCS::<E>::commit_bool(ck, &w_rest_bool, &r_W_rest)?;
   info!(elapsed_ms = %commit_rest_t.elapsed().as_millis(), "commit_witness_rest");
 
   // Absorb commitments into transcript in the same order as SplitR1CSInstance::validate

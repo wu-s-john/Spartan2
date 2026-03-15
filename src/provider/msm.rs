@@ -137,14 +137,11 @@ pub fn msm<C: CurveAffine>(
     });
   }
 
-  let num_threads = if coeffs.len() > 1024 {
-    // If the number of coefficients is large, we use parallelism.
-    // Otherwise, we use a single thread.
-    // This is a heuristic to avoid overhead from parallelism for small inputs.
-    1
-  } else if use_parallelism_internally {
+  let num_threads = if coeffs.len() > 1024 && use_parallelism_internally {
+    // Large input: use parallelism
     current_num_threads()
   } else {
+    // Small input or parallelism disabled: single thread
     1
   };
 
@@ -258,6 +255,50 @@ fn msm_binary<C: CurveAffine, T: Integer + Sync>(
   } else {
     process_chunk(scalars, bases)
   }
+}
+
+/// MSM for boolean scalars: sum bases where bit is true.
+///
+/// Pippenger bucketing is useless for binary scalars — there's only 1 nonzero bucket.
+/// This directly sums the matching bases with parallel chunking.
+pub fn msm_bool<C: CurveAffine>(
+  bits: &[bool],
+  bases: &[C],
+  use_parallelism_internally: bool,
+) -> Result<C::Curve, SpartanError> {
+  if bits.len() != bases.len() {
+    return Err(SpartanError::InvalidInputLength {
+      reason: "msm_bool: bits and bases must have the same length".to_string(),
+    });
+  }
+
+  let num_threads = if bits.len() > 1024 && use_parallelism_internally {
+    current_num_threads()
+  } else {
+    1
+  };
+
+  let process_chunk = |bits: &[bool], bases: &[C]| {
+    bits
+      .iter()
+      .zip(bases.iter())
+      .fold(C::Curve::identity(), |acc, (&bit, base)| {
+        if bit { acc + base } else { acc }
+      })
+  };
+
+  let result = if bits.len() > num_threads {
+    let chunk = bits.len() / num_threads;
+    bits
+      .par_chunks(chunk)
+      .zip(bases.par_chunks(chunk))
+      .map(|(b, g)| process_chunk(b, g))
+      .reduce(C::Curve::identity, |a, b| a + b)
+  } else {
+    process_chunk(bits, bases)
+  };
+
+  Ok(result)
 }
 
 /// MSM optimized for up to 10-bit scalars

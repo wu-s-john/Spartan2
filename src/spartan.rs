@@ -690,6 +690,7 @@ impl<E: Engine> SpartanSNARK<E> {
     E::Scalar: SmallValueField<i32>
       + DelayedReduction<i32>
       + DelayedReduction<i64>
+      + DelayedReduction<bool>
       + DelayedReduction<E::Scalar>,
   {
     use crate::bellpepper::r1cs::small_r1cs_instance_and_witness;
@@ -785,14 +786,14 @@ impl<E: Engine> SpartanSNARK<E> {
     let (_sc2_span, sc2_t) = start_span!("inner_sumcheck");
     let l0_inner = std::cmp::min(3, num_rounds_y.saturating_sub(1));
     let (sc_proof_inner, r_y, claims_inner) = if U_i8.challenges.is_empty() {
-      // z_i8 is purely binary — use small-value Lagrange accumulator path
-      let mut z_bin = z_i8;
-      z_bin.resize(num_vars * 2, 0i8);
+      // z_i8 is purely binary — convert to bool and use optimized path
+      let mut z_bool: Vec<bool> = z_i8.iter().map(|&v| v != 0).collect();
+      z_bool.resize(num_vars * 2, false);
       crate::small_sumcheck::prove_quad_small_value::<E>(
         &claim_inner_joint,
         num_rounds_y,
         &mut MultilinearPolynomial::new(poly_ABC),
-        &z_bin,
+        &z_bool,
         l0_inner,
         &mut transcript,
       )?
@@ -837,12 +838,13 @@ impl<E: Engine> SpartanSNARK<E> {
 
     let blind_eval_W = E::PCS::blind(&pk.ck_s, 1);
     let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W, false)?;
-    let eval_arg = E::PCS::prove_i8(
+    let w_bool: Vec<bool> = W_i8.W.iter().map(|&v| v != 0).collect();
+    let eval_arg = E::PCS::prove_bool(
       &pk.ck,
       &pk.ck_s,
       &mut transcript,
       &U_regular.comm_W,
-      &W_i8.W,
+      &w_bool,
       &W_i8.r_W,
       &r_y[1..],
       &comm_eval_W,
@@ -918,10 +920,11 @@ impl<E: Engine> SpartanSNARK<E> {
     let shared_copy = cs.aux_assignment.len().min(pk.S.num_shared_unpadded);
     witness[..shared_copy].copy_from_slice(&cs.aux_assignment[..shared_copy]);
 
-    // Commit shared
+    // Commit shared (convert i8 → bool for msm_bool)
     let (comm_W_shared, r_W_shared) = if pk.S.num_shared_unpadded > 0 {
       let r = PCS::<E>::blind(&pk.ck, pk.S.num_shared);
-      let comm = PCS::<E>::commit_i8(&pk.ck, &witness[..pk.S.num_shared], &r)?;
+      let w_bool: Vec<bool> = witness[..pk.S.num_shared].iter().map(|&v| v != 0).collect();
+      let comm = PCS::<E>::commit_bool(&pk.ck, &w_bool, &r)?;
       (Some(comm), Some(r))
     } else {
       (None, None)
@@ -952,11 +955,11 @@ impl<E: Engine> SpartanSNARK<E> {
     let (_commit_pre_span, commit_pre_t) = start_span!("commit_witness_precommitted");
     let (comm_W_precommitted, r_W_precommitted) = if pk.S.num_precommitted_unpadded > 0 {
       let r = PCS::<E>::blind(&pk.ck, pk.S.num_precommitted);
-      let comm = PCS::<E>::commit_i8(
-        &pk.ck,
-        &witness[pk.S.num_shared..pk.S.num_shared + pk.S.num_precommitted],
-        &r,
-      )?;
+      let w_bool: Vec<bool> = witness[pk.S.num_shared..pk.S.num_shared + pk.S.num_precommitted]
+        .iter()
+        .map(|&v| v != 0)
+        .collect();
+      let comm = PCS::<E>::commit_bool(&pk.ck, &w_bool, &r)?;
       (Some(comm), Some(r))
     } else {
       (None, None)
@@ -989,6 +992,7 @@ impl<E: Engine> SpartanSNARK<E> {
     E::Scalar: SmallValueField<i32>
       + DelayedReduction<i32>
       + DelayedReduction<i64>
+      + DelayedReduction<bool>
       + DelayedReduction<E::Scalar>,
   {
     use crate::PCS;
@@ -1058,11 +1062,11 @@ impl<E: Engine> SpartanSNARK<E> {
     // Commit rest
     let (_commit_rest_span, commit_rest_t) = start_span!("commit_witness_rest");
     let r_W_rest = PCS::<E>::blind(&pk.ck, pk.S.num_rest);
-    let comm_W_rest = PCS::<E>::commit_i8(
-      &pk.ck,
-      &prep.W[pk.S.num_shared + pk.S.num_precommitted..],
-      &r_W_rest,
-    )?;
+    let w_rest_bool: Vec<bool> = prep.W[pk.S.num_shared + pk.S.num_precommitted..]
+      .iter()
+      .map(|&v| v != 0)
+      .collect();
+    let comm_W_rest = PCS::<E>::commit_bool(&pk.ck, &w_rest_bool, &r_W_rest)?;
     info!(elapsed_ms = %commit_rest_t.elapsed().as_millis(), "commit_witness_rest");
     transcript.absorb(b"comm_W_rest", &comm_W_rest);
 
@@ -1139,16 +1143,18 @@ impl<E: Engine> SpartanSNARK<E> {
     let poly_ABC = pk.S.bind_row_vars_combined_int(&evals_rx, r);
     info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
 
-    // Inner sumcheck
+    // Inner sumcheck — use prove_quad_small_value with Lagrange accumulators
     let (_sc2_span, sc2_t) = start_span!("inner_sumcheck");
+    let l0_inner = std::cmp::min(3, num_rounds_y.saturating_sub(1));
     let (sc_proof_inner, r_y, claims_inner) = if U_i8.challenges.is_empty() {
-      let mut z_bin = z_i8;
-      z_bin.resize(num_vars * 2, 0i8);
-      crate::small_sumcheck::prove_quad_with_binary_z::<E>(
+      let mut z_bool: Vec<bool> = z_i8.iter().map(|&v| v != 0).collect();
+      z_bool.resize(num_vars * 2, false);
+      crate::small_sumcheck::prove_quad_small_value::<E>(
         &claim_inner_joint,
         num_rounds_y,
         &mut MultilinearPolynomial::new(poly_ABC),
-        &z_bin,
+        &z_bool,
+        l0_inner,
         &mut transcript,
       )?
     } else {
@@ -1192,12 +1198,13 @@ impl<E: Engine> SpartanSNARK<E> {
 
     let blind_eval_W = E::PCS::blind(&pk.ck_s, 1);
     let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W, false)?;
-    let eval_arg = E::PCS::prove_i8(
+    let w_bool: Vec<bool> = prep.W.iter().map(|&v| v != 0).collect();
+    let eval_arg = E::PCS::prove_bool(
       &pk.ck,
       &pk.ck_s,
       &mut transcript,
       &U_regular.comm_W,
-      &prep.W,
+      &w_bool,
       &r_W,
       &r_y[1..],
       &comm_eval_W,
@@ -1579,6 +1586,7 @@ mod tests {
       + DelayedReduction<i32>
       + DelayedReduction<i64>
       + DelayedReduction<i128>
+      + DelayedReduction<bool>
       + DelayedReduction<E::Scalar>
       + ff::PrimeFieldBits,
   {

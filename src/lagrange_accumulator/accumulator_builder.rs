@@ -555,7 +555,7 @@ where
 /// * `l0` - Number of small-value rounds
 pub fn build_accumulators_inner<F>(
   poly_M: &MultilinearPolynomial<F>,
-  z: &[i8],
+  z: &[bool],
   l0: usize,
 ) -> LagrangeAccumulators<F, 2>
 where
