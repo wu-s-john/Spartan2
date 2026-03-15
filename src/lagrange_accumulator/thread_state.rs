@@ -237,3 +237,68 @@ where
     self.beta_values.clear();
   }
 }
+
+/// Thread-local scratch buffers for `build_accumulators_inner`.
+///
+/// Simpler than `SpartanThreadState` because:
+/// - Only one polynomial pair (M̃ × z) instead of two (Az × Bz)
+/// - z is i8-valued (widened to i32 for extension)
+/// - M̃ is field-valued
+/// - No eq weighting in scatter (plain `+=`)
+///
+/// # Type Parameters
+///
+/// - `F`: Field type with delayed reduction support
+/// - `D`: Polynomial degree bound
+pub(crate) struct InnerThreadState<F, const D: usize>
+where
+  F: PrimeField
+    + DelayedReduction<i32>
+    + DelayedReduction<F>
+    + Send
+    + Sync,
+{
+  /// Partial sums indexed by β, accumulated over suffixes.
+  /// Uses DelayedReduction<i32>::Accumulator (field × i32 products).
+  pub partial_sums: Vec<<F as DelayedReduction<i32>>::Accumulator>,
+  /// Bucket accumulators — plain field addition (no eq weighting).
+  pub acc: LagrangeAccumulators<F, D>,
+  /// Prefix evaluations of z for current suffix. Size: 2^l0, widened from i8 to i32.
+  pub z_prefix_boolean_evals: Vec<i32>,
+  /// Result buffer for z Lagrange extension. Size: 3^l0
+  pub z_extended_evals: Vec<i32>,
+  /// Scratch buffer for z Lagrange extension.
+  pub z_extended_scratch: Vec<i32>,
+  /// Prefix evaluations of M̃ for current suffix. Size: 2^l0
+  pub M_prefix_boolean_evals: Vec<F>,
+  /// Result buffer for M̃ Lagrange extension. Size: 3^l0
+  pub M_extended_evals: Vec<F>,
+  /// Scratch buffer for M̃ Lagrange extension.
+  pub M_extended_scratch: Vec<F>,
+}
+
+impl<F, const D: usize> InnerThreadState<F, D>
+where
+  F: PrimeField
+    + DelayedReduction<i32>
+    + DelayedReduction<F>
+    + Send
+    + Sync,
+{
+  pub fn new(l0: usize, num_betas: usize, prefix_size: usize, ext_size: usize) -> Self {
+    Self {
+      partial_sums: vec![
+        <F as DelayedReduction<i32>>::Accumulator::zero();
+        num_betas
+      ],
+      acc: LagrangeAccumulators::new(l0),
+      z_prefix_boolean_evals: vec![0i32; prefix_size],
+      z_extended_evals: vec![0i32; ext_size],
+      z_extended_scratch: vec![0i32; ext_size],
+      M_prefix_boolean_evals: vec![F::ZERO; prefix_size],
+      M_extended_evals: vec![F::ZERO; ext_size],
+      M_extended_scratch: vec![F::ZERO; ext_size],
+    }
+  }
+
+}

@@ -781,17 +781,19 @@ impl<E: Engine> SpartanSNARK<E> {
     let poly_ABC = S_int.bind_row_vars_combined_int(&evals_rx, r);
     info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
 
-    // Inner sumcheck: use binary z when no challenges (SHA-256 fast path)
+    // Inner sumcheck: use Lagrange accumulator optimization when no challenges (SHA-256 fast path)
     let (_sc2_span, sc2_t) = start_span!("inner_sumcheck");
+    let l0_inner = std::cmp::min(3, num_rounds_y.saturating_sub(1));
     let (sc_proof_inner, r_y, claims_inner) = if U_i8.challenges.is_empty() {
-      // z_i8 is purely binary — use optimized path (zero field multiplies in round 0)
+      // z_i8 is purely binary — use small-value Lagrange accumulator path
       let mut z_bin = z_i8;
       z_bin.resize(num_vars * 2, 0i8);
-      crate::small_sumcheck::prove_quad_with_binary_z::<E>(
+      crate::small_sumcheck::prove_quad_small_value::<E>(
         &claim_inner_joint,
         num_rounds_y,
         &mut MultilinearPolynomial::new(poly_ABC),
         &z_bin,
+        l0_inner,
         &mut transcript,
       )?
     } else {

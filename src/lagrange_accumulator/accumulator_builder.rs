@@ -15,7 +15,7 @@ use super::{
   domain::LagrangeIndex,
   extension::extend_to_lagrange_domain,
   index::CachedPrefixIndex,
-  thread_state::{NeutronNovaThreadState, SpartanThreadState},
+  thread_state::{InnerThreadState, NeutronNovaThreadState, SpartanThreadState},
 };
 use crate::{
   csr::Csr,
@@ -538,6 +538,121 @@ where
   merged
     .scatter_acc
     .map(|acc| <F as DelayedReduction<F>>::reduce(acc))
+}
+
+/// Build accumulators A_i(v, u) for the inner sumcheck: g(y) = M̃(y) · z(y).
+///
+/// Unlike `build_accumulators_spartan`, there is no eq(τ,y) factor, so:
+/// - No suffix split or eq_cache precomputation
+/// - Scatter uses plain `+=` instead of eq-weighted multiply-accumulate
+/// - All betas contribute (no binary-beta-zero shortcut — M̃ is field-valued,
+///   not an R1CS identity)
+/// - Round polynomial is degree 2 (not degree 3)
+///
+/// # Arguments
+/// * `poly_M` - Field-valued multilinear polynomial (from `bind_row_vars_combined_int`)
+/// * `z` - i8-valued witness (binary 0/1)
+/// * `l0` - Number of small-value rounds
+pub fn build_accumulators_inner<F>(
+  poly_M: &MultilinearPolynomial<F>,
+  z: &[i8],
+  l0: usize,
+) -> LagrangeAccumulators<F, 2>
+where
+  F: PrimeField + DelayedReduction<i32> + DelayedReduction<F> + Send + Sync,
+{
+  let base: usize = 3; // D + 1 = 2 + 1 = 3
+  let l = poly_M.Z.len().trailing_zeros() as usize;
+  debug_assert_eq!(poly_M.Z.len(), 1usize << l, "poly size must be power of 2");
+  debug_assert_eq!(z.len(), poly_M.Z.len());
+  debug_assert!(l0 < l, "l0 must be < ℓ");
+
+  let prefix_size = 1usize << l0;
+  let suffix_size = 1usize << (l - l0);
+  let ext_size = base.pow(l0 as u32); // 3^l0
+
+  let BetaPrefixCache {
+    cache: beta_prefix_cache,
+    num_betas,
+  } = build_beta_cache::<2>(l0);
+
+  type State<F2> = InnerThreadState<F2, 2>;
+
+  // Parallel over suffixes with thread-local state.
+  // Unlike the Spartan builder (which resets partial sums per x_in iteration because
+  // the scatter involves per-suffix eq weighting), here the scatter is plain +=,
+  // so we accumulate partial sums across all suffixes in a chunk and scatter once.
+  let fold_results: Vec<State<F>> = (0..suffix_size)
+    .into_par_iter()
+    .fold(
+      || State::<F>::new(l0, num_betas, prefix_size, ext_size),
+      |mut state: State<F>, suffix| {
+        // No reset_partial_sums: accumulate across all suffixes in this chunk
+
+        // GATHER: collect 2^l0 evals for this suffix
+        #[allow(clippy::needless_range_loop)]
+        for p in 0..prefix_size {
+          let idx = p * suffix_size + suffix;
+          state.z_prefix_boolean_evals[p] = z[idx] as i32;
+          state.M_prefix_boolean_evals[p] = poly_M.Z[idx];
+        }
+
+        // EXTEND z: {0,1}^l0 → {∞,0,1}^l0 (integer add/sub)
+        let z_size = extend_to_lagrange_domain::<i32, 2>(
+          &state.z_prefix_boolean_evals,
+          &mut state.z_extended_evals,
+          &mut state.z_extended_scratch,
+        );
+        let z_ext = &state.z_extended_evals[..z_size];
+
+        // EXTEND M̃: {0,1}^l0 → {∞,0,1}^l0 (field add/sub only)
+        let m_size = extend_to_lagrange_domain::<F, 2>(
+          &state.M_prefix_boolean_evals,
+          &mut state.M_extended_evals,
+          &mut state.M_extended_scratch,
+        );
+        let m_ext = &state.M_extended_evals[..m_size];
+
+        // ACCUMULATE: field × i32 → DelayedReduction<i32> accumulator
+        for beta in 0..num_betas {
+          F::unreduced_multiply_accumulate(
+            &mut state.partial_sums[beta],
+            &m_ext[beta],
+            &z_ext[beta],
+          );
+        }
+
+        state
+      },
+    )
+    .collect();
+
+  // Sequential merge of thread-local accumulators.
+  // Two-phase: first reduce partial_sums and scatter, then merge acc.
+  // We need to reduce+scatter before merging because partial_sums are per-fold-chunk.
+  let mut result: LagrangeAccumulators<F, 2> = LagrangeAccumulators::new(l0);
+
+  for mut state in fold_results {
+    // Reduce partial sums and scatter into state.acc
+    for beta in 0..num_betas {
+      if state.partial_sums[beta].is_zero() {
+        continue;
+      }
+      let val = <F as DelayedReduction<i32>>::reduce(&state.partial_sums[beta]);
+      if val == F::ZERO {
+        continue;
+      }
+      // Scatter: plain += (no eq weighting)
+      for pref in &beta_prefix_cache[beta] {
+        state.acc.rounds[pref.round_0].data_mut()[pref.v_idx][pref.u_idx] += val;
+      }
+    }
+
+    // Merge into global result
+    result.merge(&state.acc);
+  }
+
+  result
 }
 
 // =============================================================================

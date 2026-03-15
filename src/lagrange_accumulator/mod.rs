@@ -45,7 +45,8 @@ pub use accumulator::{LagrangeAccumulators, RoundAccumulator};
 
 // Builder functions
 pub use accumulator_builder::{
-  SPARTAN_T_DEGREE, build_accumulators_neutronnova, build_accumulators_spartan,
+  SPARTAN_T_DEGREE, build_accumulators_inner, build_accumulators_neutronnova,
+  build_accumulators_spartan,
 };
 
 // Eq round factor and derivation
