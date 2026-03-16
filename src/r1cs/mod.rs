@@ -17,7 +17,8 @@ use crate::{
     transcript::{TranscriptEngineTrait, TranscriptReprTrait},
   },
 };
-use crate::small_field::{barrett::barrett_reduce_5, limbs::mac, montgomery::MontgomeryLimbs};
+use crate::small_constraint_system::SmallCoeff;
+use crate::small_field::montgomery::MontgomeryLimbs;
 use core::cmp::max;
 use ff::Field;
 use once_cell::sync::OnceCell;
@@ -54,24 +55,6 @@ fn mul_field_fast<F: ff::PrimeField>(x: F, v: &F) -> F {
     -x
   } else {
     x * v
-  }
-}
-
-/// Field × i32 multiply using direct limb MACs + Barrett reduction.
-/// Avoids `F::from(u64)` Montgomery conversion entirely.
-#[inline(always)]
-fn mul_field_i32_barrett<F: MontgomeryLimbs + ff::PrimeField>(x: &F, v: i32) -> F {
-  let a = x.to_limbs();
-  let mag = v.unsigned_abs() as u64;
-  let (r0, c) = mac(0, a[0], mag, 0);
-  let (r1, c) = mac(0, a[1], mag, c);
-  let (r2, c) = mac(0, a[2], mag, c);
-  let (r3, c) = mac(0, a[3], mag, c);
-  let result = F::from_limbs(barrett_reduce_5::<F>(&[r0, r1, r2, r3, c]));
-  if v > 0 {
-    result
-  } else {
-    -result
   }
 }
 
@@ -1252,248 +1235,6 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     })
   }
 
-  /// Pure integer matrix-vector multiply: Az, Bz, Cz with i32 coefficients and i8 bit witnesses.
-  pub fn multiply_vec_int(
-    &self,
-    z: &[i8],
-  ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>), SpartanError> {
-    let expected_len = self.num_public
-      + self.num_challenges
-      + 1
-      + self.num_shared
-      + self.num_precommitted
-      + self.num_rest;
-    if z.len() != expected_len {
-      return Err(SpartanError::InvalidWitnessLength);
-    }
-
-    let (Az, (Bz, Cz)) = rayon::join(
-      || self.A.multiply_vec_int(z),
-      || rayon::join(|| self.B.multiply_vec_int(z), || self.C.multiply_vec_int(z)),
-    );
-
-    Ok((Az?, Bz?, Cz?))
-  }
-
-  /// Pure integer matrix-vector multiply with boolean witnesses.
-  pub fn multiply_vec_bool(
-    &self,
-    z: &[bool],
-  ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>), SpartanError> {
-    let expected_len = self.num_public
-      + self.num_challenges
-      + 1
-      + self.num_shared
-      + self.num_precommitted
-      + self.num_rest;
-    if z.len() != expected_len {
-      return Err(SpartanError::InvalidWitnessLength);
-    }
-
-    let (Az, (Bz, Cz)) = rayon::join(
-      || self.A.multiply_vec_bool(z),
-      || rayon::join(|| self.B.multiply_vec_bool(z), || self.C.multiply_vec_bool(z)),
-    );
-
-    Ok((Az?, Bz?, Cz?))
-  }
-
-  /// Computes poly_ABC = A·rx + r·(B·rx) + r²·(C·rx) with i32 matrix entries.
-  ///
-  /// Uses column remapping to shrink thread-local buffers from `2 * num_vars` to
-  /// `num_dense_cols` (the number of columns actually touched by nonzero entries).
-  /// For SHA-256 after padding, ~80% of columns are empty → buffer shrinks from
-  /// ~64MB to ~6MB, fitting in L2 cache.
-  pub(crate) fn bind_row_vars_combined_int(
-    &self,
-    rx: &[E::Scalar],
-    r: E::Scalar,
-  ) -> Vec<E::Scalar>
-  where
-    E::Scalar: MontgomeryLimbs,
-  {
-    assert_eq!(rx.len(), self.num_cons);
-
-    let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
-    let num_cols = 2 * num_vars;
-    let r_sq = r * r;
-
-    let num_dense = self.dense_to_col.len();
-
-    // Fallback: if remap tables aren't built (e.g., after deserialization), use full buffer
-    if num_dense == 0 || self.A_dense_col.is_empty() {
-      return self.bind_row_vars_combined_int_no_remap(rx, r);
-    }
-
-    // Only iterate real (non-padded) rows — padded rows have zero NNZ
-    let num_rows = self.num_cons_unpadded;
-    let has_unit_partition = !self.A_unit_end.is_empty();
-
-    // Cap total buffer memory to avoid excessive allocation while preserving parallelism.
-    let buffer_bytes = num_dense * std::mem::size_of::<E::Scalar>();
-    let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
-    let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
-    let chunk_size = (num_rows + num_threads - 1) / num_threads;
-
-    // Allocate + compute in parallel with compact buffers
-    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
-      .into_par_iter()
-      .map(|thread_idx| {
-        let start_row = thread_idx * chunk_size;
-        let end_row = ((thread_idx + 1) * chunk_size).min(num_rows);
-        let mut buffer = vec![E::Scalar::ZERO; num_dense];
-
-        for row_idx in start_row..end_row {
-          let rx_row = rx[row_idx];
-          let rx_r = rx_row * r;
-          let rx_r_sq = rx_row * r_sq;
-
-          if has_unit_partition {
-            // --- Matrix A ---
-            let a_start = self.A.indptr[row_idx];
-            let a_unit = self.A_unit_end[row_idx];
-            let a_end = self.A.indptr[row_idx + 1];
-            // ±1 entries: add/sub only
-            for i in a_start..a_unit {
-              let idx = self.A_dense_col[i] as usize;
-              if self.A.data[i] > 0 {
-                buffer[idx] += rx_row;
-              } else {
-                buffer[idx] -= rx_row;
-              }
-            }
-            // Non-±1 entries: Barrett multiply
-            for i in a_unit..a_end {
-              let idx = self.A_dense_col[i] as usize;
-              buffer[idx] += mul_field_i32_barrett(&rx_row, self.A.data[i]);
-            }
-
-            // --- Matrix B ---
-            let b_start = self.B.indptr[row_idx];
-            let b_unit = self.B_unit_end[row_idx];
-            let b_end = self.B.indptr[row_idx + 1];
-            for i in b_start..b_unit {
-              let idx = self.B_dense_col[i] as usize;
-              if self.B.data[i] > 0 {
-                buffer[idx] += rx_r;
-              } else {
-                buffer[idx] -= rx_r;
-              }
-            }
-            for i in b_unit..b_end {
-              let idx = self.B_dense_col[i] as usize;
-              buffer[idx] += mul_field_i32_barrett(&rx_r, self.B.data[i]);
-            }
-
-            // --- Matrix C ---
-            let c_start = self.C.indptr[row_idx];
-            let c_unit = self.C_unit_end[row_idx];
-            let c_end = self.C.indptr[row_idx + 1];
-            for i in c_start..c_unit {
-              let idx = self.C_dense_col[i] as usize;
-              if self.C.data[i] > 0 {
-                buffer[idx] += rx_r_sq;
-              } else {
-                buffer[idx] -= rx_r_sq;
-              }
-            }
-            for i in c_unit..c_end {
-              let idx = self.C_dense_col[i] as usize;
-              buffer[idx] += mul_field_i32_barrett(&rx_r_sq, self.C.data[i]);
-            }
-          } else {
-            // Fallback: no partition data, use mul_field_i32 for all entries
-            for i in self.A.indptr[row_idx]..self.A.indptr[row_idx + 1] {
-              let idx = self.A_dense_col[i] as usize;
-              buffer[idx] += mul_field_i32(rx_row, self.A.data[i]);
-            }
-            for i in self.B.indptr[row_idx]..self.B.indptr[row_idx + 1] {
-              let idx = self.B_dense_col[i] as usize;
-              buffer[idx] += mul_field_i32(rx_r, self.B.data[i]);
-            }
-            for i in self.C.indptr[row_idx]..self.C.indptr[row_idx + 1] {
-              let idx = self.C_dense_col[i] as usize;
-              buffer[idx] += mul_field_i32(rx_r_sq, self.C.data[i]);
-            }
-          }
-        }
-        buffer
-      })
-      .collect();
-
-    // Reduce compact thread buffers
-    let mut compact = thread_buffers.swap_remove(0);
-    for buffer in thread_buffers {
-      compact
-        .par_iter_mut()
-        .zip(buffer.par_iter())
-        .for_each(|(a, b)| *a += *b);
-    }
-
-    // Expand compact buffer → full-size output
-    let mut result = vec![E::Scalar::ZERO; num_cols];
-    for (dense_idx, &orig_col) in self.dense_to_col.iter().enumerate() {
-      result[orig_col as usize] = compact[dense_idx];
-    }
-
-    result
-  }
-
-  /// Fallback without column remapping (used when remap tables are not populated).
-  fn bind_row_vars_combined_int_no_remap(
-    &self,
-    rx: &[E::Scalar],
-    r: E::Scalar,
-  ) -> Vec<E::Scalar> {
-    let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
-    let num_cols = 2 * num_vars;
-    let r_sq = r * r;
-    let buffer_bytes = num_cols * std::mem::size_of::<E::Scalar>();
-    let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
-    let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
-    let chunk_size = (self.num_cons + num_threads - 1) / num_threads;
-
-    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
-      .into_par_iter()
-      .map(|thread_idx| {
-        let start_row = thread_idx * chunk_size;
-        let end_row = ((thread_idx + 1) * chunk_size).min(self.num_cons);
-        let mut buffer = vec![E::Scalar::ZERO; num_cols];
-
-        for row_idx in start_row..end_row {
-          let rx_row = rx[row_idx];
-          let rx_r = rx_row * r;
-          let rx_r_sq = rx_row * r_sq;
-
-          let a_ptrs = [self.A.indptr[row_idx], self.A.indptr[row_idx + 1]];
-          let b_ptrs = [self.B.indptr[row_idx], self.B.indptr[row_idx + 1]];
-          let c_ptrs = [self.C.indptr[row_idx], self.C.indptr[row_idx + 1]];
-
-          for (val, col) in self.A.get_row_unchecked(&a_ptrs) {
-            buffer[*col] += mul_field_i32(rx_row, *val);
-          }
-          for (val, col) in self.B.get_row_unchecked(&b_ptrs) {
-            buffer[*col] += mul_field_i32(rx_r, *val);
-          }
-          for (val, col) in self.C.get_row_unchecked(&c_ptrs) {
-            buffer[*col] += mul_field_i32(rx_r_sq, *val);
-          }
-        }
-        buffer
-      })
-      .collect();
-
-    let mut result = thread_buffers.swap_remove(0);
-    for buffer in thread_buffers {
-      result
-        .par_iter_mut()
-        .zip(buffer.par_iter())
-        .for_each(|(a, b)| *a += *b);
-    }
-
-    result
-  }
-
   /// Evaluates the MLE of R1CS matrices at the provided point (i32 matrix entries).
   pub fn evaluate_with_tables_int(
     &self,
@@ -1519,6 +1260,223 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
       multi_eval(&self.B),
       multi_eval(&self.C),
     )
+  }
+}
+
+// ---- Generic SmallCoeff methods ----
+
+impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
+  /// Generic matrix-vector multiply: Az, Bz, Cz with `Coeff` coefficients and `W` witnesses.
+  pub fn multiply_vec_witness<W>(
+    &self,
+    z: &[W],
+  ) -> Result<(Vec<Coeff>, Vec<Coeff>, Vec<Coeff>), SpartanError>
+  where
+    W: Copy + Default + PartialEq + Send + Sync,
+  {
+    let expected_len = self.num_public
+      + self.num_challenges
+      + 1
+      + self.num_shared
+      + self.num_precommitted
+      + self.num_rest;
+    if z.len() != expected_len {
+      return Err(SpartanError::InvalidWitnessLength);
+    }
+
+    let (Az, (Bz, Cz)) = rayon::join(
+      || self.A.multiply_vec_witness(z),
+      || {
+        rayon::join(
+          || self.B.multiply_vec_witness(z),
+          || self.C.multiply_vec_witness(z),
+        )
+      },
+    );
+
+    Ok((Az?, Bz?, Cz?))
+  }
+
+  /// Computes poly_ABC = A·rx + r·(B·rx) + r²·(C·rx).
+  ///
+  /// Uses column remapping to shrink thread-local buffers from `2 * num_vars` to
+  /// `num_dense_cols` (the number of columns actually touched by nonzero entries).
+  /// For SHA-256 after padding, ~80% of columns are empty → buffer shrinks from
+  /// ~64MB to ~6MB, fitting in L2 cache.
+  pub(crate) fn bind_row_vars_combined_small(
+    &self,
+    rx: &[E::Scalar],
+    r: E::Scalar,
+  ) -> Vec<E::Scalar>
+  where
+    E::Scalar: MontgomeryLimbs,
+  {
+    assert_eq!(rx.len(), self.num_cons);
+
+    let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
+    let num_cols = 2 * num_vars;
+    let r_sq = r * r;
+
+    let num_dense = self.dense_to_col.len();
+
+    // Fallback: if remap tables aren't built (e.g., after deserialization), use full buffer
+    if num_dense == 0 || self.A_dense_col.is_empty() {
+      return self.bind_row_vars_combined_small_no_remap(rx, r);
+    }
+
+    // Only iterate real (non-padded) rows — padded rows have zero NNZ
+    let num_rows = self.num_cons_unpadded;
+    let has_unit_partition = !self.A_unit_end.is_empty();
+
+    // Cap total buffer memory to avoid excessive allocation while preserving parallelism.
+    let buffer_bytes = num_dense * std::mem::size_of::<E::Scalar>();
+    let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
+    let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
+    let chunk_size = (num_rows + num_threads - 1) / num_threads;
+
+    // Helper: process one matrix's entries for a row
+    #[inline(always)]
+    fn process_matrix_row<F: ff::PrimeField + MontgomeryLimbs, C: SmallCoeff>(
+      buffer: &mut [F],
+      rx_scaled: F,
+      data: &[C],
+      dense_col: &[u32],
+      start: usize,
+      unit_end: usize,
+      end: usize,
+      has_unit: bool,
+    ) {
+      if has_unit {
+        // ±1 entries: add/sub only (no multiply)
+        for i in start..unit_end {
+          let idx = dense_col[i] as usize;
+          if data[i].is_positive() {
+            buffer[idx] += rx_scaled;
+          } else {
+            buffer[idx] -= rx_scaled;
+          }
+        }
+        // Non-±1 entries: use SmallCoeff::mul_field
+        for i in unit_end..end {
+          let idx = dense_col[i] as usize;
+          buffer[idx] += data[i].mul_field(&rx_scaled);
+        }
+      } else {
+        for i in start..end {
+          let idx = dense_col[i] as usize;
+          buffer[idx] += data[i].mul_field(&rx_scaled);
+        }
+      }
+    }
+
+    // Allocate + compute in parallel with compact buffers
+    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
+      .into_par_iter()
+      .map(|thread_idx| {
+        let start_row = thread_idx * chunk_size;
+        let end_row = ((thread_idx + 1) * chunk_size).min(num_rows);
+        let mut buffer = vec![E::Scalar::ZERO; num_dense];
+
+        for row_idx in start_row..end_row {
+          let rx_row = rx[row_idx];
+          let rx_r = rx_row * r;
+          let rx_r_sq = rx_row * r_sq;
+
+          let a_unit = if has_unit_partition { self.A_unit_end[row_idx] } else { self.A.indptr[row_idx] };
+          let b_unit = if has_unit_partition { self.B_unit_end[row_idx] } else { self.B.indptr[row_idx] };
+          let c_unit = if has_unit_partition { self.C_unit_end[row_idx] } else { self.C.indptr[row_idx] };
+
+          process_matrix_row(
+            &mut buffer, rx_row, &self.A.data, &self.A_dense_col,
+            self.A.indptr[row_idx], a_unit, self.A.indptr[row_idx + 1], has_unit_partition,
+          );
+          process_matrix_row(
+            &mut buffer, rx_r, &self.B.data, &self.B_dense_col,
+            self.B.indptr[row_idx], b_unit, self.B.indptr[row_idx + 1], has_unit_partition,
+          );
+          process_matrix_row(
+            &mut buffer, rx_r_sq, &self.C.data, &self.C_dense_col,
+            self.C.indptr[row_idx], c_unit, self.C.indptr[row_idx + 1], has_unit_partition,
+          );
+        }
+        buffer
+      })
+      .collect();
+
+    // Reduce compact thread buffers
+    let mut compact = thread_buffers.swap_remove(0);
+    for buffer in thread_buffers {
+      compact
+        .par_iter_mut()
+        .zip(buffer.par_iter())
+        .for_each(|(a, b)| *a += *b);
+    }
+
+    // Expand compact buffer → full-size output
+    let mut result = vec![E::Scalar::ZERO; num_cols];
+    for (dense_idx, &orig_col) in self.dense_to_col.iter().enumerate() {
+      result[orig_col as usize] = compact[dense_idx];
+    }
+
+    result
+  }
+
+  /// Fallback without column remapping (used when remap tables are not populated).
+  fn bind_row_vars_combined_small_no_remap(
+    &self,
+    rx: &[E::Scalar],
+    r: E::Scalar,
+  ) -> Vec<E::Scalar>
+  where
+    E::Scalar: MontgomeryLimbs,
+  {
+    let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
+    let num_cols = 2 * num_vars;
+    let r_sq = r * r;
+    let buffer_bytes = num_cols * std::mem::size_of::<E::Scalar>();
+    let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
+    let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
+    let chunk_size = (self.num_cons + num_threads - 1) / num_threads;
+
+    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
+      .into_par_iter()
+      .map(|thread_idx| {
+        let start_row = thread_idx * chunk_size;
+        let end_row = ((thread_idx + 1) * chunk_size).min(self.num_cons);
+        let mut buffer = vec![E::Scalar::ZERO; num_cols];
+
+        for row_idx in start_row..end_row {
+          let rx_row = rx[row_idx];
+          let rx_r = rx_row * r;
+          let rx_r_sq = rx_row * r_sq;
+
+          let a_ptrs = [self.A.indptr[row_idx], self.A.indptr[row_idx + 1]];
+          let b_ptrs = [self.B.indptr[row_idx], self.B.indptr[row_idx + 1]];
+          let c_ptrs = [self.C.indptr[row_idx], self.C.indptr[row_idx + 1]];
+
+          for (val, col) in self.A.get_row_unchecked(&a_ptrs) {
+            buffer[*col] += val.mul_field(&rx_row);
+          }
+          for (val, col) in self.B.get_row_unchecked(&b_ptrs) {
+            buffer[*col] += val.mul_field(&rx_r);
+          }
+          for (val, col) in self.C.get_row_unchecked(&c_ptrs) {
+            buffer[*col] += val.mul_field(&rx_r_sq);
+          }
+        }
+        buffer
+      })
+      .collect();
+
+    let mut result = thread_buffers.swap_remove(0);
+    for buffer in thread_buffers {
+      result
+        .par_iter_mut()
+        .zip(buffer.par_iter())
+        .for_each(|(a, b)| *a += *b);
+    }
+
+    result
   }
 }
 

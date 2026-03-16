@@ -238,73 +238,40 @@ impl<F: PrimeField> SparseMatrix<F> {
   }
 }
 
-// ---- Pure integer methods for i32 matrices ----
+// ---- Pure integer methods for small-coefficient matrices ----
 
-impl SparseMatrix<i32> {
+impl<Coeff: Copy + Default + std::ops::AddAssign + Send + Sync> SparseMatrix<Coeff> {
   /// Pure integer matrix-vector multiply for the small-value path.
   ///
-  /// Computes M × z where M has i32 coefficients and z has i8 values (bits 0/1).
-  /// Since witnesses are bits, this is conditional addition: for each nonzero z[col],
+  /// Computes M × z where M has `Coeff` coefficients and z has small witness values.
+  /// Since witnesses are bits (0/1), this is conditional addition: for each nonzero z[col],
   /// add data[i] to the accumulator. No multiply needed.
   ///
-  /// # Safety assumptions
-  /// The caller must ensure z contains only 0 or 1 values (bit witnesses).
   /// For SHA-256 with NoBatchEq (max coeff ~2^18) and ~200 nonzeros per row,
   /// each row result is at most ~200 × 2^18 ≈ 2^26, well within i32 range.
-  ///
-  /// # Errors
-  /// Returns `SpartanError::InvalidInputLength` if vector length doesn't match.
-  pub fn multiply_vec_int(&self, z: &[i8]) -> Result<Vec<i32>, SpartanError> {
+  pub fn multiply_vec_witness<W>(&self, z: &[W]) -> Result<Vec<Coeff>, SpartanError>
+  where
+    W: Copy + Default + PartialEq + Send + Sync,
+  {
     if self.cols != z.len() {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
-          "SparseMatrix::multiply_vec_int: Expected {} elements, got {}",
+          "SparseMatrix::multiply_vec_witness: Expected {} elements, got {}",
           self.cols,
           z.len()
         ),
       });
     }
 
+    let zero_w = W::default();
     Ok(
       self
         .indptr
         .par_windows(2)
         .map(|ptrs| {
-          let mut acc: i32 = 0;
+          let mut acc = Coeff::default();
           for i in ptrs[0]..ptrs[1] {
-            if z[self.indices[i]] != 0 {
-              acc += self.data[i];
-            }
-          }
-          acc
-        })
-        .collect(),
-    )
-  }
-
-  /// Pure integer matrix-vector multiply for boolean witnesses.
-  ///
-  /// Same as `multiply_vec_int` but takes `&[bool]` directly, avoiding the
-  /// `!= 0` comparison and enabling exhaustive match patterns.
-  pub fn multiply_vec_bool(&self, z: &[bool]) -> Result<Vec<i32>, SpartanError> {
-    if self.cols != z.len() {
-      return Err(SpartanError::InvalidInputLength {
-        reason: format!(
-          "SparseMatrix::multiply_vec_bool: Expected {} elements, got {}",
-          self.cols,
-          z.len()
-        ),
-      });
-    }
-
-    Ok(
-      self
-        .indptr
-        .par_windows(2)
-        .map(|ptrs| {
-          let mut acc: i32 = 0;
-          for i in ptrs[0]..ptrs[1] {
-            if z[self.indices[i]] {
+            if z[self.indices[i]] != zero_w {
               acc += self.data[i];
             }
           }
@@ -476,7 +443,7 @@ mod tests {
   }
 
   #[test]
-  fn test_multiply_vec_int_basic() {
+  fn test_multiply_vec_witness_basic() {
     // Build a 3×3 i32 matrix manually in CSR format
     // z is bit-valued (0/1), so this tests conditional addition
     let matrix = SparseMatrix::<i32> {
@@ -486,7 +453,7 @@ mod tests {
       cols: 3,
     };
     let z: Vec<i8> = vec![1, 1, 1]; // all bits set
-    let result = matrix.multiply_vec_int(&z).unwrap();
+    let result = matrix.multiply_vec_witness(&z).unwrap();
     // Row 0: 2*1 + 7*1 = 9
     // Row 1: 3*1 = 3
     // Row 2: 4*1 = 4
@@ -494,7 +461,7 @@ mod tests {
 
     // Test with zeros
     let z2: Vec<i8> = vec![0, 1, 0]; // only bit 1 set
-    let result2 = matrix.multiply_vec_int(&z2).unwrap();
+    let result2 = matrix.multiply_vec_witness(&z2).unwrap();
     // Row 0: 2*1 = 2
     // Row 1: 0
     // Row 2: 0

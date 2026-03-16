@@ -20,6 +20,65 @@ pub use bridge::SmallToBellpepperCS;
 use bellpepper_core::{Index, SynthesisError, Variable};
 
 use crate::r1cs::SparseMatrix;
+use crate::small_field::{WideMul, montgomery::MontgomeryLimbs};
+
+// ── SmallCoeff ───────────────────────────────────────────────────────────
+
+/// A matrix coefficient type for the small-value proving path.
+///
+/// Abstracts over `i32` (and potentially `i16`, `i8`) for matrix coefficients.
+/// The key method is `mul_field` which multiplies a field element by this coefficient,
+/// with type-specific optimizations (e.g., Barrett reduction for `i32`).
+pub trait SmallCoeff:
+  Copy
+  + Clone
+  + Default
+  + Send
+  + Sync
+  + std::ops::Add<Output = Self>
+  + std::ops::Sub<Output = Self>
+  + std::ops::AddAssign
+  + std::ops::Neg<Output = Self>
+  + PartialEq
+  + PartialOrd
+  + WideMul
+{
+  /// Multiply a field element by this coefficient (optimized dispatch).
+  /// Implementations should fast-path ±1 and use Barrett/limb tricks for larger values.
+  fn mul_field<F: ff::PrimeField + MontgomeryLimbs>(self, x: &F) -> F;
+
+  /// Whether this value is ±1 (for unit partition optimization).
+  fn is_unit(&self) -> bool;
+
+  /// Whether this value is positive (> 0).
+  fn is_positive(&self) -> bool;
+}
+
+impl SmallCoeff for i32 {
+  #[inline(always)]
+  fn mul_field<F: ff::PrimeField + MontgomeryLimbs>(self, x: &F) -> F {
+    use crate::small_field::barrett::barrett_reduce_5;
+    use crate::small_field::limbs::mac;
+    let a = x.to_limbs();
+    let mag = self.unsigned_abs() as u64;
+    let (r0, c) = mac(0, a[0], mag, 0);
+    let (r1, c) = mac(0, a[1], mag, c);
+    let (r2, c) = mac(0, a[2], mag, c);
+    let (r3, c) = mac(0, a[3], mag, c);
+    let result = F::from_limbs(barrett_reduce_5::<F>(&[r0, r1, r2, r3, c]));
+    if self > 0 { result } else { -result }
+  }
+
+  #[inline(always)]
+  fn is_unit(&self) -> bool {
+    *self == 1 || *self == -1
+  }
+
+  #[inline(always)]
+  fn is_positive(&self) -> bool {
+    *self > 0
+  }
+}
 
 // ── SmallLinearCombination ─────────────────────────────────────────────────
 
@@ -210,14 +269,14 @@ impl<V: Copy + Default> SmallSatisfyingAssignment<V> {
   }
 }
 
-impl SmallConstraintSystem<i8> for SmallSatisfyingAssignment<i8> {
+impl<V: Copy + Default> SmallConstraintSystem<V> for SmallSatisfyingAssignment<V> {
   type Root = Self;
 
   fn alloc<A, AR, F>(&mut self, _annotation: A, f: F) -> Result<Variable, SynthesisError>
   where
     A: FnOnce() -> AR,
     AR: Into<String>,
-    F: FnOnce() -> Result<i8, SynthesisError>,
+    F: FnOnce() -> Result<V, SynthesisError>,
   {
     let val = f()?;
     self.aux_assignment.push(val);
@@ -230,7 +289,7 @@ impl SmallConstraintSystem<i8> for SmallSatisfyingAssignment<i8> {
   where
     A: FnOnce() -> AR,
     AR: Into<String>,
-    F: FnOnce() -> Result<i8, SynthesisError>,
+    F: FnOnce() -> Result<V, SynthesisError>,
   {
     let val = f()?;
     self.input_assignment.push(val);
@@ -242,9 +301,9 @@ impl SmallConstraintSystem<i8> for SmallSatisfyingAssignment<i8> {
   fn enforce<A, AR>(
     &mut self,
     _annotation: A,
-    _a: SmallLinearCombination<i8>,
-    _b: SmallLinearCombination<i8>,
-    _c: SmallLinearCombination<i8>,
+    _a: SmallLinearCombination<V>,
+    _b: SmallLinearCombination<V>,
+    _c: SmallLinearCombination<V>,
   ) where
     A: FnOnce() -> AR,
     AR: Into<String>,

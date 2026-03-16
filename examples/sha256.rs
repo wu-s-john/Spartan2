@@ -139,7 +139,7 @@ fn run_benchmark<E: Engine>(
 
       // Prep: witness gen (shared + precommitted) + commit
       let t0 = Instant::now();
-      let prep = SpartanSNARK::<E>::prep_prove_small(&pk_small, &circuit).expect("prep_prove_small failed");
+      let prep = SpartanSNARK::<E>::prep_prove_small::<_, _, i8>(&pk_small, &circuit).expect("prep_prove_small failed");
       let prep_ms = t0.elapsed().as_millis() as u64;
       info!(elapsed_ms = prep_ms, "prep_prove_small");
 

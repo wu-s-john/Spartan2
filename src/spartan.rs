@@ -21,7 +21,8 @@ use crate::{
     multilinear::{MultilinearPolynomial, SparsePolynomial},
   },
   r1cs::{R1CSWitness, SplitR1CSInstance, SplitR1CSShape},
-  small_field::{DelayedReduction, SmallValueField, vec_to_small_for_extension},
+  small_constraint_system::SmallCoeff,
+  small_field::{DelayedReduction, SmallValueField, WideMul, vec_to_small_for_extension},
   small_sumcheck::prove_cubic_small_value,
   start_span,
   sumcheck::SumcheckProof,
@@ -409,19 +410,24 @@ impl<E: Engine> SpartanSNARK<E> {
     z
   }
 
-  /// Build z = [W | 1 | public_values | challenges] converting i8 binary values to field elements.
-  fn build_z_field(w_i8: &[i8], pub_i8: &[i8], challenges: &[E::Scalar]) -> Vec<E::Scalar> {
-    let i8_to_field = |&v: &i8| {
-      if v == 0 {
+  /// Build z = [W | 1 | public_values | challenges] converting small witness values to field elements.
+  fn build_z_field<W: Copy + Default + PartialEq>(
+    w: &[W],
+    pub_w: &[W],
+    challenges: &[E::Scalar],
+  ) -> Vec<E::Scalar> {
+    let zero_w = W::default();
+    let to_field = |v: &W| {
+      if *v == zero_w {
         E::Scalar::ZERO
       } else {
         E::Scalar::ONE
       }
     };
-    let mut z = Vec::with_capacity(w_i8.len() + 1 + pub_i8.len() + challenges.len());
-    z.extend(w_i8.iter().map(i8_to_field));
+    let mut z = Vec::with_capacity(w.len() + 1 + pub_w.len() + challenges.len());
+    z.extend(w.iter().map(to_field));
     z.push(E::Scalar::ONE);
-    z.extend(pub_i8.iter().map(i8_to_field));
+    z.extend(pub_w.iter().map(to_field));
     z.extend_from_slice(challenges);
     z
   }
@@ -668,7 +674,7 @@ impl<E: Engine> SpartanSNARK<E> {
     Ok(snark)
   }
 
-  /// Sets up a prover key with i32 coefficient matrices for the small-value path.
+  /// Sets up a prover key with small-value coefficient matrices.
   ///
   /// Caches the shape so that `prep_prove_small` and `prove_small_value` don't
   /// need to re-synthesize it.
@@ -697,12 +703,13 @@ impl<E: Engine> SpartanSNARK<E> {
   /// and commits to those portions.
   ///
   /// Returns a `SmallPrepSNARK` that can be passed to `prove_small_value`.
-  pub fn prep_prove_small<C>(
-    pk: &SpartanProverKey<E, i32>,
+  pub fn prep_prove_small<C, Coeff, W>(
+    pk: &SpartanProverKey<E, Coeff>,
     circuit: &C,
-  ) -> Result<SmallPrepSNARK<E, i8>, SpartanError>
+  ) -> Result<SmallPrepSNARK<E, W>, SpartanError>
   where
-    C: SmallSpartanCircuit<E, i8>,
+    W: Copy + Clone + Default + PartialEq + Send + Sync,
+    C: SmallSpartanCircuit<E, W>,
   {
     use crate::{
       PCS, bellpepper::r1cs::SmallPrepSNARK, small_constraint_system::SmallSatisfyingAssignment,
@@ -711,7 +718,7 @@ impl<E: Engine> SpartanSNARK<E> {
     // Synthesis span — matches "precommitted_witness_synthesize" from field path
     let (_synth_span, synth_t) = start_span!("precommitted_witness_synthesize");
 
-    let mut cs = SmallSatisfyingAssignment::<i8>::new();
+    let mut cs = SmallSatisfyingAssignment::<W>::new();
 
     let shared = circuit
       .shared(&mut cs)
@@ -720,14 +727,15 @@ impl<E: Engine> SpartanSNARK<E> {
       })?;
 
     let num_vars = pk.S.num_shared + pk.S.num_precommitted + pk.S.num_rest;
-    let mut witness = vec![0i8; num_vars];
+    let mut witness = vec![W::default(); num_vars];
     let shared_copy = cs.aux_assignment.len().min(pk.S.num_shared_unpadded);
     witness[..shared_copy].copy_from_slice(&cs.aux_assignment[..shared_copy]);
 
-    // Commit shared (convert i8 → bool for msm_bool)
+    // Commit shared (convert W → bool for msm_bool)
+    let zero_w = W::default();
     let (comm_W_shared, r_W_shared) = if pk.S.num_shared_unpadded > 0 {
       let r = PCS::<E>::blind(&pk.ck, pk.S.num_shared);
-      let w_bool: Vec<bool> = witness[..pk.S.num_shared].iter().map(|&v| v != 0).collect();
+      let w_bool: Vec<bool> = witness[..pk.S.num_shared].iter().map(|v| *v != zero_w).collect();
       let comm = PCS::<E>::commit_witness(&pk.ck, &w_bool, &r)?;
       (Some(comm), Some(r))
     } else {
@@ -761,7 +769,7 @@ impl<E: Engine> SpartanSNARK<E> {
       let r = PCS::<E>::blind(&pk.ck, pk.S.num_precommitted);
       let w_bool: Vec<bool> = witness[pk.S.num_shared..pk.S.num_shared + pk.S.num_precommitted]
         .iter()
-        .map(|&v| v != 0)
+        .map(|v| *v != zero_w)
         .collect();
       let comm = PCS::<E>::commit_witness(&pk.ck, &w_bool, &r)?;
       (Some(comm), Some(r))
@@ -784,18 +792,21 @@ impl<E: Engine> SpartanSNARK<E> {
 
   /// Proves satisfiability using the prep/prove split for the pure-integer path.
   ///
-  /// Takes a cached `SpartanProverKey<E, i32>` and a `SmallPrepSNARK<E, i8>` from
+  /// Generic over coefficient type `Coeff` (matrix entries) and witness type `W` (variable values).
+  /// Takes a cached `SpartanProverKey<E, Coeff>` and a `SmallPrepSNARK<E, W>` from
   /// `prep_prove_small`, synthesizes the rest, commits, and runs mat-vec + sumcheck + PCS.
-  pub fn prove_small_value<C>(
-    pk: &SpartanProverKey<E, i32>,
+  pub fn prove_small_value<C, Coeff, W>(
+    pk: &SpartanProverKey<E, Coeff>,
     circuit: C,
-    prep: &SmallPrepSNARK<E, i8>,
+    prep: &SmallPrepSNARK<E, W>,
   ) -> Result<Self, SpartanError>
   where
-    C: SmallSpartanCircuit<E, i32> + SmallSpartanCircuit<E, i8>,
-    E::Scalar: SmallValueField<i32>
-      + DelayedReduction<i32>
-      + DelayedReduction<i64>
+    W: Copy + Clone + Default + One + PartialEq + Send + Sync,
+    Coeff: SmallCoeff,
+    C: SmallSpartanCircuit<E, Coeff> + SmallSpartanCircuit<E, W>,
+    E::Scalar: SmallValueField<Coeff>
+      + DelayedReduction<Coeff>
+      + DelayedReduction<<Coeff as WideMul>::Product>
       + DelayedReduction<bool>
       + DelayedReduction<E::Scalar>
       + crate::small_field::montgomery::MontgomeryLimbs,
@@ -805,18 +816,19 @@ impl<E: Engine> SpartanSNARK<E> {
     let (_prove_span, prove_t) = start_span!("spartan_snark_prove");
 
     // Transcript setup
+    let zero_w = W::default();
     let mut transcript = E::TE::new(b"SpartanSNARK");
     transcript.absorb(b"vk", &pk.vk_digest);
-    let pub_i8: Vec<i8> =
-      <C as SmallSpartanCircuit<E, i8>>::public_values(&circuit).map_err(|e| {
+    let pub_w: Vec<W> =
+      <C as SmallSpartanCircuit<E, W>>::public_values(&circuit).map_err(|e| {
         SpartanError::SynthesisError {
           reason: format!("prove_small_value: public_values: {e}"),
         }
       })?;
-    let pub_field: Vec<E::Scalar> = pub_i8
+    let pub_field: Vec<E::Scalar> = pub_w
       .iter()
-      .map(|&v| {
-        if v == 0 {
+      .map(|v| {
+        if *v == zero_w {
           E::Scalar::ZERO
         } else {
           E::Scalar::ONE
@@ -838,7 +850,7 @@ impl<E: Engine> SpartanSNARK<E> {
 
     // Challenges
     let challenges_field: Vec<E::Scalar> =
-      (0..<C as SmallSpartanCircuit<E, i8>>::num_challenges(&circuit))
+      (0..<C as SmallSpartanCircuit<E, W>>::num_challenges(&circuit))
         .map(|_| transcript.squeeze(b"c"))
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -869,7 +881,7 @@ impl<E: Engine> SpartanSNARK<E> {
     let r_W_rest = PCS::<E>::blind(&pk.ck, pk.S.num_rest);
     let w_rest_bool: Vec<bool> = prep.W[pk.S.num_shared + pk.S.num_precommitted..]
       .iter()
-      .map(|&v| v != 0)
+      .map(|v| *v != zero_w)
       .collect();
     let comm_W_rest = PCS::<E>::commit_witness(&pk.ck, &w_rest_bool, &r_W_rest)?;
     info!(elapsed_ms = %commit_rest_t.elapsed().as_millis(), "commit_witness_rest");
@@ -886,18 +898,18 @@ impl<E: Engine> SpartanSNARK<E> {
     blinds.push(r_W_rest);
     let r_W = PCS::<E>::combine_blinds(&blinds)?;
 
-    // Build U_i8 instance
-    let U_i8 = SplitR1CSInstance::<E, i8> {
+    // Build U_w instance
+    let U_w = SplitR1CSInstance::<E, W> {
       comm_W_shared: prep.comm_W_shared.clone(),
       comm_W_precommitted: prep.comm_W_precommitted.clone(),
       comm_W_rest: comm_W_rest.clone(),
-      public_values: pub_i8.clone(),
+      public_values: pub_w.clone(),
       challenges: challenges_field,
     };
 
-    // Build z_i8 for mat-vec
-    let challenges_i8 = vec![0i8; U_i8.challenges.len()];
-    let z_i8 = Self::build_z_small(&prep.W, &pub_i8, &challenges_i8);
+    // Build z_w for mat-vec
+    let challenges_w = vec![W::default(); U_w.challenges.len()];
+    let z_w = Self::build_z_small(&prep.W, &pub_w, &challenges_w);
 
     let num_vars = pk.S.num_shared + pk.S.num_precommitted + pk.S.num_rest;
     let num_rounds_x =
@@ -910,7 +922,7 @@ impl<E: Engine> SpartanSNARK<E> {
 
     // Pure-integer mat-vec
     let (_mv_span, mv_t) = start_span!("matrix_vector_multiply");
-    let (Az_i32, Bz_i32, Cz_i32) = pk.S.multiply_vec_int(&z_i8)?;
+    let (Az, Bz, Cz) = pk.S.multiply_vec_witness(&z_w)?;
     info!(
       elapsed_ms = %mv_t.elapsed().as_millis(),
       constraints = %pk.S.num_cons,
@@ -918,14 +930,14 @@ impl<E: Engine> SpartanSNARK<E> {
       "matrix_vector_multiply"
     );
 
-    // Outer sumcheck with i32 polynomials
+    // Outer sumcheck with small-value polynomials
     let (_sc_span, sc_t) = start_span!("outer_sumcheck");
-    let (sc_proof_outer, r_x, claims_outer) = prove_cubic_small_value::<E, i32, 3>(
+    let (sc_proof_outer, r_x, claims_outer) = prove_cubic_small_value::<E, Coeff, 3>(
       &E::Scalar::ZERO,
       tau,
-      &MultilinearPolynomial::new(Az_i32),
-      &MultilinearPolynomial::new(Bz_i32),
-      &MultilinearPolynomial::new(Cz_i32),
+      &MultilinearPolynomial::new(Az),
+      &MultilinearPolynomial::new(Bz),
+      &MultilinearPolynomial::new(Cz),
       &mut transcript,
     )?;
 
@@ -945,14 +957,14 @@ impl<E: Engine> SpartanSNARK<E> {
     info!(elapsed_ms = %eval_rx_t.elapsed().as_millis(), "compute_eval_rx");
 
     let (_sparse_span, sparse_t) = start_span!("compute_eval_table_sparse");
-    let poly_ABC = pk.S.bind_row_vars_combined_int(&evals_rx, r);
+    let poly_ABC = pk.S.bind_row_vars_combined_small(&evals_rx, r);
     info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
 
     // Inner sumcheck — use prove_quad_small_value with Lagrange accumulators
     let (_sc2_span, sc2_t) = start_span!("inner_sumcheck");
     let l0_inner = std::cmp::min(3, num_rounds_y.saturating_sub(1));
-    let (sc_proof_inner, r_y, claims_inner) = if U_i8.challenges.is_empty() {
-      let mut z_bool: Vec<bool> = z_i8.iter().map(|&v| v != 0).collect();
+    let (sc_proof_inner, r_y, claims_inner) = if U_w.challenges.is_empty() {
+      let mut z_bool: Vec<bool> = z_w.iter().map(|v| *v != zero_w).collect();
       z_bool.resize(num_vars * 2, false);
       crate::small_sumcheck::prove_quad_small_value::<E>(
         &claim_inner_joint,
@@ -963,7 +975,7 @@ impl<E: Engine> SpartanSNARK<E> {
         &mut transcript,
       )?
     } else {
-      let mut z_field = Self::build_z_field(&prep.W, &pub_i8, &U_i8.challenges);
+      let mut z_field = Self::build_z_field(&prep.W, &pub_w, &U_w.challenges);
       z_field.resize(num_vars * 2, E::Scalar::ZERO);
       SumcheckProof::prove_quad(
         &claim_inner_joint,
@@ -978,11 +990,11 @@ impl<E: Engine> SpartanSNARK<E> {
 
     // Build field U for eval_X computation
     let U_field = SplitR1CSInstance::<E> {
-      comm_W_shared: U_i8.comm_W_shared.clone(),
-      comm_W_precommitted: U_i8.comm_W_precommitted.clone(),
-      comm_W_rest: U_i8.comm_W_rest.clone(),
+      comm_W_shared: U_w.comm_W_shared.clone(),
+      comm_W_precommitted: U_w.comm_W_precommitted.clone(),
+      comm_W_rest: U_w.comm_W_rest.clone(),
       public_values: pub_field,
-      challenges: U_i8.challenges.clone(),
+      challenges: U_w.challenges.clone(),
     };
     let U_regular = U_field.to_regular_instance()?;
     let eval_X = {
@@ -1003,7 +1015,7 @@ impl<E: Engine> SpartanSNARK<E> {
 
     let blind_eval_W = E::PCS::blind(&pk.ck_s, 1);
     let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W, false)?;
-    let w_bool: Vec<bool> = prep.W.iter().map(|&v| v != 0).collect();
+    let w_bool: Vec<bool> = prep.W.iter().map(|v| *v != zero_w).collect();
     let eval_arg = E::PCS::prove_witness(
       &pk.ck,
       &pk.ck_s,
