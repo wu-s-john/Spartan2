@@ -16,7 +16,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::Parser;
 use spartan2::{
-  bellpepper::r1cs::small_r1cs_shape,
   cli::FieldChoice,
   provider::{Bn254Engine, PallasHyraxEngine, VestaHyraxEngine},
   sha256_circuits::SmallSha256Circuit,
@@ -79,8 +78,6 @@ fn run_benchmark<E: Engine>(
 
     let mut small_timings = HashMap::new();
     let mut large_timings = HashMap::new();
-    let mut int_timings = HashMap::new();
-
     for is_small in [true, false] {
       let mode = if is_small { "small" } else { "large" };
       let _mode_span = info_span!("mode", mode).entered();
@@ -125,48 +122,8 @@ fn run_benchmark<E: Engine>(
       );
     }
 
-    // prove_int path: pure-integer i32/i8
-    {
-      let _mode_span = info_span!("mode", mode = "int").entered();
-      info!("--- prove_int ---");
-
-      clear_timings(timing_data);
-
-      // Prep: extract i32 shape (A, B, C matrices)
-      let t0 = Instant::now();
-      let S_int = small_r1cs_shape::<E, _>(&circuit).expect("small_r1cs_shape");
-      let prep_ms = t0.elapsed().as_millis() as u64;
-      info!(elapsed_ms = prep_ms, "shape_int");
-
-      // Prove: witness gen + mat_vec + sumcheck + PCS
-      let t0 = Instant::now();
-      let proof = SpartanSNARK::<E>::prove_int(&S_int, &pk, circuit.clone())
-        .expect("prove_int failed");
-      let prove_ms = t0.elapsed().as_millis() as u64;
-      info!(elapsed_ms = prove_ms, "prove_int");
-
-      // Inject wall-clock prep/prove times
-      {
-        let mut map = timing_data.lock().unwrap();
-        map.insert("__prep__".to_string(), prep_ms);
-        map.insert("__prove__".to_string(), prove_ms);
-      }
-
-      int_timings = snapshot_timings(timing_data, SPARTAN_PHASES);
-
-      let t0 = Instant::now();
-      proof.verify(&vk).expect("verify_int errored");
-      let verify_ms = t0.elapsed().as_millis();
-      info!(elapsed_ms = verify_ms, "verify_int");
-
-      info!(
-        "SUMMARY msg={}B, prove_int, setup={} ms, prep={} ms, prove={} ms, verify={} ms",
-        msg_len, setup_ms, prep_ms, prove_ms, verify_ms
-      );
-    }
-
     // prep_int path: setup_small + prep_prove_small + prove_small_value
-    let mut prep_int_timings = HashMap::new();
+    let prep_int_timings;
     {
       let _mode_span = info_span!("mode", mode = "prep_int").entered();
       info!("--- prep_int (setup_small + prep/prove split) ---");
@@ -219,7 +176,6 @@ fn run_benchmark<E: Engine>(
       None => format!("===== msg={}B =====", msg_len),
     };
     print_table(&header, SPARTAN_PHASES, &small_timings, &large_timings);
-    print_table(&format!("{} [int vs large]", header), SPARTAN_PHASES, &int_timings, &large_timings);
     print_table(&format!("{} [prep_int vs large]", header), SPARTAN_PHASES, &prep_int_timings, &large_timings);
 
     drop(root_span);

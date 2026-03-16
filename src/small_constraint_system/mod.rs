@@ -13,6 +13,8 @@
 //! - No field elements are created until the inner sumcheck boundary
 
 pub mod bridge;
+use std::marker::PhantomData;
+
 pub use bridge::SmallToBellpepperCS;
 
 use bellpepper_core::{Index, SynthesisError, Variable};
@@ -115,7 +117,7 @@ pub trait SmallConstraintSystem<V>: Sized {
     self.get_root().push_namespace(name_fn);
     SmallNamespace {
       inner: self.get_root(),
-      _marker: std::marker::PhantomData,
+      _marker: PhantomData,
     }
   }
 }
@@ -125,7 +127,7 @@ pub trait SmallConstraintSystem<V>: Sized {
 /// A scoped namespace within a SmallConstraintSystem.
 pub struct SmallNamespace<'a, V, CS: SmallConstraintSystem<V>> {
   pub(crate) inner: &'a mut CS,
-  pub(crate) _marker: std::marker::PhantomData<V>,
+  pub(crate) _marker: PhantomData<V>,
 }
 
 impl<V, CS: SmallConstraintSystem<V>> SmallConstraintSystem<V> for SmallNamespace<'_, V, CS> {

@@ -6,7 +6,7 @@
 
 //! This module defines traits that a circuit provider must implement to be used with Spartan.
 use crate::{small_constraint_system::SmallConstraintSystem, traits::Engine};
-use bellpepper_core::{ConstraintSystem, SynthesisError, num::AllocatedNum};
+use bellpepper_core::{ConstraintSystem, SynthesisError, Variable, num::AllocatedNum};
 
 /// A helper trait for defining a randomized circuit that Spartan proves.
 /// The circuit contains a set of variables that are shared with other circuits.
@@ -63,20 +63,20 @@ pub trait SpartanCircuit<E: Engine>: Send + Sync + Clone {
 /// (powers of 2 up to 2^18) fit in `i32`.
 pub trait SmallSpartanCircuit<E: Engine, V>: Send + Sync + Clone {
   /// Returns the public values of the circuit as V (usually i8 bit-values).
-  fn public_values(&self) -> Result<Vec<V>, bellpepper_core::SynthesisError>;
+  fn public_values(&self) -> Result<Vec<V>, SynthesisError>;
 
   /// Allocates shared variables in the constraint system.
   fn shared<CS: SmallConstraintSystem<V>>(
     &self,
     cs: &mut CS,
-  ) -> Result<Vec<bellpepper_core::Variable>, bellpepper_core::SynthesisError>;
+  ) -> Result<Vec<Variable>, SynthesisError>;
 
   /// Allocates precommitted variables.
   fn precommitted<CS: SmallConstraintSystem<V>>(
     &self,
     cs: &mut CS,
-    shared: &[bellpepper_core::Variable],
-  ) -> Result<Vec<bellpepper_core::Variable>, bellpepper_core::SynthesisError>;
+    shared: &[Variable],
+  ) -> Result<Vec<Variable>, SynthesisError>;
 
   /// Returns the number of verifier challenges this circuit expects.
   fn num_challenges(&self) -> usize;
@@ -87,10 +87,10 @@ pub trait SmallSpartanCircuit<E: Engine, V>: Send + Sync + Clone {
   fn synthesize<CS: SmallConstraintSystem<V>>(
     &self,
     cs: &mut CS,
-    shared: &[bellpepper_core::Variable],
-    precommitted: &[bellpepper_core::Variable],
+    shared: &[Variable],
+    precommitted: &[Variable],
     challenges: Option<&[E::Scalar]>,
-  ) -> Result<(), bellpepper_core::SynthesisError>;
+  ) -> Result<(), SynthesisError>;
 }
 
 /// A helper trait for defining a multi-round randomized circuit that Spartan proves.
