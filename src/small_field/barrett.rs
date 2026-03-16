@@ -15,6 +15,23 @@ use super::{
 };
 
 // ==========================================================================
+// 5-limb Barrett reduction (for field × u32 products: 4 limbs × 1 limb = 5 limbs)
+// ==========================================================================
+
+/// Barrett reduction for 5-limb input.
+///
+/// Used for field × i32 multiplication: a 4-limb Montgomery field element
+/// multiplied by a u32 magnitude produces at most 5 limbs (256 + 32 = 288 bits).
+/// Dispatches to Pasta 2-fold or generic μ-Barrett based on field type.
+#[inline]
+pub(crate) fn barrett_reduce_5<F: FieldReductionConstants>(a: &[u64; 5]) -> [u64; 4] {
+  // Promote to 6 limbs and delegate to the existing 6-limb reducer.
+  // The top limb is zero so the 6-limb code does minimal extra work.
+  let c = [a[0], a[1], a[2], a[3], a[4], 0];
+  barrett_reduce_6::<F>(&c)
+}
+
+// ==========================================================================
 // 6-limb Barrett reduction (for SignedWideLimbs<6>, i.e. DelayedReduction<i64>::Accumulator)
 // ==========================================================================
 

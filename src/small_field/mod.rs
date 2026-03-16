@@ -16,7 +16,7 @@ pub(crate) mod barrett;
 mod delayed_reduction;
 pub(crate) mod field_reduction_constants;
 pub(crate) mod limbs;
-pub(crate) mod montgomery;
+pub mod montgomery;
 mod small_value_field;
 mod wide_mul;
 mod witness_value;

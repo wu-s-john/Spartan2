@@ -53,7 +53,8 @@ fn run_benchmark<E: Engine>(
     + DelayedReduction<i64>
     + DelayedReduction<i128>
     + DelayedReduction<E::Scalar>
-    + ff::PrimeFieldBits,
+    + ff::PrimeFieldBits
+    + spartan2::small_field::montgomery::MontgomeryLimbs,
 {
   let msg_lengths: Vec<usize> = match bytes {
     Some(b) => vec![b],

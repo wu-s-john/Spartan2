@@ -797,7 +797,8 @@ impl<E: Engine> SpartanSNARK<E> {
       + DelayedReduction<i32>
       + DelayedReduction<i64>
       + DelayedReduction<bool>
-      + DelayedReduction<E::Scalar>,
+      + DelayedReduction<E::Scalar>
+      + crate::small_field::montgomery::MontgomeryLimbs,
   {
     use crate::PCS;
 

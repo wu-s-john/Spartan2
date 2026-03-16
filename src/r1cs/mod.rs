@@ -17,6 +17,7 @@ use crate::{
     transcript::{TranscriptEngineTrait, TranscriptReprTrait},
   },
 };
+use crate::small_field::{barrett::barrett_reduce_5, limbs::mac, montgomery::MontgomeryLimbs};
 use core::cmp::max;
 use ff::Field;
 use once_cell::sync::OnceCell;
@@ -53,6 +54,24 @@ fn mul_field_fast<F: ff::PrimeField>(x: F, v: &F) -> F {
     -x
   } else {
     x * v
+  }
+}
+
+/// Field × i32 multiply using direct limb MACs + Barrett reduction.
+/// Avoids `F::from(u64)` Montgomery conversion entirely.
+#[inline(always)]
+fn mul_field_i32_barrett<F: MontgomeryLimbs + ff::PrimeField>(x: &F, v: i32) -> F {
+  let a = x.to_limbs();
+  let mag = v.unsigned_abs() as u64;
+  let (r0, c) = mac(0, a[0], mag, 0);
+  let (r1, c) = mac(0, a[1], mag, c);
+  let (r2, c) = mac(0, a[2], mag, c);
+  let (r3, c) = mac(0, a[3], mag, c);
+  let result = F::from_limbs(barrett_reduce_5::<F>(&[r0, r1, r2, r3, c]));
+  if v > 0 {
+    result
+  } else {
+    -result
   }
 }
 
@@ -726,6 +745,22 @@ pub struct SplitR1CSShape<E: Engine, V = <E as Engine>::Scalar> {
   /// Untouched columns map to u32::MAX. Only populated for i32 shapes.
   #[serde(skip, default)]
   pub(crate) col_to_dense: Vec<u32>,
+  /// Per-row split: A.data[indptr[row]..A_unit_end[row]] are ±1 entries.
+  /// A.data[A_unit_end[row]..indptr[row+1]] are non-±1 entries.
+  #[serde(skip, default)]
+  pub(crate) A_unit_end: Vec<usize>,
+  #[serde(skip, default)]
+  pub(crate) B_unit_end: Vec<usize>,
+  #[serde(skip, default)]
+  pub(crate) C_unit_end: Vec<usize>,
+  /// Pre-remapped column indices for A: A_dense_col[i] = col_to_dense[A.indices[i]].
+  /// Eliminates random access into col_to_dense during the hot loop.
+  #[serde(skip, default)]
+  pub(crate) A_dense_col: Vec<u32>,
+  #[serde(skip, default)]
+  pub(crate) B_dense_col: Vec<u32>,
+  #[serde(skip, default)]
+  pub(crate) C_dense_col: Vec<u32>,
 }
 
 impl<E: Engine, V: Serialize> SimpleDigestible for SplitR1CSShape<E, V> {}
@@ -858,6 +893,12 @@ impl<E: Engine> SplitR1CSShape<E> {
       digest: OnceCell::new(),
       dense_to_col: Vec::new(),
       col_to_dense: Vec::new(),
+      A_unit_end: Vec::new(),
+      B_unit_end: Vec::new(),
+      C_unit_end: Vec::new(),
+      A_dense_col: Vec::new(),
+      B_dense_col: Vec::new(),
+      C_dense_col: Vec::new(),
     })
   }
 
@@ -1144,9 +1185,14 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
       M
     };
 
-    let A_padded = apply_pad(A);
-    let B_padded = apply_pad(B);
-    let C_padded = apply_pad(C);
+    let mut A_padded = apply_pad(A);
+    let mut B_padded = apply_pad(B);
+    let mut C_padded = apply_pad(C);
+
+    // Partition entries within each row: ±1 entries first, non-±1 after.
+    let A_unit_end = A_padded.partition_unit_entries();
+    let B_unit_end = B_padded.partition_unit_entries();
+    let C_unit_end = C_padded.partition_unit_entries();
 
     // Build column remap: only ~20% of columns are touched after padding.
     // Compact indexing shrinks thread-local buffers in bind_row_vars_combined_int
@@ -1172,6 +1218,12 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
       }
     }
 
+    // Pre-remap column indices: store col_to_dense[indices[i]] in parallel Vec<u32>
+    // so the hot loop reads sequential memory instead of random-accessing col_to_dense.
+    let A_dense_col: Vec<u32> = A_padded.indices.iter().map(|&c| col_to_dense[c]).collect();
+    let B_dense_col: Vec<u32> = B_padded.indices.iter().map(|&c| col_to_dense[c]).collect();
+    let C_dense_col: Vec<u32> = C_padded.indices.iter().map(|&c| col_to_dense[c]).collect();
+
     Ok(SplitR1CSShape {
       num_cons: num_cons_padded,
       num_shared: num_shared_padded,
@@ -1191,6 +1243,12 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
       digest: OnceCell::new(),
       dense_to_col,
       col_to_dense,
+      A_unit_end,
+      B_unit_end,
+      C_unit_end,
+      A_dense_col,
+      B_dense_col,
+      C_dense_col,
     })
   }
 
@@ -1250,33 +1308,39 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     &self,
     rx: &[E::Scalar],
     r: E::Scalar,
-  ) -> Vec<E::Scalar> {
+  ) -> Vec<E::Scalar>
+  where
+    E::Scalar: MontgomeryLimbs,
+  {
     assert_eq!(rx.len(), self.num_cons);
 
     let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
     let num_cols = 2 * num_vars;
     let r_sq = r * r;
 
-    let col_remap = &self.col_to_dense;
     let num_dense = self.dense_to_col.len();
 
     // Fallback: if remap tables aren't built (e.g., after deserialization), use full buffer
-    if num_dense == 0 {
+    if num_dense == 0 || self.A_dense_col.is_empty() {
       return self.bind_row_vars_combined_int_no_remap(rx, r);
     }
+
+    // Only iterate real (non-padded) rows — padded rows have zero NNZ
+    let num_rows = self.num_cons_unpadded;
+    let has_unit_partition = !self.A_unit_end.is_empty();
 
     // Thread-local buffers now sized to num_dense (fits in L2!)
     let buffer_bytes = num_dense * std::mem::size_of::<E::Scalar>();
     let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
     let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
-    let chunk_size = (self.num_cons + num_threads - 1) / num_threads;
+    let chunk_size = (num_rows + num_threads - 1) / num_threads;
 
     // Allocate + compute in parallel with compact buffers
     let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
       .into_par_iter()
       .map(|thread_idx| {
         let start_row = thread_idx * chunk_size;
-        let end_row = ((thread_idx + 1) * chunk_size).min(self.num_cons);
+        let end_row = ((thread_idx + 1) * chunk_size).min(num_rows);
         let mut buffer = vec![E::Scalar::ZERO; num_dense];
 
         for row_idx in start_row..end_row {
@@ -1284,18 +1348,73 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
           let rx_r = rx_row * r;
           let rx_r_sq = rx_row * r_sq;
 
-          let a_ptrs = [self.A.indptr[row_idx], self.A.indptr[row_idx + 1]];
-          let b_ptrs = [self.B.indptr[row_idx], self.B.indptr[row_idx + 1]];
-          let c_ptrs = [self.C.indptr[row_idx], self.C.indptr[row_idx + 1]];
+          if has_unit_partition {
+            // --- Matrix A ---
+            let a_start = self.A.indptr[row_idx];
+            let a_unit = self.A_unit_end[row_idx];
+            let a_end = self.A.indptr[row_idx + 1];
+            // ±1 entries: add/sub only
+            for i in a_start..a_unit {
+              let idx = self.A_dense_col[i] as usize;
+              if self.A.data[i] > 0 {
+                buffer[idx] += rx_row;
+              } else {
+                buffer[idx] -= rx_row;
+              }
+            }
+            // Non-±1 entries: Barrett multiply
+            for i in a_unit..a_end {
+              let idx = self.A_dense_col[i] as usize;
+              buffer[idx] += mul_field_i32_barrett(&rx_row, self.A.data[i]);
+            }
 
-          for (val, col) in self.A.get_row_unchecked(&a_ptrs) {
-            buffer[col_remap[*col] as usize] += mul_field_i32(rx_row, *val);
-          }
-          for (val, col) in self.B.get_row_unchecked(&b_ptrs) {
-            buffer[col_remap[*col] as usize] += mul_field_i32(rx_r, *val);
-          }
-          for (val, col) in self.C.get_row_unchecked(&c_ptrs) {
-            buffer[col_remap[*col] as usize] += mul_field_i32(rx_r_sq, *val);
+            // --- Matrix B ---
+            let b_start = self.B.indptr[row_idx];
+            let b_unit = self.B_unit_end[row_idx];
+            let b_end = self.B.indptr[row_idx + 1];
+            for i in b_start..b_unit {
+              let idx = self.B_dense_col[i] as usize;
+              if self.B.data[i] > 0 {
+                buffer[idx] += rx_r;
+              } else {
+                buffer[idx] -= rx_r;
+              }
+            }
+            for i in b_unit..b_end {
+              let idx = self.B_dense_col[i] as usize;
+              buffer[idx] += mul_field_i32_barrett(&rx_r, self.B.data[i]);
+            }
+
+            // --- Matrix C ---
+            let c_start = self.C.indptr[row_idx];
+            let c_unit = self.C_unit_end[row_idx];
+            let c_end = self.C.indptr[row_idx + 1];
+            for i in c_start..c_unit {
+              let idx = self.C_dense_col[i] as usize;
+              if self.C.data[i] > 0 {
+                buffer[idx] += rx_r_sq;
+              } else {
+                buffer[idx] -= rx_r_sq;
+              }
+            }
+            for i in c_unit..c_end {
+              let idx = self.C_dense_col[i] as usize;
+              buffer[idx] += mul_field_i32_barrett(&rx_r_sq, self.C.data[i]);
+            }
+          } else {
+            // Fallback: no partition data, use mul_field_i32 for all entries
+            for i in self.A.indptr[row_idx]..self.A.indptr[row_idx + 1] {
+              let idx = self.A_dense_col[i] as usize;
+              buffer[idx] += mul_field_i32(rx_row, self.A.data[i]);
+            }
+            for i in self.B.indptr[row_idx]..self.B.indptr[row_idx + 1] {
+              let idx = self.B_dense_col[i] as usize;
+              buffer[idx] += mul_field_i32(rx_r, self.B.data[i]);
+            }
+            for i in self.C.indptr[row_idx]..self.C.indptr[row_idx + 1] {
+              let idx = self.C_dense_col[i] as usize;
+              buffer[idx] += mul_field_i32(rx_r_sq, self.C.data[i]);
+            }
           }
         }
         buffer
