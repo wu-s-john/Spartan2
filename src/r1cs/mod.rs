@@ -1329,7 +1329,7 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     let num_rows = self.num_cons_unpadded;
     let has_unit_partition = !self.A_unit_end.is_empty();
 
-    // Thread-local buffers now sized to num_dense (fits in L2!)
+    // Cap total buffer memory to avoid excessive allocation while preserving parallelism.
     let buffer_bytes = num_dense * std::mem::size_of::<E::Scalar>();
     let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
     let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
