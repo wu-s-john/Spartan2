@@ -12,6 +12,7 @@ use ff::{PrimeField, PrimeFieldBits};
 use std::marker::PhantomData;
 
 use ff::Field;
+#[cfg(debug_assertions)]
 use sha2::{Digest, Sha256};
 use crate::{
   gadgets::{NoBatchEq, SmallBoolean, small_sha256_int},
@@ -220,14 +221,9 @@ where
     drop(eq);
 
     // Inputize hash bits as public values (i8)
-    let hash_expected = Sha256::digest(&self.preimage);
-    let mut expected_bits = hash_expected.iter().flat_map(|&byte| {
-      (0..8u32).rev().map(move |i| (byte >> i) & 1 == 1)
-    });
     for bit in &hash_bits {
-      let expected = expected_bits.next().unwrap_or(false);
-      let _ = bit; // variable already allocated above
-      cs.alloc_input(|| "hash_bit", || Ok(if expected { 1i8 } else { 0i8 }))?;
+      let val = bit.get_value().map(|b| if b { 1i8 } else { 0i8 });
+      cs.alloc_input(|| "hash_bit", || val.ok_or(SynthesisError::AssignmentMissing))?;
     }
 
     Ok(vec![])

@@ -258,12 +258,12 @@ pub struct SmallSatisfyingAssignment<V> {
   pub(crate) aux_assignment: Vec<V>,
 }
 
-impl<V: Copy + Default> SmallSatisfyingAssignment<V> {
+impl<V: Copy + From<bool>> SmallSatisfyingAssignment<V> {
   /// Create a new satisfying assignment with no variables.
   pub fn new() -> Self {
     SmallSatisfyingAssignment {
       // Input 0 is always ONE (the constant 1)
-      input_assignment: vec![V::default()],
+      input_assignment: vec![V::from(true)],
       aux_assignment: vec![],
     }
   }
@@ -415,6 +415,28 @@ impl SmallShapeCS {
             row_slice_data.swap(j - 1, j);
             j -= 1;
           }
+        }
+        // Merge duplicate column entries (sum coefficients, drop zeros)
+        let row_len = row_end - row_start;
+        if row_len > 1 {
+          let mut write = row_start;
+          for read in (row_start + 1)..row_end {
+            if indices[read] == indices[write] {
+              data[write] += data[read];
+            } else {
+              if data[write] != 0 {
+                write += 1;
+              }
+              data[write] = data[read];
+              indices[write] = indices[read];
+            }
+          }
+          // Keep last element if non-zero
+          if data[write] != 0 {
+            write += 1;
+          }
+          data.truncate(write);
+          indices.truncate(write);
         }
         indptr.push(data.len());
       }
