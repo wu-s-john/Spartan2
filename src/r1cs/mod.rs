@@ -44,6 +44,18 @@ fn mul_field_i32<F: ff::PrimeField>(x: F, v: i32) -> F {
   }
 }
 
+/// Fast-path field multiplication: avoids full mul for common ±1 coefficients.
+#[inline(always)]
+fn mul_field_fast<F: ff::PrimeField>(x: F, v: &F) -> F {
+  if *v == F::ONE {
+    x
+  } else if *v == -F::ONE {
+    -x
+  } else {
+    x * v
+  }
+}
+
 fn eq01<F: Field>(bit: u8, r: &F) -> F {
   if bit == 0 { F::ONE - *r } else { *r }
 }
@@ -1002,49 +1014,44 @@ impl<E: Engine> SplitR1CSShape<E> {
     let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
     let num_cols = 2 * num_vars;
     let r_sq = r * r;
-    let num_threads = rayon::current_num_threads();
-
-    // Pre-allocate exactly num_threads buffers (one per thread)
-    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
-      .map(|_| vec![E::Scalar::ZERO; num_cols])
-      .collect();
-
-    // Split rows into chunks, one chunk per thread
+    // Cap threads to limit total buffer memory (~512MB max) while preserving parallelism
+    let buffer_bytes = num_cols * std::mem::size_of::<E::Scalar>();
+    let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
+    let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
     let chunk_size = (self.num_cons + num_threads - 1) / num_threads;
 
-    // Process chunks in parallel - each thread works on its own buffer
-    thread_buffers
-      .par_iter_mut()
-      .enumerate()
-      .for_each(|(thread_idx, buffer)| {
+    // Allocate + compute in parallel: each thread creates and fills its own buffer
+    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
+      .into_par_iter()
+      .map(|thread_idx| {
         let start_row = thread_idx * chunk_size;
         let end_row = ((thread_idx + 1) * chunk_size).min(self.num_cons);
+        let mut buffer = vec![E::Scalar::ZERO; num_cols];
 
         for row_idx in start_row..end_row {
           let rx_row = rx[row_idx];
-          // Precompute scaled values once per row (saves 2 mults per row)
           let rx_r = rx_row * r;
           let rx_r_sq = rx_row * r_sq;
 
-          // Get row bounds for each matrix
           let a_ptrs = [self.A.indptr[row_idx], self.A.indptr[row_idx + 1]];
           let b_ptrs = [self.B.indptr[row_idx], self.B.indptr[row_idx + 1]];
           let c_ptrs = [self.C.indptr[row_idx], self.C.indptr[row_idx + 1]];
 
-          // Fused accumulation: A + r*B + r²*C
           for (val, col) in self.A.get_row_unchecked(&a_ptrs) {
-            buffer[*col] += rx_row * val;
+            buffer[*col] += mul_field_fast(rx_row, val);
           }
           for (val, col) in self.B.get_row_unchecked(&b_ptrs) {
-            buffer[*col] += rx_r * val;
+            buffer[*col] += mul_field_fast(rx_r, val);
           }
           for (val, col) in self.C.get_row_unchecked(&c_ptrs) {
-            buffer[*col] += rx_r_sq * val;
+            buffer[*col] += mul_field_fast(rx_r_sq, val);
           }
         }
-      });
+        buffer
+      })
+      .collect();
 
-    // Sequential reduction with parallel inner loop (simple and efficient)
+    // Reduce: first buffer becomes result, add remaining with parallel inner loop
     let mut result = thread_buffers.swap_remove(0);
     for buffer in thread_buffers {
       result
@@ -1211,20 +1218,19 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
     let num_cols = 2 * num_vars;
     let r_sq = r * r;
-    let num_threads = rayon::current_num_threads();
-
-    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
-      .map(|_| vec![E::Scalar::ZERO; num_cols])
-      .collect();
-
+    // Cap threads to limit total buffer memory (~512MB max) while preserving parallelism
+    let buffer_bytes = num_cols * std::mem::size_of::<E::Scalar>();
+    let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
+    let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
     let chunk_size = (self.num_cons + num_threads - 1) / num_threads;
 
-    thread_buffers
-      .par_iter_mut()
-      .enumerate()
-      .for_each(|(thread_idx, buffer)| {
+    // Allocate + compute in parallel: each thread creates and fills its own buffer
+    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
+      .into_par_iter()
+      .map(|thread_idx| {
         let start_row = thread_idx * chunk_size;
         let end_row = ((thread_idx + 1) * chunk_size).min(self.num_cons);
+        let mut buffer = vec![E::Scalar::ZERO; num_cols];
 
         for row_idx in start_row..end_row {
           let rx_row = rx[row_idx];
@@ -1235,7 +1241,6 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
           let b_ptrs = [self.B.indptr[row_idx], self.B.indptr[row_idx + 1]];
           let c_ptrs = [self.C.indptr[row_idx], self.C.indptr[row_idx + 1]];
 
-          // field × i32: fast path for ±1 (most SHA-256 coefficients), then general
           for (val, col) in self.A.get_row_unchecked(&a_ptrs) {
             buffer[*col] += mul_field_i32(rx_row, *val);
           }
@@ -1246,8 +1251,11 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
             buffer[*col] += mul_field_i32(rx_r_sq, *val);
           }
         }
-      });
+        buffer
+      })
+      .collect();
 
+    // Reduce: first buffer becomes result, add remaining with parallel inner loop
     let mut result = thread_buffers.swap_remove(0);
     for buffer in thread_buffers {
       result
