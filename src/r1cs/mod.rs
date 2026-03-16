@@ -718,6 +718,14 @@ pub struct SplitR1CSShape<E: Engine, V = <E as Engine>::Scalar> {
   pub C: SparseMatrix<V>,
   #[serde(skip, default = "OnceCell::new")]
   pub(crate) digest: OnceCell<E::Scalar>,
+  /// Column remap: compact dense index → original column index.
+  /// Only populated for i32 shapes (the integer proving path).
+  #[serde(skip, default)]
+  pub(crate) dense_to_col: Vec<u32>,
+  /// Column remap: original column index → compact dense index.
+  /// Untouched columns map to u32::MAX. Only populated for i32 shapes.
+  #[serde(skip, default)]
+  pub(crate) col_to_dense: Vec<u32>,
 }
 
 impl<E: Engine, V: Serialize> SimpleDigestible for SplitR1CSShape<E, V> {}
@@ -848,6 +856,8 @@ impl<E: Engine> SplitR1CSShape<E> {
       B: B_padded,
       C: C_padded,
       digest: OnceCell::new(),
+      dense_to_col: Vec::new(),
+      col_to_dense: Vec::new(),
     })
   }
 
@@ -1138,6 +1148,30 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     let B_padded = apply_pad(B);
     let C_padded = apply_pad(C);
 
+    // Build column remap: only ~20% of columns are touched after padding.
+    // Compact indexing shrinks thread-local buffers in bind_row_vars_combined_int
+    // from 64MB to ~6MB (fits in L2 cache).
+    let num_buf_cols = 2 * (num_shared_padded + num_precommitted_padded + num_rest_padded);
+    let mut touched = vec![false; num_buf_cols];
+    for &col in A_padded
+      .indices
+      .iter()
+      .chain(B_padded.indices.iter())
+      .chain(C_padded.indices.iter())
+    {
+      if col < num_buf_cols {
+        touched[col] = true;
+      }
+    }
+    let mut dense_to_col = Vec::new();
+    let mut col_to_dense = vec![u32::MAX; num_buf_cols];
+    for (col, &is_touched) in touched.iter().enumerate() {
+      if is_touched {
+        col_to_dense[col] = dense_to_col.len() as u32;
+        dense_to_col.push(col as u32);
+      }
+    }
+
     Ok(SplitR1CSShape {
       num_cons: num_cons_padded,
       num_shared: num_shared_padded,
@@ -1155,6 +1189,8 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
       B: B_padded,
       C: C_padded,
       digest: OnceCell::new(),
+      dense_to_col,
+      col_to_dense,
     })
   }
 
@@ -1206,8 +1242,10 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
 
   /// Computes poly_ABC = A·rx + r·(B·rx) + r²·(C·rx) with i32 matrix entries.
   ///
-  /// Uses field × i32 multiplication (via simple scalar multiply) for each entry,
-  /// which is much cheaper than field × field.
+  /// Uses column remapping to shrink thread-local buffers from `2 * num_vars` to
+  /// `num_dense_cols` (the number of columns actually touched by nonzero entries).
+  /// For SHA-256 after padding, ~80% of columns are empty → buffer shrinks from
+  /// ~64MB to ~6MB, fitting in L2 cache.
   pub(crate) fn bind_row_vars_combined_int(
     &self,
     rx: &[E::Scalar],
@@ -1218,13 +1256,84 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
     let num_cols = 2 * num_vars;
     let r_sq = r * r;
-    // Cap threads to limit total buffer memory (~512MB max) while preserving parallelism
+
+    let col_remap = &self.col_to_dense;
+    let num_dense = self.dense_to_col.len();
+
+    // Fallback: if remap tables aren't built (e.g., after deserialization), use full buffer
+    if num_dense == 0 {
+      return self.bind_row_vars_combined_int_no_remap(rx, r);
+    }
+
+    // Thread-local buffers now sized to num_dense (fits in L2!)
+    let buffer_bytes = num_dense * std::mem::size_of::<E::Scalar>();
+    let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
+    let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
+    let chunk_size = (self.num_cons + num_threads - 1) / num_threads;
+
+    // Allocate + compute in parallel with compact buffers
+    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
+      .into_par_iter()
+      .map(|thread_idx| {
+        let start_row = thread_idx * chunk_size;
+        let end_row = ((thread_idx + 1) * chunk_size).min(self.num_cons);
+        let mut buffer = vec![E::Scalar::ZERO; num_dense];
+
+        for row_idx in start_row..end_row {
+          let rx_row = rx[row_idx];
+          let rx_r = rx_row * r;
+          let rx_r_sq = rx_row * r_sq;
+
+          let a_ptrs = [self.A.indptr[row_idx], self.A.indptr[row_idx + 1]];
+          let b_ptrs = [self.B.indptr[row_idx], self.B.indptr[row_idx + 1]];
+          let c_ptrs = [self.C.indptr[row_idx], self.C.indptr[row_idx + 1]];
+
+          for (val, col) in self.A.get_row_unchecked(&a_ptrs) {
+            buffer[col_remap[*col] as usize] += mul_field_i32(rx_row, *val);
+          }
+          for (val, col) in self.B.get_row_unchecked(&b_ptrs) {
+            buffer[col_remap[*col] as usize] += mul_field_i32(rx_r, *val);
+          }
+          for (val, col) in self.C.get_row_unchecked(&c_ptrs) {
+            buffer[col_remap[*col] as usize] += mul_field_i32(rx_r_sq, *val);
+          }
+        }
+        buffer
+      })
+      .collect();
+
+    // Reduce compact thread buffers
+    let mut compact = thread_buffers.swap_remove(0);
+    for buffer in thread_buffers {
+      compact
+        .par_iter_mut()
+        .zip(buffer.par_iter())
+        .for_each(|(a, b)| *a += *b);
+    }
+
+    // Expand compact buffer → full-size output
+    let mut result = vec![E::Scalar::ZERO; num_cols];
+    for (dense_idx, &orig_col) in self.dense_to_col.iter().enumerate() {
+      result[orig_col as usize] = compact[dense_idx];
+    }
+
+    result
+  }
+
+  /// Fallback without column remapping (used when remap tables are not populated).
+  fn bind_row_vars_combined_int_no_remap(
+    &self,
+    rx: &[E::Scalar],
+    r: E::Scalar,
+  ) -> Vec<E::Scalar> {
+    let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
+    let num_cols = 2 * num_vars;
+    let r_sq = r * r;
     let buffer_bytes = num_cols * std::mem::size_of::<E::Scalar>();
     let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
     let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
     let chunk_size = (self.num_cons + num_threads - 1) / num_threads;
 
-    // Allocate + compute in parallel: each thread creates and fills its own buffer
     let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
       .into_par_iter()
       .map(|thread_idx| {
@@ -1255,7 +1364,6 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
       })
       .collect();
 
-    // Reduce: first buffer becomes result, add remaining with parallel inner loop
     let mut result = thread_buffers.swap_remove(0);
     for buffer in thread_buffers {
       result
