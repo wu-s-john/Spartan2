@@ -40,7 +40,6 @@ use crate::{
   traits::{Engine, transcript::TranscriptEngineTrait},
 };
 use ff::{Field, PrimeField};
-use num_traits::Zero;
 use rayon::prelude::*;
 use tracing::info;
 
@@ -164,9 +163,9 @@ where
 
   // Suffix-outer parallel loop: accumulators live on stack per thread
   let compute = |s: usize| -> (F, F, F) {
-    let mut acc_a = Acc::<F, SV>::zero();
-    let mut acc_b = Acc::<F, SV>::zero();
-    let mut acc_c = Acc::<F, SV>::zero();
+    let mut acc_a = Acc::<F, SV>::default();
+    let mut acc_b = Acc::<F, SV>::default();
+    let mut acc_c = Acc::<F, SV>::default();
 
     for (p, eq_p) in eq_table.iter().enumerate() {
       let idx = p * stride + s;
@@ -231,7 +230,6 @@ where
   SmallValue: WideMul
     + Copy
     + Default
-    + num_traits::Zero
     + std::ops::Add<Output = SmallValue>
     + std::ops::Sub<Output = SmallValue>
     + Send
@@ -545,7 +543,7 @@ where
   type AccB<F2> = <F2 as DelayedReduction<bool>>::Accumulator;
 
   let compute = |s: usize| -> (F, F) {
-    let mut acc_m = AccF::<F>::zero();
+    let mut acc_m = AccF::<F>::default();
     let mut acc_z = AccB::<F>::default();
 
     for (p, eq_p) in eq_table.iter().enumerate() {
@@ -734,7 +732,6 @@ mod tests {
     V: WideMul
       + Copy
       + Default
-      + num_traits::Zero
       + Add<Output = V>
       + Sub<Output = V>
       + Mul<Output = V>

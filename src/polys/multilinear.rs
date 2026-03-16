@@ -11,7 +11,7 @@
 use crate::{
   math::Math,
   polys::eq::EqPolynomial,
-  small_field::{SmallValueField, vec_to_small},
+  small_field::{DelayedReduction, SmallValueField, WitnessValue, vec_to_small},
   zip_with_for_each,
 };
 use core::ops::Index;
@@ -103,9 +103,15 @@ impl<T: Field> MultilinearPolynomial<T> {
 }
 
 impl<T: PrimeField> MultilinearPolynomial<T> {
-  /// Binds the polynomial's top variables where the polynomial coefficients are i8.
-  /// Uses conditional add/sub instead of field multiply for small values.
-  pub fn bind_with_i8(poly: &[i8], l: &[T], r_len: usize) -> Vec<T> {
+  /// Bind row variables for a witness polynomial using delayed reduction.
+  ///
+  /// Generic over `W: WitnessValue` — works for both bool and i8 witnesses.
+  /// `output[i] = Σ_j L[j] * poly[j * r_len + i]`
+  pub fn bind_with_witness<W>(poly: &[W], l: &[T], r_len: usize) -> Vec<T>
+  where
+    W: WitnessValue,
+    T: DelayedReduction<W>,
+  {
     assert_eq!(
       poly.len(),
       l.len() * r_len,
@@ -119,45 +125,11 @@ impl<T: PrimeField> MultilinearPolynomial<T> {
     (0..r_len)
       .into_par_iter()
       .map(|i| {
-        let mut acc = T::ZERO;
+        let mut acc = <T as DelayedReduction<W>>::Accumulator::default();
         for j in 0..l.len() {
-          let v = poly[j * r_len + i];
-          match v {
-            0 => {}
-            1 => acc += l[j],
-            -1 => acc -= l[j],
-            v if v > 0 => acc += l[j] * T::from(v as u64),
-            v => acc -= l[j] * T::from((-v) as u64),
-          }
+          T::unreduced_multiply_accumulate(&mut acc, &l[j], &poly[j * r_len + i]);
         }
-        acc
-      })
-      .collect()
-  }
-
-  /// Bind row variables for a boolean polynomial: output[i] = Σ_j L[j] * poly[j * r_len + i]
-  /// Since poly values are {0,1}, this is pure conditional add — no field multiply.
-  pub fn bind_with_bool(poly: &[bool], l: &[T], r_len: usize) -> Vec<T> {
-    assert_eq!(
-      poly.len(),
-      l.len() * r_len,
-      "poly length ({}) must equal L.len() * r_len ({} * {}) = {}",
-      poly.len(),
-      l.len(),
-      r_len,
-      l.len() * r_len
-    );
-
-    (0..r_len)
-      .into_par_iter()
-      .map(|i| {
-        let mut acc = T::ZERO;
-        for j in 0..l.len() {
-          if poly[j * r_len + i] {
-            acc += l[j];
-          }
-        }
-        acc
+        <T as DelayedReduction<W>>::reduce(&acc)
       })
       .collect()
   }

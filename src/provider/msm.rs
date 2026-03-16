@@ -261,6 +261,7 @@ fn msm_binary<C: CurveAffine, T: Integer + Sync>(
 ///
 /// Pippenger bucketing is useless for binary scalars — there's only 1 nonzero bucket.
 /// This directly sums the matching bases with parallel chunking.
+#[allow(dead_code)]
 pub fn msm_bool<C: CurveAffine>(
   bits: &[bool],
   bases: &[C],

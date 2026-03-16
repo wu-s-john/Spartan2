@@ -370,7 +370,7 @@ where
   let (comm_W_shared, r_W_shared) = if S.num_shared_unpadded > 0 {
     let r = PCS::<E>::blind(ck, S.num_shared);
     let w_bool: Vec<bool> = W_i8[..S.num_shared].iter().map(|&v| v != 0).collect();
-    let comm = PCS::<E>::commit_bool(ck, &w_bool, &r)?;
+    let comm = PCS::<E>::commit_witness(ck, &w_bool, &r)?;
     (Some(comm), Some(r))
   } else {
     (None, None)
@@ -384,7 +384,7 @@ where
       .iter()
       .map(|&v| v != 0)
       .collect();
-    let comm = PCS::<E>::commit_bool(ck, &w_bool, &r)?;
+    let comm = PCS::<E>::commit_witness(ck, &w_bool, &r)?;
     (Some(comm), Some(r))
   } else {
     (None, None)
@@ -398,7 +398,7 @@ where
     .iter()
     .map(|&v| v != 0)
     .collect();
-  let comm_W_rest = PCS::<E>::commit_bool(ck, &w_rest_bool, &r_W_rest)?;
+  let comm_W_rest = PCS::<E>::commit_witness(ck, &w_rest_bool, &r_W_rest)?;
   info!(elapsed_ms = %commit_rest_t.elapsed().as_millis(), "commit_witness_rest");
 
   // Absorb commitments into transcript in the same order as SplitR1CSInstance::validate

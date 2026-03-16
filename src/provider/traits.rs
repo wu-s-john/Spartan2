@@ -148,13 +148,6 @@ pub trait DlogGroupExt: DlogGroup {
     use_parallelism_internally: bool,
   ) -> Result<Self, SpartanError>;
 
-  /// A method to compute a multiexponentation with boolean scalars.
-  /// Equivalent to summing bases where the corresponding bit is true.
-  fn vartime_multiscalar_mul_bool(
-    bits: &[bool],
-    bases: &[Self::AffineGroupElement],
-    use_parallelism_internally: bool,
-  ) -> Result<Self, SpartanError>;
 }
 
 /// Implements Spartan's traits except DlogGroupExt so that the MSM can be implemented differently
@@ -333,14 +326,6 @@ macro_rules! impl_traits {
         use_parallelism_internally: bool,
       ) -> Result<Self, $crate::errors::SpartanError> {
         msm_signed_small(scalars, bases, use_parallelism_internally)
-      }
-
-      fn vartime_multiscalar_mul_bool(
-        bits: &[bool],
-        bases: &[Self::AffineGroupElement],
-        use_parallelism_internally: bool,
-      ) -> Result<Self, $crate::errors::SpartanError> {
-        msm_bool(bits, bases, use_parallelism_internally)
       }
     }
   };

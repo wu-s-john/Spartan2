@@ -220,7 +220,7 @@ where
   (0..dim)
     .into_par_iter()
     .map(|j| {
-      let mut acc = <F as DelayedReduction<SV>>::Accumulator::zero();
+      let mut acc = <F as DelayedReduction<SV>>::Accumulator::default();
       for (i, wi) in weights.iter().enumerate() {
         <F as DelayedReduction<SV>>::unreduced_multiply_accumulate(&mut acc, wi, &vectors[i][j]);
       }
@@ -317,7 +317,7 @@ where
   (0..num_cons)
     .into_par_iter()
     .map(|k| {
-      let mut acc = <E::Scalar as DelayedReduction<SV>>::Accumulator::zero();
+      let mut acc = <E::Scalar as DelayedReduction<SV>>::Accumulator::default();
       for i in 0..n_inst {
         // Single-value accumulation (field × small with delayed reduction)
         <E::Scalar as DelayedReduction<SV>>::unreduced_multiply_accumulate(
@@ -349,7 +349,7 @@ where
 
       (0..dim)
         .map(|j| {
-          let mut acc = <F as DelayedReduction<F>>::Accumulator::zero();
+          let mut acc = <F as DelayedReduction<F>>::Accumulator::default();
           <F as DelayedReduction<F>>::unreduced_multiply_accumulate(&mut acc, &one_minus_r, &lo[j]);
           <F as DelayedReduction<F>>::unreduced_multiply_accumulate(&mut acc, &r, &hi[j]);
           <F as DelayedReduction<F>>::reduce(&acc)
@@ -380,7 +380,7 @@ where
       // Fold witness vectors with DMR
       let W_folded: Vec<E::Scalar> = (0..dim)
         .map(|j| {
-          let mut acc = <E::Scalar as DelayedReduction<E::Scalar>>::Accumulator::zero();
+          let mut acc = <E::Scalar as DelayedReduction<E::Scalar>>::Accumulator::default();
           <E::Scalar as DelayedReduction<E::Scalar>>::unreduced_multiply_accumulate(
             &mut acc,
             &one_minus_r,
@@ -530,11 +530,11 @@ where
     let (acc_e0, acc_quad) = (0..right)
       .into_par_iter()
       .fold(
-        || (Acc::<E::Scalar>::zero(), Acc::<E::Scalar>::zero()),
+        || (Acc::<E::Scalar>::default(), Acc::<E::Scalar>::default()),
         |mut middle_acc, i| {
           // Inner level: accumulate over j (0..left) - NO reductions in this loop!
-          let mut inner_e0 = Acc::<E::Scalar>::zero();
-          let mut inner_quad = Acc::<E::Scalar>::zero();
+          let mut inner_e0 = Acc::<E::Scalar>::default();
+          let mut inner_quad = Acc::<E::Scalar>::default();
 
           for (j, e_j) in e[..left].iter().enumerate() {
             let k = i * left + j;
@@ -581,7 +581,7 @@ where
         },
       )
       .reduce(
-        || (Acc::<E::Scalar>::zero(), Acc::<E::Scalar>::zero()),
+        || (Acc::<E::Scalar>::default(), Acc::<E::Scalar>::default()),
         |mut a, b| {
           a.0 += b.0;
           a.1 += b.1;
@@ -1386,7 +1386,7 @@ where
         .zip(C_layers.par_chunks(2))
         .enumerate()
         .fold(
-          || (Acc::<E::Scalar>::zero(), Acc::<E::Scalar>::zero()),
+          || (Acc::<E::Scalar>::default(), Acc::<E::Scalar>::default()),
           |mut outer_acc, (pair_idx, ((pair_a, pair_b), pair_c))| {
             // Two-level DMR prove_helper
             // Pass global round index t (not t-l0) so round 0 optimization only
@@ -1422,7 +1422,7 @@ where
           },
         )
         .reduce(
-          || (Acc::<E::Scalar>::zero(), Acc::<E::Scalar>::zero()),
+          || (Acc::<E::Scalar>::default(), Acc::<E::Scalar>::default()),
           |mut a, b| {
             a.0 += b.0;
             a.1 += b.1;

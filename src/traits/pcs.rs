@@ -8,6 +8,7 @@
 //! We require the commitment engine to provide a commitment to vectors with a single group element
 use crate::{
   errors::SpartanError,
+  small_field::{DelayedReduction, WitnessValue},
   traits::{Engine, TranscriptReprTrait},
 };
 use core::fmt::Debug;
@@ -63,19 +64,11 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
     is_small: bool,
   ) -> Result<Self::Commitment, SpartanError>;
 
-  /// Commits to a vector of signed small integers (e.g. i8 witnesses in {-1, 0, 1, 2})
-  /// without converting to field elements first.
-  fn commit_i8(
+  /// Commits to a witness vector using the witness type's MSM implementation.
+  /// Works for both bool (conditional add) and i8 (signed small MSM) witnesses.
+  fn commit_witness<W: WitnessValue>(
     ck: &Self::CommitmentKey,
-    v: &[i8],
-    r: &Self::Blind,
-  ) -> Result<Self::Commitment, SpartanError>;
-
-  /// Commits to a boolean vector. Each base is conditionally added if the bit is true.
-  /// No scalar multiplication needed.
-  fn commit_bool(
-    ck: &Self::CommitmentKey,
-    v: &[bool],
+    v: &[W],
     r: &Self::Blind,
   ) -> Result<Self::Commitment, SpartanError>;
 
@@ -126,33 +119,21 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
     blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError>;
 
-  /// Proves evaluation of a polynomial whose coefficients are small signed integers.
-  /// Avoids field conversion: bind_with uses conditional add instead of field multiply.
-  fn prove_i8(
+  /// Proves evaluation of a witness polynomial using generic binding.
+  /// Works for both bool and i8 witnesses via `WitnessValue` + `DelayedReduction`.
+  fn prove_witness<W: WitnessValue>(
     ck: &Self::CommitmentKey,
     ck_eval: &Self::CommitmentKey,
     transcript: &mut E::TE,
     comm: &Self::Commitment,
-    poly: &[i8],
+    poly: &[W],
     blind: &Self::Blind,
     point: &[E::Scalar],
     comm_eval: &Self::Commitment,
     blind_eval: &Self::Blind,
-  ) -> Result<Self::EvaluationArgument, SpartanError>;
-
-  /// Proves evaluation of a boolean polynomial.
-  /// Binding uses conditional add (no field multiply or negation).
-  fn prove_bool(
-    ck: &Self::CommitmentKey,
-    ck_eval: &Self::CommitmentKey,
-    transcript: &mut E::TE,
-    comm: &Self::Commitment,
-    poly: &[bool],
-    blind: &Self::Blind,
-    point: &[E::Scalar],
-    comm_eval: &Self::Commitment,
-    blind_eval: &Self::Blind,
-  ) -> Result<Self::EvaluationArgument, SpartanError>;
+  ) -> Result<Self::EvaluationArgument, SpartanError>
+  where
+    E::Scalar: DelayedReduction<W>;
 
   /// A method to verify the purported evaluation of a multilinear polynomials
   fn verify(

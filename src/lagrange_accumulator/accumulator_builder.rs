@@ -26,7 +26,6 @@ use crate::{
   small_field::{DelayedReduction, SmallValueField, WideMul},
 };
 use ff::PrimeField;
-use num_traits::Zero;
 use rayon::prelude::*;
 use std::ops::{Add, Sub};
 
@@ -85,7 +84,6 @@ where
   SmallValue: WideMul
     + Copy
     + Default
-    + Zero
     + Add<Output = SmallValue>
     + Sub<Output = SmallValue>
     + Send
@@ -214,7 +212,7 @@ where
         // This eliminates closure call overhead in the accumulator building loop
         // Reuse pre-allocated buffer to avoid per-iteration allocations
         for &beta_idx in &betas_with_infty {
-          if state.partial_sums[beta_idx].is_zero() {
+          if state.partial_sums[beta_idx] == Default::default() {
             continue;
           }
           // Reduce partial sum to field element
@@ -262,7 +260,7 @@ where
   for (round_idx, round) in merged.acc.rounds.iter().enumerate() {
     for (v_idx, row) in round.data().iter().enumerate() {
       for (u_idx, elem) in row.iter().enumerate() {
-        if !elem.is_zero() {
+        if *elem != Default::default() {
           result.rounds[round_idx].data_mut()[v_idx][u_idx] =
             <F as DelayedReduction<F>>::reduce(elem);
         }
@@ -330,7 +328,6 @@ where
   SmallValue: WideMul
     + Copy
     + Default
-    + Zero
     + Add<Output = SmallValue>
     + Sub<Output = SmallValue>
     + Send
@@ -501,7 +498,7 @@ where
         // Reduce partial sums to field elements
         for &beta_idx in &betas_with_infty {
           let unreduced = &state.partial_sums[beta_idx];
-          if !unreduced.is_zero() {
+          if *unreduced != Default::default() {
             let val = <F as DelayedReduction<SmallValue::Product>>::reduce(unreduced);
             state.beta_values.push((beta_idx, val));
           }
@@ -635,7 +632,7 @@ where
   for mut state in fold_results {
     // Reduce partial sums and scatter into state.acc
     for beta in 0..num_betas {
-      if state.partial_sums[beta].is_zero() {
+      if state.partial_sums[beta] == Default::default() {
         continue;
       }
       let val = <F as DelayedReduction<i32>>::reduce(&state.partial_sums[beta]);

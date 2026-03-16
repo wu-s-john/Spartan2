@@ -839,7 +839,7 @@ impl<E: Engine> SpartanSNARK<E> {
     let blind_eval_W = E::PCS::blind(&pk.ck_s, 1);
     let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W, false)?;
     let w_bool: Vec<bool> = W_i8.W.iter().map(|&v| v != 0).collect();
-    let eval_arg = E::PCS::prove_bool(
+    let eval_arg = E::PCS::prove_witness(
       &pk.ck,
       &pk.ck_s,
       &mut transcript,
@@ -924,7 +924,7 @@ impl<E: Engine> SpartanSNARK<E> {
     let (comm_W_shared, r_W_shared) = if pk.S.num_shared_unpadded > 0 {
       let r = PCS::<E>::blind(&pk.ck, pk.S.num_shared);
       let w_bool: Vec<bool> = witness[..pk.S.num_shared].iter().map(|&v| v != 0).collect();
-      let comm = PCS::<E>::commit_bool(&pk.ck, &w_bool, &r)?;
+      let comm = PCS::<E>::commit_witness(&pk.ck, &w_bool, &r)?;
       (Some(comm), Some(r))
     } else {
       (None, None)
@@ -959,7 +959,7 @@ impl<E: Engine> SpartanSNARK<E> {
         .iter()
         .map(|&v| v != 0)
         .collect();
-      let comm = PCS::<E>::commit_bool(&pk.ck, &w_bool, &r)?;
+      let comm = PCS::<E>::commit_witness(&pk.ck, &w_bool, &r)?;
       (Some(comm), Some(r))
     } else {
       (None, None)
@@ -1066,7 +1066,7 @@ impl<E: Engine> SpartanSNARK<E> {
       .iter()
       .map(|&v| v != 0)
       .collect();
-    let comm_W_rest = PCS::<E>::commit_bool(&pk.ck, &w_rest_bool, &r_W_rest)?;
+    let comm_W_rest = PCS::<E>::commit_witness(&pk.ck, &w_rest_bool, &r_W_rest)?;
     info!(elapsed_ms = %commit_rest_t.elapsed().as_millis(), "commit_witness_rest");
     transcript.absorb(b"comm_W_rest", &comm_W_rest);
 
@@ -1199,7 +1199,7 @@ impl<E: Engine> SpartanSNARK<E> {
     let blind_eval_W = E::PCS::blind(&pk.ck_s, 1);
     let comm_eval_W = E::PCS::commit(&pk.ck_s, &[eval_W], &blind_eval_W, false)?;
     let w_bool: Vec<bool> = prep.W.iter().map(|&v| v != 0).collect();
-    let eval_arg = E::PCS::prove_bool(
+    let eval_arg = E::PCS::prove_witness(
       &pk.ck,
       &pk.ck_s,
       &mut transcript,

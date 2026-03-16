@@ -14,7 +14,7 @@ use crate::{
   small_field::{DelayedReduction, ExtensionBound, SmallValueField, WideMul},
 };
 use ff::PrimeField;
-use num_traits::{Bounded, One, Signed, Zero};
+use num_traits::{Bounded, One, Signed};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -211,7 +211,7 @@ impl<F: PrimeField> SparseMatrix<F> {
         let end = ptrs[1];
 
         // Accumulate using delayed reduction: acc += matrix_val × z[col]
-        let mut acc = <F as DelayedReduction<SmallValue>>::Accumulator::zero();
+        let mut acc = <F as DelayedReduction<SmallValue>>::Accumulator::default();
         for i in start..end {
           let matrix_val = &self.data[i];
           let col_idx = self.indices[i];
