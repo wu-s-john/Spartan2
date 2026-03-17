@@ -708,7 +708,7 @@ impl<E: Engine> SpartanSNARK<E> {
     circuit: &C,
   ) -> Result<SmallPrepSNARK<E, W>, SpartanError>
   where
-    W: Copy + Clone + Default + PartialEq + Send + Sync,
+    W: Copy + Clone + Default + PartialEq + Send + Sync + From<bool>,
     C: SmallSpartanCircuit<E, W>,
   {
     use crate::{
