@@ -744,6 +744,34 @@ pub struct SplitR1CSShape<E: Engine, V = <E as Engine>::Scalar> {
   pub(crate) B_dense_col: Vec<u32>,
   #[serde(skip, default)]
   pub(crate) C_dense_col: Vec<u32>,
+  /// CSC (column-sorted) entries for cache-efficient scatter in bind_row_vars_combined_small.
+  /// For each matrix: col_ptr[c]..col_ptr[c+1] gives the range of entries for dense column c.
+  /// row_indices[j] gives the row, values[j] gives the coefficient.
+  /// col_unit_end[c] splits ±1 entries (col_ptr[c]..col_unit_end[c]) from non-±1.
+  #[serde(skip, default)]
+  pub(crate) A_csc_col_ptr: Vec<usize>,
+  #[serde(skip, default)]
+  pub(crate) A_csc_row: Vec<u32>,
+  #[serde(skip, default)]
+  pub(crate) A_csc_data: Vec<i32>,
+  #[serde(skip, default)]
+  pub(crate) A_csc_unit_end: Vec<usize>,
+  #[serde(skip, default)]
+  pub(crate) B_csc_col_ptr: Vec<usize>,
+  #[serde(skip, default)]
+  pub(crate) B_csc_row: Vec<u32>,
+  #[serde(skip, default)]
+  pub(crate) B_csc_data: Vec<i32>,
+  #[serde(skip, default)]
+  pub(crate) B_csc_unit_end: Vec<usize>,
+  #[serde(skip, default)]
+  pub(crate) C_csc_col_ptr: Vec<usize>,
+  #[serde(skip, default)]
+  pub(crate) C_csc_row: Vec<u32>,
+  #[serde(skip, default)]
+  pub(crate) C_csc_data: Vec<i32>,
+  #[serde(skip, default)]
+  pub(crate) C_csc_unit_end: Vec<usize>,
 }
 
 impl<E: Engine, V: Serialize> SimpleDigestible for SplitR1CSShape<E, V> {}
@@ -882,6 +910,18 @@ impl<E: Engine> SplitR1CSShape<E> {
       A_dense_col: Vec::new(),
       B_dense_col: Vec::new(),
       C_dense_col: Vec::new(),
+      A_csc_col_ptr: Vec::new(),
+      A_csc_row: Vec::new(),
+      A_csc_data: Vec::new(),
+      A_csc_unit_end: Vec::new(),
+      B_csc_col_ptr: Vec::new(),
+      B_csc_row: Vec::new(),
+      B_csc_data: Vec::new(),
+      B_csc_unit_end: Vec::new(),
+      C_csc_col_ptr: Vec::new(),
+      C_csc_row: Vec::new(),
+      C_csc_data: Vec::new(),
+      C_csc_unit_end: Vec::new(),
     })
   }
 
@@ -1207,6 +1247,70 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     let B_dense_col: Vec<u32> = B_padded.indices.iter().map(|&c| col_to_dense[c]).collect();
     let C_dense_col: Vec<u32> = C_padded.indices.iter().map(|&c| col_to_dense[c]).collect();
 
+    // Build CSC (column-sorted) representation for cache-efficient scatter.
+    // Entries sorted by dense column → sequential buffer writes in bind_row_vars_combined_small.
+    let num_dense = dense_to_col.len();
+    let build_csc = |matrix: &SparseMatrix<i32>,
+                     dense_col: &[u32],
+                     num_rows: usize,
+                     num_dense_cols: usize|
+     -> (Vec<usize>, Vec<u32>, Vec<i32>, Vec<usize>) {
+      // Count entries per column
+      let mut col_count = vec![0usize; num_dense_cols];
+      for row in 0..num_rows {
+        for i in matrix.indptr[row]..matrix.indptr[row + 1] {
+          col_count[dense_col[i] as usize] += 1;
+        }
+      }
+      // Build col_ptr from counts
+      let mut col_ptr = Vec::with_capacity(num_dense_cols + 1);
+      col_ptr.push(0);
+      for &count in &col_count {
+        col_ptr.push(col_ptr.last().unwrap() + count);
+      }
+      let total = *col_ptr.last().unwrap();
+      let mut row_indices = vec![0u32; total];
+      let mut values = vec![0i32; total];
+      // Fill in entries: ±1 entries first within each column, then non-±1
+      // Two-pass: first ±1, then non-±1
+      let mut write_pos = col_ptr[..num_dense_cols].to_vec();
+      // Pass 1: ±1 entries
+      for row in 0..num_rows {
+        for i in matrix.indptr[row]..matrix.indptr[row + 1] {
+          let c = dense_col[i] as usize;
+          let v = matrix.data[i];
+          if v == 1 || v == -1 {
+            let pos = write_pos[c];
+            row_indices[pos] = row as u32;
+            values[pos] = v;
+            write_pos[c] = pos + 1;
+          }
+        }
+      }
+      let unit_ends: Vec<usize> = write_pos.clone();
+      // Pass 2: non-±1 entries
+      for row in 0..num_rows {
+        for i in matrix.indptr[row]..matrix.indptr[row + 1] {
+          let c = dense_col[i] as usize;
+          let v = matrix.data[i];
+          if v != 1 && v != -1 {
+            let pos = write_pos[c];
+            row_indices[pos] = row as u32;
+            values[pos] = v;
+            write_pos[c] = pos + 1;
+          }
+        }
+      }
+      (col_ptr, row_indices, values, unit_ends)
+    };
+
+    let (A_csc_col_ptr, A_csc_row, A_csc_data, A_csc_unit_end) =
+      build_csc(&A_padded, &A_dense_col, num_cons, num_dense);
+    let (B_csc_col_ptr, B_csc_row, B_csc_data, B_csc_unit_end) =
+      build_csc(&B_padded, &B_dense_col, num_cons, num_dense);
+    let (C_csc_col_ptr, C_csc_row, C_csc_data, C_csc_unit_end) =
+      build_csc(&C_padded, &C_dense_col, num_cons, num_dense);
+
     Ok(SplitR1CSShape {
       num_cons: num_cons_padded,
       num_shared: num_shared_padded,
@@ -1232,6 +1336,18 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
       A_dense_col,
       B_dense_col,
       C_dense_col,
+      A_csc_col_ptr,
+      A_csc_row,
+      A_csc_data,
+      A_csc_unit_end,
+      B_csc_col_ptr,
+      B_csc_row,
+      B_csc_data,
+      B_csc_unit_end,
+      C_csc_col_ptr,
+      C_csc_row,
+      C_csc_data,
+      C_csc_unit_end,
     })
   }
 
@@ -1324,17 +1440,84 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
       return self.bind_row_vars_combined_small_no_remap(rx, r);
     }
 
-    // Only iterate real (non-padded) rows — padded rows have zero NNZ
+    // Use CSC (column-sorted) iteration if available. Column-major access makes
+    // buffer writes sequential (L1 hits), with random rx reads hitting L2.
+    // Separate A/B/C buffers: only read from rx (5.4MB, fits in L2) instead of
+    // rx + rx_r + rx_r_sq (16.2MB, spills L2). Combine with r, r² at the end.
+    if !self.A_csc_col_ptr.is_empty() {
+      /// Accumulate CSC entries for one matrix into a register accumulator.
+      #[inline(always)]
+      fn accumulate_column<F: ff::PrimeField + MontgomeryLimbs>(
+        rx_vals: &[F],
+        col_ptr: &[usize],
+        row_indices: &[u32],
+        values: &[i32],
+        unit_ends: &[usize],
+        c: usize,
+      ) -> F {
+        let start = col_ptr[c];
+        let end = col_ptr[c + 1];
+        let unit_end = unit_ends[c];
+        let mut acc = F::ZERO;
+        // ±1 entries: add/sub only
+        for j in start..unit_end {
+          let row = row_indices[j] as usize;
+          if values[j] > 0 {
+            acc += rx_vals[row];
+          } else {
+            acc -= rx_vals[row];
+          }
+        }
+        // Non-±1 entries
+        for j in unit_end..end {
+          let row = row_indices[j] as usize;
+          acc += SmallCoeff::mul_field(values[j], &rx_vals[row]);
+        }
+        acc
+      }
+
+      // Cache-blocked column partitioning. Process all 3 matrices per column inline:
+      // result[c] = A_sum + r * B_sum + r² * C_sum. No separate buffers or combine pass.
+      let col_chunk = std::cmp::min(7000, num_dense);
+      let mut compact = vec![E::Scalar::ZERO; num_dense];
+
+      compact.par_chunks_mut(col_chunk).enumerate().for_each(|(tid, chunk)| {
+        let col_start = tid * col_chunk;
+        for (i, slot) in chunk.iter_mut().enumerate() {
+          let c = col_start + i;
+          let sum_a = accumulate_column::<E::Scalar>(
+            rx, &self.A_csc_col_ptr, &self.A_csc_row,
+            &self.A_csc_data, &self.A_csc_unit_end, c,
+          );
+          let sum_b = accumulate_column::<E::Scalar>(
+            rx, &self.B_csc_col_ptr, &self.B_csc_row,
+            &self.B_csc_data, &self.B_csc_unit_end, c,
+          );
+          let sum_c = accumulate_column::<E::Scalar>(
+            rx, &self.C_csc_col_ptr, &self.C_csc_row,
+            &self.C_csc_data, &self.C_csc_unit_end, c,
+          );
+          *slot = sum_a + r * sum_b + r_sq * sum_c;
+        }
+      });
+
+      // Expand compact buffer → full-size output
+      let mut result = vec![E::Scalar::ZERO; num_cols];
+      for (dense_idx, &orig_col) in self.dense_to_col.iter().enumerate() {
+        result[orig_col as usize] = compact[dense_idx];
+      }
+      return result;
+    }
+
+    // Fallback: CSR-based scatter (used when CSC tables aren't built)
     let num_rows = self.num_cons_unpadded;
     let has_unit_partition = !self.A_unit_end.is_empty();
 
-    // Cap total buffer memory to avoid excessive allocation while preserving parallelism.
     let buffer_bytes = num_dense * std::mem::size_of::<E::Scalar>();
     let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
     let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
     let chunk_size = (num_rows + num_threads - 1) / num_threads;
 
-    // Helper: process one matrix's entries for a row
     #[inline(always)]
     fn process_matrix_row<F: ff::PrimeField + MontgomeryLimbs, C: SmallCoeff>(
       buffer: &mut [F],
@@ -1347,7 +1530,6 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
       has_unit: bool,
     ) {
       if has_unit {
-        // ±1 entries: add/sub only (no multiply)
         for i in start..unit_end {
           let idx = dense_col[i] as usize;
           if data[i].is_positive() {
@@ -1356,7 +1538,6 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
             buffer[idx] -= rx_scaled;
           }
         }
-        // Non-±1 entries: use SmallCoeff::mul_field
         for i in unit_end..end {
           let idx = dense_col[i] as usize;
           buffer[idx] += data[i].mul_field(&rx_scaled);
@@ -1369,7 +1550,6 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
       }
     }
 
-    // Allocate + compute in parallel with compact buffers
     let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
       .into_par_iter()
       .map(|thread_idx| {
@@ -1403,7 +1583,6 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
       })
       .collect();
 
-    // Reduce compact thread buffers
     let mut compact = thread_buffers.swap_remove(0);
     for buffer in thread_buffers {
       compact
@@ -1412,7 +1591,6 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
         .for_each(|(a, b)| *a += *b);
     }
 
-    // Expand compact buffer → full-size output
     let mut result = vec![E::Scalar::ZERO; num_cols];
     for (dense_idx, &orig_col) in self.dense_to_col.iter().enumerate() {
       result[orig_col as usize] = compact[dense_idx];
