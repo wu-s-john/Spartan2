@@ -134,13 +134,13 @@ fn run_benchmark<E: Engine>(
 
       // Setup small (once, cached)
       let t0 = Instant::now();
-      let pk_small = SpartanSNARK::<E>::setup_small(&circuit, &vk).expect("setup_small failed");
+      let pk_small = SpartanSNARK::<E>::setup_small::<i32, _>(&circuit, &vk).expect("setup_small failed");
       let setup_small_ms = t0.elapsed().as_millis() as u64;
       info!(elapsed_ms = setup_small_ms, "setup_small");
 
       // Prep: witness gen (shared + precommitted) + commit
       let t0 = Instant::now();
-      let prep = SpartanSNARK::<E>::prep_prove_small::<_, _, i8>(&pk_small, &circuit)
+      let prep = SpartanSNARK::<E>::prep_prove_small::<_, i32, i8>(&pk_small, &circuit)
         .expect("prep_prove_small failed");
       let prep_ms = t0.elapsed().as_millis() as u64;
       info!(elapsed_ms = prep_ms, "prep_prove_small");

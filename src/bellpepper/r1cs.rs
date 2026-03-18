@@ -13,7 +13,7 @@ use crate::{
     R1CSWitness, SparseMatrix, SplitMultiRoundR1CSInstance, SplitMultiRoundR1CSShape,
     SplitR1CSInstance, SplitR1CSShape,
   },
-  small_constraint_system::SmallCoeff,
+  small_constraint_system::{SmallCoeff, SmallSatisfyingAssignment},
   start_span,
   traits::{
     Engine,
@@ -23,7 +23,7 @@ use crate::{
   },
 };
 use bellpepper::gadgets::num::AllocatedNum;
-use bellpepper_core::{ConstraintSystem, Index, LinearCombination};
+use bellpepper_core::{ConstraintSystem, Index, LinearCombination, Variable};
 use ff::{Field, PrimeField};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -88,6 +88,34 @@ pub trait SpartanWitness<E: Engine> {
     is_small: bool,
     transcript: &mut E::TE,
   ) -> Result<(SplitR1CSInstance<E>, R1CSWitness<E>), SpartanError>;
+}
+
+/// `SmallSpartanWitness` provides methods for witness preparation on the small-value (integer) path.
+///
+/// Mirrors `SpartanWitness` but for `SmallSatisfyingAssignment<W>`. The small path always
+/// uses `commit_witness` (bool MSM), so there is no `is_small` flag.
+///
+/// `Coeff` is the matrix-coefficient type stored in `SplitR1CSShape<E, Coeff>`.
+pub trait SmallSpartanWitness<E: Engine, W, Coeff> {
+  /// Holds the pre-processed state for the small-value proving path.
+  type SmallPrepState;
+
+  /// Synthesizes the shared witness and commits to it.
+  ///
+  /// Returns a `SmallPrepState` with `comm_precommitted: None`.
+  fn shared_witness<C: SmallSpartanCircuit<E, W>>(
+    S: &SplitR1CSShape<E, Coeff>,
+    ck: &CommitmentKey<E>,
+    circuit: &C,
+  ) -> Result<Self::SmallPrepState, SpartanError>;
+
+  /// Synthesizes the precommitted witness and commits to it, mutating `prep` in-place.
+  fn precommitted_witness<C: SmallSpartanCircuit<E, W>>(
+    prep: &mut Self::SmallPrepState,
+    S: &SplitR1CSShape<E, Coeff>,
+    ck: &CommitmentKey<E>,
+    circuit: &C,
+  ) -> Result<(), SpartanError>;
 }
 
 /// `MultiRoundSpartanShape` provides methods for acquiring `SplitMultiRoundR1CSShape` and `CommitmentKey` from implementers.
@@ -294,6 +322,13 @@ pub fn small_r1cs_shape<E: Engine, Coeff: SmallCoeff, Circuit: SmallSpartanCircu
   })
 }
 
+/// A commitment to a witness segment together with its blinding factor.
+#[derive(Debug, Clone)]
+pub struct WitnessCommitment<E: Engine> {
+  pub(crate) comm: Commitment<E>,
+  pub(crate) blind: Blind<E>,
+}
+
 /// A type that holds the pre-processed state for proving with the small-value (integer) path.
 ///
 /// Contains the witness assignment, partial commitments, and the full witness vector.
@@ -301,13 +336,11 @@ pub fn small_r1cs_shape<E: Engine, Coeff: SmallCoeff, Circuit: SmallSpartanCircu
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct SmallPrepSNARK<E: Engine, W> {
-  pub(crate) cs: crate::small_constraint_system::SmallSatisfyingAssignment<W>,
-  pub(crate) shared: Vec<bellpepper_core::Variable>,
-  pub(crate) precommitted: Vec<bellpepper_core::Variable>,
-  pub(crate) comm_W_shared: Option<Commitment<E>>,
-  pub(crate) r_W_shared: Option<Blind<E>>,
-  pub(crate) comm_W_precommitted: Option<Commitment<E>>,
-  pub(crate) r_W_precommitted: Option<Blind<E>>,
+  pub(crate) cs: SmallSatisfyingAssignment<W>,
+  pub(crate) shared: Vec<Variable>,
+  pub(crate) precommitted: Vec<Variable>,
+  pub(crate) comm_shared: Option<WitnessCommitment<E>>,
+  pub(crate) comm_precommitted: Option<WitnessCommitment<E>>,
   pub(crate) W: Vec<W>,
 }
 
@@ -880,5 +913,105 @@ impl<E: Engine> MultiRoundSpartanWitness<E> for SatisfyingAssignment<E> {
     let w = R1CSWitness::<E>::new_unchecked(state.w.clone(), r_w, false)?;
 
     Ok((u, w))
+  }
+}
+
+impl<E: Engine, W, Coeff> SmallSpartanWitness<E, W, Coeff> for SmallSatisfyingAssignment<W>
+where
+  W: Copy + Default + PartialEq + From<bool>,
+{
+  type SmallPrepState = SmallPrepSNARK<E, W>;
+
+  fn shared_witness<C: SmallSpartanCircuit<E, W>>(
+    S: &SplitR1CSShape<E, Coeff>,
+    ck: &CommitmentKey<E>,
+    circuit: &C,
+  ) -> Result<SmallPrepSNARK<E, W>, SpartanError> {
+    use tracing::info;
+
+    let (_synth_span, synth_t) = start_span!("shared_witness_synthesize");
+
+    let mut cs = SmallSatisfyingAssignment::<W>::new();
+
+    let shared = circuit
+      .shared(&mut cs)
+      .map_err(|e| SpartanError::SynthesisError {
+        reason: format!("shared_witness: shared: {e}"),
+      })?;
+
+    let num_vars = S.num_shared + S.num_precommitted + S.num_rest;
+    let mut witness = vec![W::default(); num_vars];
+    let shared_copy = cs.aux_assignment.len().min(S.num_shared_unpadded);
+    witness[..shared_copy].copy_from_slice(&cs.aux_assignment[..shared_copy]);
+
+    let zero_w = W::default();
+    let comm_shared = if S.num_shared_unpadded > 0 {
+      let blind = PCS::<E>::blind(ck, S.num_shared);
+      let w_bool: Vec<bool> = witness[..S.num_shared]
+        .iter()
+        .map(|v| *v != zero_w)
+        .collect();
+      let comm = PCS::<E>::commit_witness(ck, &w_bool, &blind)?;
+      Some(WitnessCommitment { comm, blind })
+    } else {
+      None
+    };
+
+    info!(elapsed_ms = %synth_t.elapsed().as_millis(), "shared_witness_synthesize");
+
+    Ok(SmallPrepSNARK {
+      cs,
+      shared,
+      precommitted: vec![],
+      comm_shared,
+      comm_precommitted: None,
+      W: witness,
+    })
+  }
+
+  fn precommitted_witness<C: SmallSpartanCircuit<E, W>>(
+    prep: &mut SmallPrepSNARK<E, W>,
+    S: &SplitR1CSShape<E, Coeff>,
+    ck: &CommitmentKey<E>,
+    circuit: &C,
+  ) -> Result<(), SpartanError> {
+    use tracing::info;
+
+    let (_synth_span, synth_t) = start_span!("precommitted_witness_synthesize");
+
+    let precommitted = circuit
+      .precommitted(&mut prep.cs, &prep.shared)
+      .map_err(|e| SpartanError::SynthesisError {
+        reason: format!("precommitted_witness: precommitted: {e}"),
+      })?;
+
+    let precommitted_start_aux = S.num_shared_unpadded;
+    let precommitted_copy = (prep.cs.aux_assignment.len().saturating_sub(precommitted_start_aux))
+      .min(S.num_precommitted_unpadded);
+    let dst_start = S.num_shared;
+    prep.W[dst_start..dst_start + precommitted_copy].copy_from_slice(
+      &prep.cs.aux_assignment[precommitted_start_aux..precommitted_start_aux + precommitted_copy],
+    );
+
+    info!(elapsed_ms = %synth_t.elapsed().as_millis(), "precommitted_witness_synthesize");
+
+    let (_commit_pre_span, commit_pre_t) = start_span!("commit_witness_precommitted");
+    let zero_w = W::default();
+    prep.comm_precommitted = if S.num_precommitted_unpadded > 0 {
+      let blind = PCS::<E>::blind(ck, S.num_precommitted);
+      let w_bool: Vec<bool> = prep.W[S.num_shared..S.num_shared + S.num_precommitted]
+        .iter()
+        .map(|v| *v != zero_w)
+        .collect();
+      let comm = PCS::<E>::commit_witness(ck, &w_bool, &blind)?;
+      Some(WitnessCommitment { comm, blind })
+    } else {
+      None
+    };
+    info!(elapsed_ms = %commit_pre_t.elapsed().as_millis(), "commit_witness_precommitted");
+
+    prep.precommitted = precommitted;
+
+    Ok(())
   }
 }

@@ -757,6 +757,10 @@ pub struct SplitR1CSShape<E: Engine, V = <E as Engine>::Scalar> {
   pub(crate) C_csc_data: Vec<V>,
   #[serde(skip, default)]
   pub(crate) C_csc_unit_end: Vec<usize>,
+  /// Per-column presence bitmask: bit 0 = A non-empty, bit 1 = B non-empty, bit 2 = C non-empty.
+  /// Used to skip Montgomery multiplications for empty matrix columns in the hot path.
+  #[serde(skip, default)]
+  pub(crate) col_presence: Vec<u8>,
 }
 
 impl<E: Engine, V: Serialize + for<'a> Deserialize<'a>> SimpleDigestible for SplitR1CSShape<E, V> {}
@@ -908,6 +912,7 @@ impl<E: Engine> SplitR1CSShape<E> {
       C_csc_row: Vec::new(),
       C_csc_data: Vec::new(),
       C_csc_unit_end: Vec::new(),
+      col_presence: Vec::new(),
     })
   }
 
@@ -1297,6 +1302,15 @@ impl<E: Engine, C: SmallCoeff> SplitR1CSShape<E, C> {
     let (C_csc_col_ptr, C_csc_row, C_csc_data, C_csc_unit_end) =
       build_csc(&C_padded, &C_dense_col, num_cons, num_dense);
 
+    let col_presence: Vec<u8> = (0..num_dense)
+      .map(|c| {
+        let a = (A_csc_col_ptr[c + 1] > A_csc_col_ptr[c]) as u8;
+        let b = (B_csc_col_ptr[c + 1] > B_csc_col_ptr[c]) as u8 * 2;
+        let cc = (C_csc_col_ptr[c + 1] > C_csc_col_ptr[c]) as u8 * 4;
+        a | b | cc
+      })
+      .collect();
+
     Ok(SplitR1CSShape {
       num_cons: num_cons_padded,
       num_shared: num_shared_padded,
@@ -1334,6 +1348,7 @@ impl<E: Engine, C: SmallCoeff> SplitR1CSShape<E, C> {
       C_csc_row,
       C_csc_data,
       C_csc_unit_end,
+      col_presence,
     })
   }
 
@@ -1445,6 +1460,16 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
       ) -> F {
         let start = col_ptr[c];
         let end = col_ptr[c + 1];
+
+        // Depth-1: single entry — skip loop overhead entirely
+        if start + 1 == end {
+          return if values[start].is_positive() {
+            rx_vals[row_indices[start] as usize]
+          } else {
+            -rx_vals[row_indices[start] as usize]
+          };
+        }
+
         let unit_end = unit_ends[c];
         let mut acc = F::ZERO;
         // ±1 entries: add/sub only
@@ -1466,26 +1491,41 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
 
       // Cache-blocked column partitioning. Process all 3 matrices per column inline:
       // result[c] = A_sum + r * B_sum + r² * C_sum. No separate buffers or combine pass.
+      // Dispatches on col_presence to skip Montgomery muls for empty matrix columns.
       let col_chunk = std::cmp::min(7000, num_dense);
       let mut compact = vec![E::Scalar::ZERO; num_dense];
+
+      let use_presence = !self.col_presence.is_empty();
 
       compact.par_chunks_mut(col_chunk).enumerate().for_each(|(tid, chunk)| {
         let col_start = tid * col_chunk;
         for (i, slot) in chunk.iter_mut().enumerate() {
           let c = col_start + i;
-          let sum_a = accumulate_column::<E::Scalar, Coeff>(
-            rx, &self.A_csc_col_ptr, &self.A_csc_row,
-            &self.A_csc_data, &self.A_csc_unit_end, c,
-          );
-          let sum_b = accumulate_column::<E::Scalar, Coeff>(
-            rx, &self.B_csc_col_ptr, &self.B_csc_row,
-            &self.B_csc_data, &self.B_csc_unit_end, c,
-          );
-          let sum_c = accumulate_column::<E::Scalar, Coeff>(
-            rx, &self.C_csc_col_ptr, &self.C_csc_row,
-            &self.C_csc_data, &self.C_csc_unit_end, c,
-          );
-          *slot = sum_a + r * sum_b + r_sq * sum_c;
+
+          macro_rules! acc_a {
+            () => { accumulate_column::<E::Scalar, Coeff>(rx, &self.A_csc_col_ptr, &self.A_csc_row, &self.A_csc_data, &self.A_csc_unit_end, c) };
+          }
+          macro_rules! acc_b {
+            () => { accumulate_column::<E::Scalar, Coeff>(rx, &self.B_csc_col_ptr, &self.B_csc_row, &self.B_csc_data, &self.B_csc_unit_end, c) };
+          }
+          macro_rules! acc_c {
+            () => { accumulate_column::<E::Scalar, Coeff>(rx, &self.C_csc_col_ptr, &self.C_csc_row, &self.C_csc_data, &self.C_csc_unit_end, c) };
+          }
+
+          *slot = if use_presence {
+            match self.col_presence[c] {
+              0 => E::Scalar::ZERO,
+              1 => acc_a!(),
+              2 => r * acc_b!(),
+              3 => acc_a!() + r * acc_b!(),
+              4 => r_sq * acc_c!(),
+              5 => acc_a!() + r_sq * acc_c!(),
+              6 => r * acc_b!() + r_sq * acc_c!(),
+              _ => acc_a!() + r * acc_b!() + r_sq * acc_c!(),
+            }
+          } else {
+            acc_a!() + r * acc_b!() + r_sq * acc_c!()
+          };
         }
       });
 

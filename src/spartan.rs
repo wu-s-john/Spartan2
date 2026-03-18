@@ -9,7 +9,7 @@
 use crate::{
   Blind, CommitmentKey, MULTIROUND_COMMITMENT_WIDTH,
   bellpepper::{
-    r1cs::{PrecommittedState, SmallPrepSNARK, SpartanShape, SpartanWitness},
+    r1cs::{PrecommittedState, SmallPrepSNARK, SmallSpartanWitness, SpartanShape, SpartanWitness},
     shape_cs::ShapeCS,
     solver::SatisfyingAssignment,
   },
@@ -703,10 +703,9 @@ impl<E: Engine> SpartanSNARK<E> {
     })
   }
 
-  /// Prepares the small-value SNARK: synthesizes witness (shared + precommitted)
-  /// and commits to those portions.
+  /// Synthesizes and commits the shared and precommitted witness segments.
   ///
-  /// Returns a `SmallPrepSNARK` that can be passed to `prove_small_value`.
+  /// Returns a `SmallPrepSNARK` ready to be passed to `prove_small_value`.
   pub fn prep_prove_small<C, Coeff, W>(
     pk: &SpartanProverKey<E, Coeff>,
     circuit: &C,
@@ -715,86 +714,12 @@ impl<E: Engine> SpartanSNARK<E> {
     W: Copy + Clone + Default + PartialEq + Send + Sync + From<bool>,
     C: SmallSpartanCircuit<E, W>,
   {
-    use crate::{
-      PCS, bellpepper::r1cs::SmallPrepSNARK, small_constraint_system::SmallSatisfyingAssignment,
-    };
+    use crate::small_constraint_system::SmallSatisfyingAssignment;
 
-    // Synthesis span — matches "precommitted_witness_synthesize" from field path
-    let (_synth_span, synth_t) = start_span!("precommitted_witness_synthesize");
-
-    let mut cs = SmallSatisfyingAssignment::<W>::new();
-
-    let shared = circuit
-      .shared(&mut cs)
-      .map_err(|e| SpartanError::SynthesisError {
-        reason: format!("prep_prove_small: shared: {e}"),
-      })?;
-
-    let num_vars = pk.S.num_shared + pk.S.num_precommitted + pk.S.num_rest;
-    let mut witness = vec![W::default(); num_vars];
-    let shared_copy = cs.aux_assignment.len().min(pk.S.num_shared_unpadded);
-    witness[..shared_copy].copy_from_slice(&cs.aux_assignment[..shared_copy]);
-
-    // Commit shared (convert W → bool for msm_bool)
-    let zero_w = W::default();
-    let (comm_W_shared, r_W_shared) = if pk.S.num_shared_unpadded > 0 {
-      let r = PCS::<E>::blind(&pk.ck, pk.S.num_shared);
-      let w_bool: Vec<bool> = witness[..pk.S.num_shared]
-        .iter()
-        .map(|v| *v != zero_w)
-        .collect();
-      let comm = PCS::<E>::commit_witness(&pk.ck, &w_bool, &r)?;
-      (Some(comm), Some(r))
-    } else {
-      (None, None)
-    };
-
-    let precommitted =
-      circuit
-        .precommitted(&mut cs, &shared)
-        .map_err(|e| SpartanError::SynthesisError {
-          reason: format!("prep_prove_small: precommitted: {e}"),
-        })?;
-
-    // Copy precommitted witness
-    let precommitted_start_aux = pk.S.num_shared_unpadded;
-    let precommitted_copy = (cs
-      .aux_assignment
-      .len()
-      .saturating_sub(precommitted_start_aux))
-    .min(pk.S.num_precommitted_unpadded);
-    let dst_start = pk.S.num_shared;
-    witness[dst_start..dst_start + precommitted_copy].copy_from_slice(
-      &cs.aux_assignment[precommitted_start_aux..precommitted_start_aux + precommitted_copy],
-    );
-
-    info!(elapsed_ms = %synth_t.elapsed().as_millis(), "precommitted_witness_synthesize");
-
-    // Commit precommitted
-    let (_commit_pre_span, commit_pre_t) = start_span!("commit_witness_precommitted");
-    let (comm_W_precommitted, r_W_precommitted) = if pk.S.num_precommitted_unpadded > 0 {
-      let r = PCS::<E>::blind(&pk.ck, pk.S.num_precommitted);
-      let w_bool: Vec<bool> = witness[pk.S.num_shared..pk.S.num_shared + pk.S.num_precommitted]
-        .iter()
-        .map(|v| *v != zero_w)
-        .collect();
-      let comm = PCS::<E>::commit_witness(&pk.ck, &w_bool, &r)?;
-      (Some(comm), Some(r))
-    } else {
-      (None, None)
-    };
-    info!(elapsed_ms = %commit_pre_t.elapsed().as_millis(), "commit_witness_precommitted");
-
-    Ok(SmallPrepSNARK {
-      cs,
-      shared,
-      precommitted,
-      comm_W_shared,
-      r_W_shared,
-      comm_W_precommitted,
-      r_W_precommitted,
-      W: witness,
-    })
+    let mut prep =
+      SmallSatisfyingAssignment::<W>::shared_witness(&pk.S, &pk.ck, circuit)?;
+    SmallSatisfyingAssignment::<W>::precommitted_witness(&mut prep, &pk.S, &pk.ck, circuit)?;
+    Ok(prep)
   }
 
   /// Proves satisfiability using the prep/prove split for the pure-integer path.
@@ -849,11 +774,11 @@ impl<E: Engine> SpartanSNARK<E> {
     let mut prep = prep.clone();
 
     // Absorb shared/precommitted commitments
-    if let Some(ref comm) = prep.comm_W_shared {
-      transcript.absorb(b"comm_W_shared", comm);
+    if let Some(ref wc) = prep.comm_shared {
+      transcript.absorb(b"comm_W_shared", &wc.comm);
     }
-    if let Some(ref comm) = prep.comm_W_precommitted {
-      transcript.absorb(b"comm_W_precommitted", comm);
+    if let Some(ref wc) = prep.comm_precommitted {
+      transcript.absorb(b"comm_W_precommitted", &wc.comm);
     }
 
     // Challenges
@@ -897,19 +822,19 @@ impl<E: Engine> SpartanSNARK<E> {
 
     // Combine blinds
     let mut blinds = Vec::with_capacity(3);
-    if let Some(r) = &prep.r_W_shared {
-      blinds.push(r.clone());
+    if let Some(ref wc) = prep.comm_shared {
+      blinds.push(wc.blind.clone());
     }
-    if let Some(r) = &prep.r_W_precommitted {
-      blinds.push(r.clone());
+    if let Some(ref wc) = prep.comm_precommitted {
+      blinds.push(wc.blind.clone());
     }
     blinds.push(r_W_rest);
     let r_W = PCS::<E>::combine_blinds(&blinds)?;
 
     // Build U_w instance
     let U_w = SplitR1CSInstance::<E, W> {
-      comm_W_shared: prep.comm_W_shared.clone(),
-      comm_W_precommitted: prep.comm_W_precommitted.clone(),
+      comm_W_shared: prep.comm_shared.as_ref().map(|wc| wc.comm.clone()),
+      comm_W_precommitted: prep.comm_precommitted.as_ref().map(|wc| wc.comm.clone()),
       comm_W_rest: comm_W_rest.clone(),
       public_values: pub_w.clone(),
       challenges: challenges_field,
