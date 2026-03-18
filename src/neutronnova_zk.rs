@@ -17,8 +17,8 @@ use crate::{
   CommitmentKey,
   bellpepper::{
     r1cs::{
-      MultiRoundSpartanShape, MultiRoundSpartanWitness, PrecommittedState, RerandomizationTrait,
-      SpartanShape, SpartanWitness,
+      MultiRoundSpartanShape, MultiRoundSpartanWitness, RerandomizationTrait, SpartanShape,
+      SpartanWitness,
     },
     shape_cs::ShapeCS,
     solver::SatisfyingAssignment,
@@ -1586,9 +1586,9 @@ impl<E: Engine> DigestHelperTrait<E> for NeutronNovaVerifierKey<E> {
 #[serde(bound = "")]
 pub struct NeutronNovaPrepZkSNARK<E: Engine> {
   /// Pre-committed state for each step circuit
-  pub ps_step: Vec<PrecommittedState<E>>,
+  pub ps_step: Vec<crate::spartan::SpartanPrepSNARK<E>>,
   /// Pre-committed state for the core circuit
-  pub ps_core: PrecommittedState<E>,
+  pub ps_core: crate::spartan::SpartanPrepSNARK<E>,
 }
 
 /// Holds the proof produced by the NeutronNova folding scheme followed by NeutronNova SNARK
@@ -1773,8 +1773,7 @@ where
         ps_i.rerandomize_with_shared(
           &pk.ck,
           &pk.S_step,
-          &ps_core.comm_W_shared,
-          &ps_core.r_W_shared,
+          &ps_core.comm_shared,
         )
       })
       .collect::<Result<Vec<_>, _>>()?;

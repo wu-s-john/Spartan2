@@ -10,8 +10,8 @@ use crate::{
   CommitmentKey,
   bellpepper::{
     r1cs::{
-      MultiRoundSpartanShape, MultiRoundSpartanWitness, PrecommittedState, RerandomizationTrait,
-      SpartanShape, SpartanWitness,
+      MultiRoundSpartanShape, MultiRoundSpartanWitness, RerandomizationTrait, SpartanShape,
+      SpartanWitness,
     },
     shape_cs::ShapeCS,
     solver::SatisfyingAssignment,
@@ -105,11 +105,7 @@ impl<E: Engine> DigestHelperTrait<E> for SpartanVerifierKey<E> {
 }
 
 /// A type that holds the pre-processed state for proving
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound = "")]
-pub struct SpartanPrepZkSNARK<E: Engine> {
-  ps: PrecommittedState<E>,
-}
+pub type SpartanPrepZkSNARK<E> = crate::spartan::SpartanPrepSNARK<E>;
 
 /// A succinct non-interactive argument of knowledge (SNARK) for a relaxed R1CS instance,
 /// produced using Spartan's combination of sum-check protocols and polynomial commitments.
@@ -195,7 +191,7 @@ where
     let mut ps = SatisfyingAssignment::shared_witness(&pk.S, &pk.ck, &circuit, is_small)?;
     SatisfyingAssignment::precommitted_witness(&mut ps, &pk.S, &pk.ck, &circuit, is_small)?;
 
-    Ok(SpartanPrepZkSNARK { ps })
+    Ok(ps)
   }
 
   /// produces a succinct proof of satisfiability of an R1CS instance
@@ -212,7 +208,7 @@ where
 
     // rerandomize the prep state
     let (_rerandomize_span, rerandomize_t) = start_span!("rerandomize_prep_state");
-    let mut ps = prep_snark.ps.rerandomize(&pk.ck, &pk.S)?;
+    let mut ps = prep_snark.rerandomize(&pk.ck, &pk.S)?;
     info!(elapsed_ms = %rerandomize_t.elapsed().as_millis(), "rerandomize_prep_state");
 
     let mut transcript = E::TE::new(b"SpartanZkSNARK");

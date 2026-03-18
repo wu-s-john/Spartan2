@@ -14,6 +14,7 @@ use crate::{
     SplitR1CSInstance, SplitR1CSShape,
   },
   small_constraint_system::{SmallCoeff, SmallSatisfyingAssignment},
+  spartan::SpartanPrepSNARK,
   start_span,
   traits::{
     Engine,
@@ -46,8 +47,7 @@ pub trait RerandomizationTrait<E: Engine> {
     &self,
     ck: &CommitmentKey<E>,
     S: &SplitR1CSShape<E>,
-    comm_W_shared: &Option<Commitment<E>>,
-    r_W_shared: &Option<Blind<E>>,
+    shared: &Option<WitnessCommitment<E>>,
   ) -> Result<Self, SpartanError>
   where
     Self: Sized;
@@ -323,7 +323,8 @@ pub fn small_r1cs_shape<E: Engine, Coeff: SmallCoeff, Circuit: SmallSpartanCircu
 }
 
 /// A commitment to a witness segment together with its blinding factor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct WitnessCommitment<E: Engine> {
   pub(crate) comm: Commitment<E>,
   pub(crate) blind: Blind<E>,
@@ -399,22 +400,8 @@ pub(crate) fn add_constraint<S: PrimeField>(
   **nn += 1;
 }
 
-/// A type that holds the pre-processed state for proving
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound = "")]
-pub struct PrecommittedState<E: Engine> {
-  cs: SatisfyingAssignment<E>,
-  shared: Vec<AllocatedNum<E::Scalar>>,
-  precommitted: Vec<AllocatedNum<E::Scalar>>,
-  pub(crate) comm_W_shared: Option<Commitment<E>>,
-  pub(crate) r_W_shared: Option<Blind<E>>,
-  comm_W_precommitted: Option<Commitment<E>>,
-  r_W_precommitted: Option<Blind<E>>,
-  W: Vec<E::Scalar>,
-}
-
 impl<E: Engine> SpartanWitness<E> for SatisfyingAssignment<E> {
-  type PrecommittedState = PrecommittedState<E>;
+  type PrecommittedState = SpartanPrepSNARK<E>;
 
   fn shared_witness<C: SpartanCircuit<E>>(
     S: &SplitR1CSShape<E>,
@@ -457,14 +444,15 @@ impl<E: Engine> SpartanWitness<E> for SatisfyingAssignment<E> {
     info!(elapsed_ms = %commit_t.elapsed().as_millis(), "commit_witness_shared");
     info!(elapsed_ms = %synth_t.elapsed().as_millis(), "shared_witness_synthesize");
 
-    Ok(PrecommittedState {
+    Ok(SpartanPrepSNARK {
       cs,
       shared,
       precommitted: vec![],
-      comm_W_shared,
-      r_W_shared,
-      comm_W_precommitted: None,
-      r_W_precommitted: None,
+      comm_shared: comm_W_shared.map(|comm| WitnessCommitment {
+        comm,
+        blind: r_W_shared.unwrap(),
+      }),
+      comm_precommitted: None,
       W,
     })
   }
@@ -514,8 +502,10 @@ impl<E: Engine> SpartanWitness<E> for SatisfyingAssignment<E> {
     info!(elapsed_ms = %commit_precommitted_t.elapsed().as_millis(), "commit_witness_precommitted");
 
     // update the preprocessed state
-    ps.comm_W_precommitted = comm_W_precommitted;
-    ps.r_W_precommitted = r_W_precommitted;
+    ps.comm_precommitted = comm_W_precommitted.map(|comm| WitnessCommitment {
+      comm,
+      blind: r_W_precommitted.unwrap(),
+    });
     ps.precommitted = precommitted;
 
     Ok(())
@@ -531,12 +521,12 @@ impl<E: Engine> SpartanWitness<E> for SatisfyingAssignment<E> {
   ) -> Result<(SplitR1CSInstance<E>, R1CSWitness<E>), SpartanError> {
     let (_synth_span, synth_t) = start_span!("circuit_synthesize_rest");
 
-    // partial commitment to precommitted witness variables
-    if let Some(comm_W_shared) = &ps.comm_W_shared {
-      transcript.absorb(b"comm_W_shared", comm_W_shared);
+    // absorb partial commitments into transcript
+    if let Some(wc) = &ps.comm_shared {
+      transcript.absorb(b"comm_W_shared", &wc.comm);
     }
-    if let Some(comm_W_precommitted) = &ps.comm_W_precommitted {
-      transcript.absorb(b"comm_W_precommitted", comm_W_precommitted);
+    if let Some(wc) = &ps.comm_precommitted {
+      transcript.absorb(b"comm_W_precommitted", &wc.comm);
     }
 
     let challenges = (0..S.num_challenges)
@@ -571,19 +561,19 @@ impl<E: Engine> SpartanWitness<E> for SatisfyingAssignment<E> {
     let public_values = ps.cs.input_assignment[1..].to_vec()[..S.num_public].to_vec();
     let U = SplitR1CSInstance::<E>::new(
       S,
-      ps.comm_W_shared.clone(),
-      ps.comm_W_precommitted.clone(),
+      ps.comm_shared.as_ref().map(|wc| wc.comm.clone()),
+      ps.comm_precommitted.as_ref().map(|wc| wc.comm.clone()),
       comm_W_rest,
       public_values,
       challenges,
     )?;
 
     let mut blinds = Vec::with_capacity(3);
-    if let Some(r_W_shared) = &ps.r_W_shared {
-      blinds.push(r_W_shared.clone());
+    if let Some(wc) = &ps.comm_shared {
+      blinds.push(wc.blind.clone());
     }
-    if let Some(r_W_precommitted) = &ps.r_W_precommitted {
-      blinds.push(r_W_precommitted.clone());
+    if let Some(wc) = &ps.comm_precommitted {
+      blinds.push(wc.blind.clone());
     }
     blinds.push(r_W_rest);
 
@@ -597,41 +587,37 @@ impl<E: Engine> SpartanWitness<E> for SatisfyingAssignment<E> {
   }
 }
 
-impl<E: Engine> RerandomizationTrait<E> for PrecommittedState<E> {
+impl<E: Engine> RerandomizationTrait<E> for SpartanPrepSNARK<E> {
   fn rerandomize(&self, ck: &CommitmentKey<E>, S: &SplitR1CSShape<E>) -> Result<Self, SpartanError>
   where
     Self: Sized,
   {
     // generate new blinds for shared and precommitted commitments and rerandomize commitments
-    let (comm_W_shared_new, r_W_shared_new) =
-      if let (Some(comm), Some(r_old)) = (&self.comm_W_shared, &self.r_W_shared) {
-        let r_new = PCS::<E>::blind(ck, S.num_shared);
-        (
-          Some(PCS::<E>::rerandomize_commitment(ck, comm, r_old, &r_new)?),
-          Some(r_new),
-        )
-      } else {
-        (None, None)
-      };
-    let (comm_W_precommitted_new, r_W_precommitted_new) =
-      if let (Some(comm), Some(r_old)) = (&self.comm_W_precommitted, &self.r_W_precommitted) {
-        let r_new = PCS::<E>::blind(ck, S.num_precommitted);
-        (
-          Some(PCS::<E>::rerandomize_commitment(ck, comm, r_old, &r_new)?),
-          Some(r_new),
-        )
-      } else {
-        (None, None)
-      };
+    let comm_shared_new = if let Some(wc) = &self.comm_shared {
+      let r_new = PCS::<E>::blind(ck, S.num_shared);
+      Some(WitnessCommitment {
+        comm: PCS::<E>::rerandomize_commitment(ck, &wc.comm, &wc.blind, &r_new)?,
+        blind: r_new,
+      })
+    } else {
+      None
+    };
+    let comm_precommitted_new = if let Some(wc) = &self.comm_precommitted {
+      let r_new = PCS::<E>::blind(ck, S.num_precommitted);
+      Some(WitnessCommitment {
+        comm: PCS::<E>::rerandomize_commitment(ck, &wc.comm, &wc.blind, &r_new)?,
+        blind: r_new,
+      })
+    } else {
+      None
+    };
 
-    Ok(PrecommittedState {
+    Ok(SpartanPrepSNARK {
       cs: self.cs.clone(),
       shared: self.shared.clone(),
       precommitted: self.precommitted.clone(),
-      comm_W_shared: comm_W_shared_new,
-      r_W_shared: r_W_shared_new,
-      comm_W_precommitted: comm_W_precommitted_new,
-      r_W_precommitted: r_W_precommitted_new,
+      comm_shared: comm_shared_new,
+      comm_precommitted: comm_precommitted_new,
       W: self.W.clone(),
     })
   }
@@ -640,32 +626,28 @@ impl<E: Engine> RerandomizationTrait<E> for PrecommittedState<E> {
     &self,
     ck: &CommitmentKey<E>,
     S: &SplitR1CSShape<E>,
-    comm_W_shared: &Option<Commitment<E>>,
-    r_W_shared: &Option<Blind<E>>,
+    shared: &Option<WitnessCommitment<E>>,
   ) -> Result<Self, SpartanError>
   where
     Self: Sized,
   {
     // generate new blinds for precommitted commitments and rerandomize commitments
-    let (comm_W_precommitted_new, r_W_precommitted_new) =
-      if let (Some(comm), Some(r_old)) = (&self.comm_W_precommitted, &self.r_W_precommitted) {
-        let r_new = PCS::<E>::blind(ck, S.num_precommitted);
-        (
-          Some(PCS::<E>::rerandomize_commitment(ck, comm, r_old, &r_new)?),
-          Some(r_new),
-        )
-      } else {
-        (None, None)
-      };
+    let comm_precommitted_new = if let Some(wc) = &self.comm_precommitted {
+      let r_new = PCS::<E>::blind(ck, S.num_precommitted);
+      Some(WitnessCommitment {
+        comm: PCS::<E>::rerandomize_commitment(ck, &wc.comm, &wc.blind, &r_new)?,
+        blind: r_new,
+      })
+    } else {
+      None
+    };
 
-    Ok(PrecommittedState {
+    Ok(SpartanPrepSNARK {
       cs: self.cs.clone(),
       shared: self.shared.clone(),
       precommitted: self.precommitted.clone(),
-      comm_W_shared: comm_W_shared.clone(),
-      r_W_shared: r_W_shared.clone(),
-      comm_W_precommitted: comm_W_precommitted_new,
-      r_W_precommitted: r_W_precommitted_new,
+      comm_shared: shared.clone(),
+      comm_precommitted: comm_precommitted_new,
       W: self.W.clone(),
     })
   }
@@ -986,8 +968,12 @@ where
       })?;
 
     let precommitted_start_aux = S.num_shared_unpadded;
-    let precommitted_copy = (prep.cs.aux_assignment.len().saturating_sub(precommitted_start_aux))
-      .min(S.num_precommitted_unpadded);
+    let precommitted_copy = (prep
+      .cs
+      .aux_assignment
+      .len()
+      .saturating_sub(precommitted_start_aux))
+    .min(S.num_precommitted_unpadded);
     let dst_start = S.num_shared;
     prep.W[dst_start..dst_start + precommitted_copy].copy_from_slice(
       &prep.cs.aux_assignment[precommitted_start_aux..precommitted_start_aux + precommitted_copy],

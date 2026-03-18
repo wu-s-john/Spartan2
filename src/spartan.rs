@@ -9,7 +9,7 @@
 use crate::{
   Blind, CommitmentKey, MULTIROUND_COMMITMENT_WIDTH,
   bellpepper::{
-    r1cs::{PrecommittedState, SmallPrepSNARK, SmallSpartanWitness, SpartanShape, SpartanWitness},
+    r1cs::{SmallPrepSNARK, SmallSpartanWitness, SpartanShape, SpartanWitness, WitnessCommitment},
     shape_cs::ShapeCS,
     solver::SatisfyingAssignment,
   },
@@ -34,6 +34,7 @@ use crate::{
     transcript::TranscriptEngineTrait,
   },
 };
+use bellpepper::gadgets::num::AllocatedNum;
 use ff::Field;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
@@ -97,7 +98,12 @@ impl<E: Engine> DigestHelperTrait<E> for SpartanVerifierKey<E> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct SpartanPrepSNARK<E: Engine> {
-  ps: PrecommittedState<E>,
+  pub(crate) cs: SatisfyingAssignment<E>,
+  pub(crate) shared: Vec<AllocatedNum<E::Scalar>>,
+  pub(crate) precommitted: Vec<AllocatedNum<E::Scalar>>,
+  pub(crate) comm_shared: Option<WitnessCommitment<E>>,
+  pub(crate) comm_precommitted: Option<WitnessCommitment<E>>,
+  pub(crate) W: Vec<E::Scalar>,
 }
 
 /// A succinct proof of knowledge of a witness to a relaxed R1CS instance
@@ -158,7 +164,7 @@ where
     let mut ps = SatisfyingAssignment::shared_witness(&pk.S, &pk.ck, &circuit, is_small)?;
     SatisfyingAssignment::precommitted_witness(&mut ps, &pk.S, &pk.ck, &circuit, is_small)?;
 
-    Ok(SpartanPrepSNARK { ps })
+    Ok(ps)
   }
 
   /// Produces a succinct proof of satisfiability of an R1CS instance.
@@ -475,7 +481,7 @@ impl<E: Engine> SpartanSNARK<E> {
 
     let (_sat_span, sat_t) = start_span!("r1cs_instance_and_witness");
     let (U, W) = SatisfyingAssignment::r1cs_instance_and_witness(
-      &mut prep_snark.ps,
+      &mut prep_snark,
       &pk.S,
       &pk.ck,
       &circuit,
@@ -586,7 +592,7 @@ impl<E: Engine> SpartanSNARK<E> {
 
     let (_sat_span, sat_t) = start_span!("r1cs_instance_and_witness");
     let (U, W) = SatisfyingAssignment::r1cs_instance_and_witness(
-      &mut prep_snark.ps,
+      &mut prep_snark,
       &pk.S,
       &pk.ck,
       &circuit,
@@ -1006,7 +1012,7 @@ impl<E: Engine> SpartanSNARK<E> {
     transcript.absorb(b"public_values", &public_values.as_slice());
 
     let (U, W) = SatisfyingAssignment::r1cs_instance_and_witness(
-      &mut prep_snark.ps,
+      &mut prep_snark,
       &pk.S,
       &pk.ck,
       &circuit,
