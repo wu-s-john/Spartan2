@@ -23,7 +23,7 @@ use crate::{
     eq::{EqPolynomial, compute_suffix_eq_pyramid},
     multilinear::MultilinearPolynomial,
   },
-  small_field::{DelayedReduction, SmallValueField, WideMul},
+  small_field::{DelayedReduction, SmallValueField, WitnessValue, WideMul},
 };
 use ff::PrimeField;
 use rayon::prelude::*;
@@ -548,15 +548,17 @@ where
 ///
 /// # Arguments
 /// * `poly_M` - Field-valued multilinear polynomial (from `bind_row_vars_combined_int`)
-/// * `z` - i8-valued witness (binary 0/1)
+/// * `z` - Witness values (bool, i8, etc.)
 /// * `l0` - Number of small-value rounds
-pub fn build_accumulators_inner<F>(
+pub fn build_accumulators_inner<F, W>(
   poly_M: &MultilinearPolynomial<F>,
-  z: &[bool],
+  z: &[W],
   l0: usize,
 ) -> LagrangeAccumulators<F, 2>
 where
-  F: PrimeField + DelayedReduction<i32> + DelayedReduction<F> + Send + Sync,
+  F: PrimeField + DelayedReduction<W::Extended> + DelayedReduction<F> + Send + Sync,
+  W: WitnessValue + Send + Sync,
+  W::Extended: Copy + Default + Add<Output = W::Extended> + Sub<Output = W::Extended> + Send + Sync,
 {
   let base: usize = 3; // D + 1 = 2 + 1 = 3
   let l = poly_M.Z.len().trailing_zeros() as usize;
@@ -573,30 +575,30 @@ where
     num_betas,
   } = build_beta_cache::<2>(l0);
 
-  type State<F2> = InnerThreadState<F2, 2>;
+  type State<F2, W2> = InnerThreadState<F2, W2, 2>;
 
   // Parallel over suffixes with thread-local state.
   // Unlike the Spartan builder (which resets partial sums per x_in iteration because
   // the scatter involves per-suffix eq weighting), here the scatter is plain +=,
   // so we accumulate partial sums across all suffixes in a chunk and scatter once.
-  let fold_results: Vec<State<F>> = (0..suffix_size)
+  let fold_results: Vec<State<F, W>> = (0..suffix_size)
     .into_par_iter()
     .fold(
-      || State::<F>::new(l0, num_betas, prefix_size, ext_size),
-      |mut state: State<F>, suffix| {
+      || State::<F, W>::new(l0, num_betas, prefix_size, ext_size),
+      |mut state: State<F, W>, suffix| {
         // No reset_partial_sums: accumulate across all suffixes in this chunk
 
         // GATHER: collect 2^l0 evals for this suffix
         #[allow(clippy::needless_range_loop)]
         for p in 0..prefix_size {
           let idx = p * suffix_size + suffix;
-          state.z_prefix_boolean_evals[p] = z[idx] as i32;
+          state.z_prefix_evals[p] = z[idx].to_extended();
           state.M_prefix_boolean_evals[p] = poly_M.Z[idx];
         }
 
         // EXTEND z: {0,1}^l0 → {∞,0,1}^l0 (integer add/sub)
-        let z_size = extend_to_lagrange_domain::<i32, 2>(
-          &state.z_prefix_boolean_evals,
+        let z_size = extend_to_lagrange_domain::<W::Extended, 2>(
+          &state.z_prefix_evals,
           &mut state.z_extended_evals,
           &mut state.z_extended_scratch,
         );
@@ -610,9 +612,9 @@ where
         );
         let m_ext = &state.M_extended_evals[..m_size];
 
-        // ACCUMULATE: field × i32 → DelayedReduction<i32> accumulator
+        // ACCUMULATE: field × W::Extended → DelayedReduction<W::Extended> accumulator
         for beta in 0..num_betas {
-          F::unreduced_multiply_accumulate(
+          <F as DelayedReduction<W::Extended>>::unreduced_multiply_accumulate(
             &mut state.partial_sums[beta],
             &m_ext[beta],
             &z_ext[beta],
@@ -635,7 +637,7 @@ where
       if state.partial_sums[beta] == Default::default() {
         continue;
       }
-      let val = <F as DelayedReduction<i32>>::reduce(&state.partial_sums[beta]);
+      let val = <F as DelayedReduction<W::Extended>>::reduce(&state.partial_sums[beta]);
       if val == F::ZERO {
         continue;
       }

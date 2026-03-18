@@ -117,6 +117,14 @@ impl NegOne for i8 {
   }
 }
 
+impl NegOne for bool {
+  fn neg(_pos_coeff: bool) -> bool {
+    // For witness path (SmallSatisfyingAssignment<bool>), enforce is a no-op.
+    // This value is never actually used in constraints.
+    false
+  }
+}
+
 fn boolean_not_lc<V: Copy + NegOne>(var: Variable, pos_coeff: V) -> SmallLinearCombination<V> {
   let mut lc = SmallLinearCombination::one(pos_coeff); // 1 * ONE
   lc.add_term(var, V::neg(pos_coeff)); // + (-1) * var
@@ -327,6 +335,14 @@ impl Double for i32 {
 impl Double for i8 {
   fn double(self) -> i8 {
     self.wrapping_mul(2)
+  }
+}
+
+impl Double for bool {
+  fn double(self) -> bool {
+    // For witness path (SmallSatisfyingAssignment<bool>), enforce is a no-op.
+    // This value is never actually used in constraints.
+    false
   }
 }
 

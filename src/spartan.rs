@@ -35,7 +35,6 @@ use crate::{
   },
 };
 use ff::Field;
-use num_traits::One;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -401,10 +400,14 @@ impl<E: Engine> SpartanSNARK<E> {
 
   /// Build witness vector z = [W | 1 | public_values | challenges] for matrix-vector multiplication (small values).
   #[inline]
-  fn build_z_small<SV: Copy + One>(w: &[SV], public_values: &[SV], challenges: &[SV]) -> Vec<SV> {
+  fn build_z_small<SV: Copy + From<bool>>(
+    w: &[SV],
+    public_values: &[SV],
+    challenges: &[SV],
+  ) -> Vec<SV> {
     let mut z = Vec::with_capacity(w.len() + 1 + public_values.len() + challenges.len());
     z.extend_from_slice(w);
-    z.push(SV::one());
+    z.push(SV::from(true)); // ONE = true
     z.extend_from_slice(public_values);
     z.extend_from_slice(challenges);
     z
@@ -678,16 +681,17 @@ impl<E: Engine> SpartanSNARK<E> {
   ///
   /// Caches the shape so that `prep_prove_small` and `prove_small_value` don't
   /// need to re-synthesize it.
-  pub fn setup_small<C>(
+  pub fn setup_small<Coeff, C>(
     circuit: &C,
     vk: &SpartanVerifierKey<E>,
-  ) -> Result<SpartanProverKey<E, i32>, SpartanError>
+  ) -> Result<SpartanProverKey<E, Coeff>, SpartanError>
   where
-    C: SmallSpartanCircuit<E, i32>,
+    Coeff: SmallCoeff + Serialize + for<'a> Deserialize<'a>,
+    C: SmallSpartanCircuit<E, Coeff>,
   {
     use crate::{DEFAULT_COMMITMENT_WIDTH, bellpepper::r1cs::small_r1cs_shape};
 
-    let S = small_r1cs_shape::<E, _>(circuit)?;
+    let S = small_r1cs_shape::<E, Coeff, _>(circuit)?;
     let num_vars = S.num_shared + S.num_precommitted + S.num_rest;
     let (ck, _) = E::PCS::setup(b"ck", num_vars, DEFAULT_COMMITMENT_WIDTH);
     let (ck_s, _) = E::PCS::setup(b"ck_s", 1, MULTIROUND_COMMITMENT_WIDTH);
@@ -735,7 +739,10 @@ impl<E: Engine> SpartanSNARK<E> {
     let zero_w = W::default();
     let (comm_W_shared, r_W_shared) = if pk.S.num_shared_unpadded > 0 {
       let r = PCS::<E>::blind(&pk.ck, pk.S.num_shared);
-      let w_bool: Vec<bool> = witness[..pk.S.num_shared].iter().map(|v| *v != zero_w).collect();
+      let w_bool: Vec<bool> = witness[..pk.S.num_shared]
+        .iter()
+        .map(|v| *v != zero_w)
+        .collect();
       let comm = PCS::<E>::commit_witness(&pk.ck, &w_bool, &r)?;
       (Some(comm), Some(r))
     } else {
@@ -801,13 +808,15 @@ impl<E: Engine> SpartanSNARK<E> {
     prep: &SmallPrepSNARK<E, W>,
   ) -> Result<Self, SpartanError>
   where
-    W: Copy + Clone + Default + One + PartialEq + Send + Sync,
+    W: crate::small_field::WitnessValue + Copy + Clone + Default + From<bool> + PartialEq + Send + Sync + 'static,
+    <W as crate::small_field::WitnessValue>::Extended: Copy + Default + std::ops::Add<Output = <W as crate::small_field::WitnessValue>::Extended> + std::ops::Sub<Output = <W as crate::small_field::WitnessValue>::Extended> + Send + Sync,
     Coeff: SmallCoeff,
     C: SmallSpartanCircuit<E, Coeff> + SmallSpartanCircuit<E, W>,
     E::Scalar: SmallValueField<Coeff>
       + DelayedReduction<Coeff>
       + DelayedReduction<<Coeff as WideMul>::Product>
-      + DelayedReduction<bool>
+      + DelayedReduction<W>
+      + DelayedReduction<<W as crate::small_field::WitnessValue>::Extended>
       + DelayedReduction<E::Scalar>
       + crate::small_field::montgomery::MontgomeryLimbs,
   {
@@ -819,12 +828,11 @@ impl<E: Engine> SpartanSNARK<E> {
     let zero_w = W::default();
     let mut transcript = E::TE::new(b"SpartanSNARK");
     transcript.absorb(b"vk", &pk.vk_digest);
-    let pub_w: Vec<W> =
-      <C as SmallSpartanCircuit<E, W>>::public_values(&circuit).map_err(|e| {
-        SpartanError::SynthesisError {
-          reason: format!("prove_small_value: public_values: {e}"),
-        }
-      })?;
+    let pub_w: Vec<W> = <C as SmallSpartanCircuit<E, W>>::public_values(&circuit).map_err(|e| {
+      SpartanError::SynthesisError {
+        reason: format!("prove_small_value: public_values: {e}"),
+      }
+    })?;
     let pub_field: Vec<E::Scalar> = pub_w
       .iter()
       .map(|v| {
@@ -964,13 +972,13 @@ impl<E: Engine> SpartanSNARK<E> {
     let (_sc2_span, sc2_t) = start_span!("inner_sumcheck");
     let l0_inner = std::cmp::min(3, num_rounds_y.saturating_sub(1));
     let (sc_proof_inner, r_y, claims_inner) = if U_w.challenges.is_empty() {
-      let mut z_bool: Vec<bool> = z_w.iter().map(|v| *v != zero_w).collect();
-      z_bool.resize(num_vars * 2, false);
-      crate::small_sumcheck::prove_quad_small_value::<E>(
+      let mut z_w_inner: Vec<W> = z_w.iter().copied().collect();
+      z_w_inner.resize(num_vars * 2, W::default());
+      crate::small_sumcheck::prove_quad_small_value::<E, W>(
         &claim_inner_joint,
         num_rounds_y,
         &mut MultilinearPolynomial::new(poly_ABC),
-        &z_bool,
+        &z_w_inner,
         l0_inner,
         &mut transcript,
       )?
@@ -1380,5 +1388,37 @@ mod tests {
 
     assert_prove_and_verify(false, "prove_regular");
     assert_prove_and_verify(true, "prove_small");
+  }
+
+  #[test]
+  fn test_keccak_small_value_i8_bool() {
+    use crate::keccak_circuits::KeccakChainCircuit;
+    use crate::provider::Bn254Engine;
+
+    let _ = tracing_subscriber::fmt()
+      .with_target(false)
+      .with_ansi(true)
+      .with_env_filter(EnvFilter::from_default_env())
+      .try_init();
+
+    type E = Bn254Engine;
+    type F = <E as Engine>::Scalar;
+
+    let input = vec![0u8; 64];
+    let circuit = KeccakChainCircuit::<F>::new(input, 1);
+
+    // Field-element path: setup for verifier key
+    let (_pk, vk) = SpartanSNARK::<E>::setup(circuit.clone()).unwrap();
+
+    // Small-value path: setup_small (i8 shape) + prep_prove_small (bool witness) + prove_small_value
+    let pk_small = SpartanSNARK::<E>::setup_small::<i8, _>(&circuit, &vk).unwrap();
+    let prep_small =
+      SpartanSNARK::<E>::prep_prove_small::<_, i8, bool>(&pk_small, &circuit).unwrap();
+    let proof =
+      SpartanSNARK::<E>::prove_small_value(&pk_small, circuit.clone(), &prep_small).unwrap();
+
+    // Verify
+    let res = proof.verify(&vk);
+    assert!(res.is_ok(), "Keccak small-value proof should verify");
   }
 }

@@ -14,6 +14,7 @@
 
 pub mod bridge;
 use std::marker::PhantomData;
+use std::ops::{Add, AddAssign, Neg, Sub};
 
 pub use bridge::SmallToBellpepperCS;
 
@@ -35,10 +36,10 @@ pub trait SmallCoeff:
   + Default
   + Send
   + Sync
-  + std::ops::Add<Output = Self>
-  + std::ops::Sub<Output = Self>
-  + std::ops::AddAssign
-  + std::ops::Neg<Output = Self>
+  + Add<Output = Self>
+  + Sub<Output = Self>
+  + AddAssign
+  + Neg<Output = Self>
   + PartialEq
   + PartialOrd
   + WideMul
@@ -52,6 +53,41 @@ pub trait SmallCoeff:
 
   /// Whether this value is positive (> 0).
   fn is_positive(&self) -> bool;
+}
+
+impl SmallCoeff for i8 {
+  #[inline(always)]
+  fn mul_field<F: ff::PrimeField + MontgomeryLimbs>(self, x: &F) -> F {
+    match self {
+      0 => F::ZERO,
+      1 => *x,
+      -1 => x.neg(),
+      2 => x.double(),
+      _ => {
+        // General fallback for arbitrary i8 values
+        use crate::small_field::barrett::barrett_reduce_5;
+        use crate::small_field::limbs::mac;
+        let a = x.to_limbs();
+        let mag = self.unsigned_abs() as u64;
+        let (r0, c) = mac(0, a[0], mag, 0);
+        let (r1, c) = mac(0, a[1], mag, c);
+        let (r2, c) = mac(0, a[2], mag, c);
+        let (r3, c) = mac(0, a[3], mag, c);
+        let result = F::from_limbs(barrett_reduce_5::<F>(&[r0, r1, r2, r3, c]));
+        if self > 0 { result } else { -result }
+      }
+    }
+  }
+
+  #[inline(always)]
+  fn is_unit(&self) -> bool {
+    *self == 1 || *self == -1
+  }
+
+  #[inline(always)]
+  fn is_positive(&self) -> bool {
+    *self > 0
+  }
 }
 
 impl SmallCoeff for i32 {
@@ -327,22 +363,30 @@ impl<V: Copy + Default> SmallConstraintSystem<V> for SmallSatisfyingAssignment<V
 
 // ── SmallShapeCS ───────────────────────────────────────────────────────────
 
-/// Shape extraction backend — records constraints as i32 linear combinations
-/// and builds `SparseMatrix<i32>` directly.
+/// Shape extraction backend — records constraints as small-integer linear combinations
+/// and builds `SparseMatrix<C>` directly.
 ///
-/// Uses i32 coefficients (max ~2^18 for NoBatchEq), never creates field elements.
-#[derive(Debug, Default)]
-pub struct SmallShapeCS {
+/// The type parameter `C` controls the coefficient type:
+/// - `C = i32`: SHA-256 path (default, max ~2^18 for NoBatchEq)
+/// - `C = i8`: Keccak path (coefficients in {-1, 0, 1, 2})
+#[derive(Debug)]
+pub struct SmallShapeCS<C: SmallCoeff = i32> {
   pub(crate) constraints: Vec<(
-    SmallLinearCombination<i32>,
-    SmallLinearCombination<i32>,
-    SmallLinearCombination<i32>,
+    SmallLinearCombination<C>,
+    SmallLinearCombination<C>,
+    SmallLinearCombination<C>,
   )>,
   pub(crate) num_inputs: usize,
   pub(crate) num_aux: usize,
 }
 
-impl SmallShapeCS {
+impl<C: SmallCoeff> Default for SmallShapeCS<C> {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl<C: SmallCoeff> SmallShapeCS<C> {
   /// Create a new shape constraint system.
   pub fn new() -> Self {
     SmallShapeCS {
@@ -374,17 +418,17 @@ impl SmallShapeCS {
   /// - aux[0..num_aux]: columns 0..num_aux
   /// - input[0..num_inputs]: columns num_aux..num_aux+num_inputs
   ///   (input[0] = ONE = column num_aux)
-  pub fn to_matrices(&self) -> (SparseMatrix<i32>, SparseMatrix<i32>, SparseMatrix<i32>) {
+  pub fn to_matrices(&self) -> (SparseMatrix<C>, SparseMatrix<C>, SparseMatrix<C>) {
     let num_cols = self.num_aux + self.num_inputs;
     let _num_rows = self.constraints.len();
 
     let lc_to_csr = |get_lc: &dyn Fn(
       &(
-        SmallLinearCombination<i32>,
-        SmallLinearCombination<i32>,
-        SmallLinearCombination<i32>,
+        SmallLinearCombination<C>,
+        SmallLinearCombination<C>,
+        SmallLinearCombination<C>,
       ),
-    ) -> &SmallLinearCombination<i32>| {
+    ) -> &SmallLinearCombination<C>| {
       let mut data = vec![];
       let mut indices = vec![];
       let mut indptr = vec![0usize];
@@ -393,7 +437,7 @@ impl SmallShapeCS {
         let lc = get_lc(constraint);
         let row_start = data.len();
         for (var, coeff) in &lc.terms {
-          if *coeff == 0 {
+          if *coeff == C::default() {
             continue;
           }
           let col = match var.get_unchecked() {
@@ -422,9 +466,10 @@ impl SmallShapeCS {
           let mut write = row_start;
           for read in (row_start + 1)..row_end {
             if indices[read] == indices[write] {
-              data[write] += data[read];
+              let val = data[read];
+              data[write] += val;
             } else {
-              if data[write] != 0 {
+              if data[write] != C::default() {
                 write += 1;
               }
               data[write] = data[read];
@@ -432,7 +477,7 @@ impl SmallShapeCS {
             }
           }
           // Keep last element if non-zero
-          if data[write] != 0 {
+          if data[write] != C::default() {
             write += 1;
           }
           data.truncate(write);
@@ -457,14 +502,14 @@ impl SmallShapeCS {
   }
 }
 
-impl SmallConstraintSystem<i32> for SmallShapeCS {
+impl<C: SmallCoeff> SmallConstraintSystem<C> for SmallShapeCS<C> {
   type Root = Self;
 
   fn alloc<A, AR, F>(&mut self, _annotation: A, _f: F) -> Result<Variable, SynthesisError>
   where
     A: FnOnce() -> AR,
     AR: Into<String>,
-    F: FnOnce() -> Result<i32, SynthesisError>,
+    F: FnOnce() -> Result<C, SynthesisError>,
   {
     let idx = self.num_aux;
     self.num_aux += 1;
@@ -475,7 +520,7 @@ impl SmallConstraintSystem<i32> for SmallShapeCS {
   where
     A: FnOnce() -> AR,
     AR: Into<String>,
-    F: FnOnce() -> Result<i32, SynthesisError>,
+    F: FnOnce() -> Result<C, SynthesisError>,
   {
     let idx = self.num_inputs;
     self.num_inputs += 1;
@@ -485,9 +530,9 @@ impl SmallConstraintSystem<i32> for SmallShapeCS {
   fn enforce<A, AR>(
     &mut self,
     _annotation: A,
-    a: SmallLinearCombination<i32>,
-    b: SmallLinearCombination<i32>,
-    c: SmallLinearCombination<i32>,
+    a: SmallLinearCombination<C>,
+    b: SmallLinearCombination<C>,
+    c: SmallLinearCombination<C>,
   ) where
     A: FnOnce() -> AR,
     AR: Into<String>,

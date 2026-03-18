@@ -13,6 +13,7 @@ use crate::{
     R1CSWitness, SparseMatrix, SplitMultiRoundR1CSInstance, SplitMultiRoundR1CSShape,
     SplitR1CSInstance, SplitR1CSShape,
   },
+  small_constraint_system::SmallCoeff,
   start_span,
   traits::{
     Engine,
@@ -231,17 +232,17 @@ impl<E: Engine> SpartanShape<E> for ShapeCS<E> {
   }
 }
 
-/// Extract a `SplitR1CSShape<E, i32>` from a `SmallSpartanCircuit`.
+/// Extract a `SplitR1CSShape<E, Coeff>` from a `SmallSpartanCircuit`.
 ///
-/// Uses `SmallShapeCS` to record i32-coefficient constraints directly,
+/// Uses `SmallShapeCS<Coeff>` to record small-coefficient constraints directly,
 /// without creating any field elements.
-pub fn small_r1cs_shape<E: Engine, C: SmallSpartanCircuit<E, i32>>(
-  circuit: &C,
-) -> Result<SplitR1CSShape<E, i32>, SpartanError> {
+pub fn small_r1cs_shape<E: Engine, Coeff: SmallCoeff, Circuit: SmallSpartanCircuit<E, Coeff>>(
+  circuit: &Circuit,
+) -> Result<SplitR1CSShape<E, Coeff>, SpartanError> {
   use crate::small_constraint_system::SmallShapeCS;
 
   let num_challenges = circuit.num_challenges();
-  let mut cs = SmallShapeCS::new();
+  let mut cs = SmallShapeCS::<Coeff>::new();
 
   let shared = circuit
     .shared(&mut cs)
@@ -269,7 +270,7 @@ pub fn small_r1cs_shape<E: Engine, C: SmallSpartanCircuit<E, i32>>(
   let num_rest = num_vars - num_shared - num_precommitted;
   let num_public = num_inputs - 1 - num_challenges; // subtract ONE and challenges
 
-  // Convert SmallShapeCS constraints to SparseMatrix<i32>
+  // Convert SmallShapeCS constraints to SparseMatrix<Coeff>
   let (mut A, mut B, mut C) = cs.to_matrices();
   A.cols = num_vars + num_inputs;
   B.cols = num_vars + num_inputs;
@@ -277,7 +278,7 @@ pub fn small_r1cs_shape<E: Engine, C: SmallSpartanCircuit<E, i32>>(
 
   let num_constraints = cs.num_constraints();
 
-  SplitR1CSShape::<E, i32>::new_int(
+  SplitR1CSShape::<E, Coeff>::new_int(
     num_constraints,
     num_shared,
     num_precommitted,

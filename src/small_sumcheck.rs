@@ -34,13 +34,14 @@ use crate::{
     derive_t1,
   },
   polys::{eq::EqPolynomial, multilinear::MultilinearPolynomial, univariate::UniPoly},
-  small_field::{DelayedReduction, SmallValueField, WideMul},
+  small_field::{DelayedReduction, SmallValueField, WitnessValue, WideMul},
   start_span,
   sumcheck::{SumcheckProof, eq_sumcheck},
   traits::{Engine, transcript::TranscriptEngineTrait},
 };
 use ff::{Field, PrimeField};
 use rayon::prelude::*;
+use std::ops::{Add, Sub};
 use tracing::info;
 
 use crate::sumcheck::PAR_THRESHOLD;
@@ -367,47 +368,50 @@ where
   ))
 }
 
-/// Compute eval points for the quadratic sumcheck `poly_A × z` when z is binary (0/1).
+/// Compute eval points for the quadratic sumcheck `poly_A × z` when z is a witness type.
 ///
-/// For binary z, `a × z` reduces to conditional addition (no field multiply):
-/// - `eval_0 = Σ_{i: z_lo[i]=1} a_lo[i]`
-/// - `eval_2`: uses `b_bound = 2·z_hi - z_lo` which is in {-1, 0, 1, 2} for binary inputs
-fn compute_eval_points_quad_binary_z<E: Engine>(
+/// For witness z, uses `DelayedReduction<W>` for eval_0 (field × witness accumulation)
+/// and field arithmetic for eval_2.
+fn compute_eval_points_quad_witness_z<E: Engine, W: WitnessValue>(
   poly_A: &MultilinearPolynomial<E::Scalar>,
-  z_bin: &[bool],
-) -> (E::Scalar, E::Scalar) {
+  z: &[W],
+) -> (E::Scalar, E::Scalar)
+where
+  E::Scalar: DelayedReduction<W>,
+{
   let len = poly_A.Z.len() / 2;
-  debug_assert_eq!(z_bin.len(), poly_A.Z.len());
+  debug_assert_eq!(z.len(), poly_A.Z.len());
+
+  type Acc<F2, W2> = <F2 as DelayedReduction<W2>>::Accumulator;
 
   let (acc_0, acc_2) = (0..len)
     .into_par_iter()
     .fold(
-      || (E::Scalar::ZERO, E::Scalar::ZERO),
+      || (Acc::<E::Scalar, W>::default(), E::Scalar::ZERO),
       |mut acc, i| {
         let a_low = poly_A[i];
-        let z_lo = z_bin[i];
+        let z_lo = z[i];
         let a_high = poly_A[len + i];
-        let z_hi = z_bin[len + i];
+        let z_hi = z[len + i];
 
-        // eval 0: conditional add
-        if z_lo {
-          acc.0 += a_low;
-        }
+        // eval 0: field × witness accumulation
+        <E::Scalar as DelayedReduction<W>>::unreduced_multiply_accumulate(
+          &mut acc.0,
+          &a_low,
+          &z_lo,
+        );
 
-        // eval 2: a_bound × b_bound where b_bound = 2·z_hi - z_lo ∈ {-1, 0, 1, 2}
+        // eval 2: a_bound × z_bound where z_bound = 2·z_hi - z_lo (as field elements)
         let a_bound = a_high + a_high - a_low;
-        match (z_lo, z_hi) {
-          (false, false) => {}
-          (true, false) => acc.1 -= a_bound,
-          (false, true) => acc.1 += a_bound.double(),
-          (true, true) => acc.1 += a_bound,
-        }
+        let z_bound: E::Scalar =
+          z_hi.to_field::<E::Scalar>() + z_hi.to_field::<E::Scalar>() - z_lo.to_field::<E::Scalar>();
+        acc.1 += a_bound * z_bound;
 
         acc
       },
     )
     .reduce(
-      || (E::Scalar::ZERO, E::Scalar::ZERO),
+      || (Acc::<E::Scalar, W>::default(), E::Scalar::ZERO),
       |mut a, b| {
         a.0 += b.0;
         a.1 += b.1;
@@ -415,27 +419,20 @@ fn compute_eval_points_quad_binary_z<E: Engine>(
       },
     );
 
-  (acc_0, acc_2)
+  (<E::Scalar as DelayedReduction<W>>::reduce(&acc_0), acc_2)
 }
 
-/// Bind a binary z polynomial with challenge r, producing field elements.
+/// Bind a witness z polynomial with challenge r, producing field elements.
 ///
-/// For binary inputs, each output is one of four precomputed values:
-/// - (0,0) → 0
-/// - (0,1) → r
-/// - (1,0) → 1-r
-/// - (1,1) → 1
-fn bind_binary_z<F: PrimeField>(z_bin: &[bool], r: &F) -> Vec<F> {
-  let len = z_bin.len() / 2;
+/// Standard linear interpolation: z_bound[i] = z_lo[i].to_field() * (1-r) + z_hi[i].to_field() * r
+fn bind_witness_z<F: PrimeField, W: WitnessValue>(z: &[W], r: &F) -> Vec<F> {
+  let len = z.len() / 2;
   let one_minus_r = F::ONE - *r;
 
   let compute = |i: usize| -> F {
-    match (z_bin[i], z_bin[len + i]) {
-      (false, false) => F::ZERO,
-      (false, true) => *r,
-      (true, false) => one_minus_r,
-      (true, true) => F::ONE,
-    }
+    let lo: F = z[i].to_field();
+    let hi: F = z[len + i].to_field();
+    lo * one_minus_r + hi * *r
   };
 
   if len >= PAR_THRESHOLD {
@@ -445,29 +442,29 @@ fn bind_binary_z<F: PrimeField>(z_bin: &[bool], r: &F) -> Vec<F> {
   }
 }
 
-/// Prove a quadratic sumcheck `poly_A × z` where z is binary (i8 of 0/1).
+/// Prove a quadratic sumcheck `poly_A × z` where z is a witness type.
 ///
-/// Round 0 uses `compute_eval_points_quad_binary_z` (zero field multiplies),
-/// then `bind_binary_z` to convert z to field elements. Rounds 1+ use
+/// Round 0 uses `compute_eval_points_quad_witness_z` (optimized for witness types),
+/// then `bind_witness_z` to convert z to field elements. Rounds 1+ use
 /// standard `compute_eval_points_quad` with delayed reduction.
-pub fn prove_quad_with_binary_z<E: Engine>(
+pub fn prove_quad_with_witness_z<E: Engine, W: WitnessValue>(
   claim: &E::Scalar,
   num_rounds: usize,
   poly_A: &mut MultilinearPolynomial<E::Scalar>,
-  z_bin: &[bool],
+  z: &[W],
   transcript: &mut E::TE,
 ) -> Result<(SumcheckProof<E>, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
 where
-  E::Scalar: DelayedReduction<E::Scalar>,
+  E::Scalar: DelayedReduction<W> + DelayedReduction<E::Scalar>,
 {
   let mut r: Vec<E::Scalar> = Vec::with_capacity(num_rounds);
   let mut polys: Vec<crate::polys::univariate::CompressedUniPoly<E::Scalar>> =
     Vec::with_capacity(num_rounds);
   let mut claim_per_round = *claim;
 
-  // === Round 0: binary z fast path ===
+  // === Round 0: witness z fast path ===
   let (eval_point_0, eval_point_2) =
-    compute_eval_points_quad_binary_z::<E>(poly_A, z_bin);
+    compute_eval_points_quad_witness_z::<E, W>(poly_A, z);
 
   let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
   let poly = UniPoly::from_evals(&evals)?;
@@ -478,8 +475,8 @@ where
   polys.push(poly.compress());
   claim_per_round = poly.evaluate(&r_0);
 
-  // Bind: binary z → field, poly_A standard bind
-  let poly_B_vec = bind_binary_z(z_bin, &r_0);
+  // Bind: witness z → field, poly_A standard bind
+  let poly_B_vec = bind_witness_z(z, &r_0);
   let mut poly_B = MultilinearPolynomial::new(poly_B_vec);
   poly_A.bind_poly_var_top(&r_0);
 
@@ -517,17 +514,18 @@ where
   ))
 }
 
-/// Batch-bind l0 top variables of M̃ (field) and z (i8) using eq-weighted accumulation.
+/// Batch-bind l0 top variables of M̃ (field) and z (witness) using eq-weighted accumulation.
 ///
 /// Computes: `out[s] = Σ_{p ∈ {0,1}^l0} eq(challenges, p) · input[p * stride + s]`
 /// for both M̃ and z in one pass using delayed reduction.
-fn bind_inner_polys_batched<F>(
+fn bind_inner_polys_batched<F, W>(
   poly_M: &MultilinearPolynomial<F>,
-  z: &[bool],
+  z: &[W],
   challenges: &[F],
 ) -> (MultilinearPolynomial<F>, MultilinearPolynomial<F>)
 where
-  F: PrimeField + DelayedReduction<bool> + DelayedReduction<F>,
+  F: PrimeField + DelayedReduction<W> + DelayedReduction<F>,
+  W: WitnessValue + Send + Sync,
 {
   let l0 = challenges.len();
   let n = poly_M.Z.len();
@@ -540,21 +538,21 @@ where
   let eq_table = EqPolynomial::evals_from_points(challenges);
 
   type AccF<F2> = <F2 as DelayedReduction<F2>>::Accumulator;
-  type AccB<F2> = <F2 as DelayedReduction<bool>>::Accumulator;
+  type AccW<F2, W2> = <F2 as DelayedReduction<W2>>::Accumulator;
 
   let compute = |s: usize| -> (F, F) {
     let mut acc_m = AccF::<F>::default();
-    let mut acc_z = AccB::<F>::default();
+    let mut acc_z = AccW::<F, W>::default();
 
     for (p, eq_p) in eq_table.iter().enumerate() {
       let idx = p * stride + s;
       F::unreduced_multiply_accumulate(&mut acc_m, eq_p, &poly_M.Z[idx]);
-      <F as DelayedReduction<bool>>::unreduced_multiply_accumulate(&mut acc_z, eq_p, &z[idx]);
+      <F as DelayedReduction<W>>::unreduced_multiply_accumulate(&mut acc_z, eq_p, &z[idx]);
     }
 
     (
       <F as DelayedReduction<F>>::reduce(&acc_m),
-      <F as DelayedReduction<bool>>::reduce(&acc_z),
+      <F as DelayedReduction<W>>::reduce(&acc_z),
     )
   };
 
@@ -582,26 +580,28 @@ where
 ///
 /// This is the inner sumcheck optimization. Unlike the outer sumcheck:
 /// - No eq(τ,y) factor → round polynomial is degree 2 (not 3)
-/// - M̃ is field-valued, z is i8-valued (binary)
+/// - M̃ is field-valued, z is witness-valued
 /// - All betas contribute (no R1CS identity shortcut)
 ///
 /// # Arguments
 /// * `claim` - The claimed sum
 /// * `num_rounds` - Total number of sumcheck rounds
 /// * `poly_M` - Field-valued multilinear polynomial (from bind_row_vars_combined_int)
-/// * `z_i8` - Binary witness as i8 values
+/// * `z` - Witness values
 /// * `l0` - Number of small-value rounds (typically 3-4)
 /// * `transcript` - Fiat-Shamir transcript
-pub fn prove_quad_small_value<E: Engine>(
+pub fn prove_quad_small_value<E: Engine, W>(
   claim: &E::Scalar,
   num_rounds: usize,
   poly_M: &mut MultilinearPolynomial<E::Scalar>,
-  z_bool: &[bool],
+  z: &[W],
   l0: usize,
   transcript: &mut E::TE,
 ) -> Result<(SumcheckProof<E>, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
 where
-  E::Scalar: DelayedReduction<bool> + DelayedReduction<i32> + DelayedReduction<E::Scalar>,
+  W: WitnessValue + Send + Sync,
+  W::Extended: Copy + Default + Add<Output = W::Extended> + Sub<Output = W::Extended> + Send + Sync,
+  E::Scalar: DelayedReduction<W> + DelayedReduction<W::Extended> + DelayedReduction<E::Scalar>,
 {
   let mut r: Vec<E::Scalar> = Vec::with_capacity(num_rounds);
   let mut polys: Vec<crate::polys::univariate::CompressedUniPoly<E::Scalar>> =
@@ -612,13 +612,13 @@ where
   let l0 = std::cmp::min(l0, num_rounds.saturating_sub(1));
 
   if l0 == 0 {
-    // Fall back to prove_quad_with_binary_z (round 0 binary + standard)
-    return prove_quad_with_binary_z::<E>(claim, num_rounds, poly_M, z_bool, transcript);
+    // Fall back to prove_quad_with_witness_z (round 0 witness + standard)
+    return prove_quad_with_witness_z::<E, W>(claim, num_rounds, poly_M, z, transcript);
   }
 
   // ===== Pre-computation: build accumulators =====
   let (_acc_span, acc_t) = start_span!("build_accumulators_inner");
-  let accumulators = build_accumulators_inner(poly_M, z_bool, l0);
+  let accumulators = build_accumulators_inner(poly_M, z, l0);
   info!(elapsed_ms = %acc_t.elapsed().as_millis(), "build_accumulators_inner");
 
   let basis_factory =
@@ -670,7 +670,7 @@ where
   // ===== Transition: bind M̃ and z by l0 challenges =====
   let (_bind_span, bind_t) = start_span!("bind_inner_transition");
   let (mut poly_M_bound, mut poly_z_bound) =
-    bind_inner_polys_batched(poly_M, z_bool, &r[..l0]);
+    bind_inner_polys_batched(poly_M, z, &r[..l0]);
   info!(elapsed_ms = %bind_t.elapsed().as_millis(), "bind_inner_transition");
 
   // ===== Remaining rounds (l0 to num_rounds-1): standard quadratic =====
@@ -1062,9 +1062,9 @@ mod tests {
 
   // ===== Inner sumcheck (prove_quad_small_value) tests =====
 
-  /// Test that prove_quad_small_value produces identical output to prove_quad_with_binary_z.
+  /// Test that prove_quad_small_value produces identical output to prove_quad_with_witness_z.
   ///
-  /// Generates random M̃ (field) and z (binary i8), computes claim = Σ M̃(y) · z(y),
+  /// Generates random M̃ (field) and z (binary), computes claim = Σ M̃(y) · z(y),
   /// and verifies both methods produce the same proof, challenges, and evaluations.
   #[test]
   fn test_inner_sumcheck_small_value_equivalence() {
@@ -1082,22 +1082,22 @@ mod tests {
       .map(|(&m, &z)| if z { m } else { F::ZERO })
       .sum();
 
-    // Run prove_quad_with_binary_z (reference)
+    // Run prove_quad_with_witness_z (reference)
     let mut transcript1 = <E as Engine>::TE::new(b"test_inner");
     let mut poly_M1 = MultilinearPolynomial::new(poly_M_vals.clone());
-    let (proof1, r1, evals1) = prove_quad_with_binary_z::<E>(
+    let (proof1, r1, evals1) = prove_quad_with_witness_z::<E, bool>(
       &claim,
       NUM_VARS,
       &mut poly_M1,
       &z_bool,
       &mut transcript1,
     )
-    .expect("binary_z prove should succeed");
+    .expect("witness_z prove should succeed");
 
     // Run prove_quad_small_value
     let mut transcript2 = <E as Engine>::TE::new(b"test_inner");
     let mut poly_M2 = MultilinearPolynomial::new(poly_M_vals);
-    let (proof2, r2, evals2) = prove_quad_small_value::<E>(
+    let (proof2, r2, evals2) = prove_quad_small_value::<E, bool>(
       &claim,
       NUM_VARS,
       &mut poly_M2,
@@ -1153,7 +1153,7 @@ mod tests {
     // Verify consistency: run the full protocol and check it matches
     let mut transcript1 = <E as Engine>::TE::new(b"test_acc");
     let mut poly_M1 = MultilinearPolynomial::new(poly_M_vals.clone());
-    let (proof, _r, _evals) = prove_quad_small_value::<E>(
+    let (proof, _r, _evals) = prove_quad_small_value::<E, bool>(
       &claim,
       NUM_VARS,
       &mut poly_M1,

@@ -30,22 +30,6 @@ mod folds;
 mod sparse;
 pub(crate) use sparse::SparseMatrix;
 
-/// Multiply a field element by an i32 coefficient with a fast path for common values.
-///
-/// For SHA-256 with NoBatchEq: most coefficients are 1, -1, or powers of 2 up to 2^18.
-/// The ±1 fast paths avoid a full field multiplication.
-#[inline(always)]
-fn mul_field_i32<F: ff::PrimeField>(x: F, v: i32) -> F {
-  match v {
-    0 => F::ZERO,
-    1 => x,
-    -1 => -x,
-    2 => x + x,
-    v if v > 0 => x * F::from(v as u64),
-    v => -(x * F::from((-v) as u64)),
-  }
-}
-
 /// Fast-path field multiplication: avoids full mul for common ±1 coefficients.
 #[inline(always)]
 fn mul_field_fast<F: ff::PrimeField>(x: F, v: &F) -> F {
@@ -689,6 +673,7 @@ impl<E: Engine> TranscriptReprTrait<E::GE> for R1CSInstance<E> {
 /// Defaults to `E::Scalar` (field elements) for the standard path.
 /// Use `i32` for the pure-integer small-value path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound = "V: Serialize + for<'a> Deserialize<'a>")]
 pub struct SplitR1CSShape<E: Engine, V = <E as Engine>::Scalar> {
   /// Number of constraints (padded).
   pub num_cons: usize,
@@ -753,7 +738,7 @@ pub struct SplitR1CSShape<E: Engine, V = <E as Engine>::Scalar> {
   #[serde(skip, default)]
   pub(crate) A_csc_row: Vec<u32>,
   #[serde(skip, default)]
-  pub(crate) A_csc_data: Vec<i32>,
+  pub(crate) A_csc_data: Vec<V>,
   #[serde(skip, default)]
   pub(crate) A_csc_unit_end: Vec<usize>,
   #[serde(skip, default)]
@@ -761,7 +746,7 @@ pub struct SplitR1CSShape<E: Engine, V = <E as Engine>::Scalar> {
   #[serde(skip, default)]
   pub(crate) B_csc_row: Vec<u32>,
   #[serde(skip, default)]
-  pub(crate) B_csc_data: Vec<i32>,
+  pub(crate) B_csc_data: Vec<V>,
   #[serde(skip, default)]
   pub(crate) B_csc_unit_end: Vec<usize>,
   #[serde(skip, default)]
@@ -769,12 +754,13 @@ pub struct SplitR1CSShape<E: Engine, V = <E as Engine>::Scalar> {
   #[serde(skip, default)]
   pub(crate) C_csc_row: Vec<u32>,
   #[serde(skip, default)]
-  pub(crate) C_csc_data: Vec<i32>,
+  pub(crate) C_csc_data: Vec<V>,
   #[serde(skip, default)]
   pub(crate) C_csc_unit_end: Vec<usize>,
 }
 
-impl<E: Engine, V: Serialize> SimpleDigestible for SplitR1CSShape<E, V> {}
+impl<E: Engine, V: Serialize + for<'a> Deserialize<'a>> SimpleDigestible for SplitR1CSShape<E, V> {}
+
 
 impl<E: Engine, V> SplitR1CSShape<E, V> {
   /// Returns sizes associated with the SplitR1CSShape.
@@ -1138,11 +1124,11 @@ impl<E: Engine> SplitR1CSShape<E> {
   }
 }
 
-// ---- Pure integer methods for i32 shapes ----
+// ---- Pure integer methods for SmallCoeff shapes ----
 
 #[allow(dead_code)]
-impl<E: Engine> SplitR1CSShape<E, i32> {
-  /// Create an i32 shape from explicitly specified R1CS matrices with i32 coefficients.
+impl<E: Engine, C: SmallCoeff> SplitR1CSShape<E, C> {
+  /// Create a small-coeff shape from explicitly specified R1CS matrices.
   pub fn new_int(
     num_cons: usize,
     num_shared: usize,
@@ -1150,10 +1136,10 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     num_rest: usize,
     num_public: usize,
     num_challenges: usize,
-    A: SparseMatrix<i32>,
-    B: SparseMatrix<i32>,
-    C: SparseMatrix<i32>,
-  ) -> Result<SplitR1CSShape<E, i32>, SpartanError> {
+    A: SparseMatrix<C>,
+    B: SparseMatrix<C>,
+    C: SparseMatrix<C>,
+  ) -> Result<SplitR1CSShape<E, C>, SpartanError> {
     let width = DEFAULT_COMMITMENT_WIDTH;
 
     let num_rows = num_cons;
@@ -1183,7 +1169,7 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     let num_vars_padded = num_shared_padded + num_precommitted_padded + num_rest_padded;
     let num_cons_padded = num_cons.next_power_of_two();
 
-    let apply_pad = |mut M: SparseMatrix<i32>| -> SparseMatrix<i32> {
+    let apply_pad = |mut M: SparseMatrix<C>| -> SparseMatrix<C> {
       M.indices.par_iter_mut().for_each(|c| {
         if *c >= num_shared && *c < num_shared + num_precommitted {
           *c += num_shared_padded - num_shared;
@@ -1250,11 +1236,11 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     // Build CSC (column-sorted) representation for cache-efficient scatter.
     // Entries sorted by dense column → sequential buffer writes in bind_row_vars_combined_small.
     let num_dense = dense_to_col.len();
-    let build_csc = |matrix: &SparseMatrix<i32>,
+    let build_csc = |matrix: &SparseMatrix<C>,
                      dense_col: &[u32],
                      num_rows: usize,
                      num_dense_cols: usize|
-     -> (Vec<usize>, Vec<u32>, Vec<i32>, Vec<usize>) {
+     -> (Vec<usize>, Vec<u32>, Vec<C>, Vec<usize>) {
       // Count entries per column
       let mut col_count = vec![0usize; num_dense_cols];
       for row in 0..num_rows {
@@ -1270,7 +1256,7 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
       }
       let total = *col_ptr.last().unwrap();
       let mut row_indices = vec![0u32; total];
-      let mut values = vec![0i32; total];
+      let mut values = vec![C::default(); total];
       // Fill in entries: ±1 entries first within each column, then non-±1
       // Two-pass: first ±1, then non-±1
       let mut write_pos = col_ptr[..num_dense_cols].to_vec();
@@ -1279,7 +1265,7 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
         for i in matrix.indptr[row]..matrix.indptr[row + 1] {
           let c = dense_col[i] as usize;
           let v = matrix.data[i];
-          if v == 1 || v == -1 {
+          if v.is_unit() {
             let pos = write_pos[c];
             row_indices[pos] = row as u32;
             values[pos] = v;
@@ -1293,7 +1279,7 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
         for i in matrix.indptr[row]..matrix.indptr[row + 1] {
           let c = dense_col[i] as usize;
           let v = matrix.data[i];
-          if v != 1 && v != -1 {
+          if !v.is_unit() {
             let pos = write_pos[c];
             row_indices[pos] = row as u32;
             values[pos] = v;
@@ -1351,21 +1337,23 @@ impl<E: Engine> SplitR1CSShape<E, i32> {
     })
   }
 
-  /// Evaluates the MLE of R1CS matrices at the provided point (i32 matrix entries).
+  /// Evaluates the MLE of R1CS matrices at the provided point (small-coeff matrix entries).
   pub fn evaluate_with_tables_int(
     &self,
     T_x: &[E::Scalar],
     T_y: &[E::Scalar],
-  ) -> (E::Scalar, E::Scalar, E::Scalar) {
-    let multi_eval = |M: &SparseMatrix<i32>| -> E::Scalar {
+  ) -> (E::Scalar, E::Scalar, E::Scalar)
+  where
+    E::Scalar: crate::small_field::montgomery::MontgomeryLimbs,
+  {
+    let multi_eval = |M: &SparseMatrix<C>| -> E::Scalar {
       M.indptr
         .par_windows(2)
         .enumerate()
         .map(|(row_idx, ptrs)| {
           M.get_row_unchecked(ptrs.try_into().unwrap())
             .map(|(val, col_idx)| {
-              let prod = T_x[row_idx] * T_y[*col_idx];
-              mul_field_i32(prod, *val)
+              SmallCoeff::mul_field(*val, &(T_x[row_idx] * T_y[*col_idx]))
             })
             .sum::<E::Scalar>()
         })
@@ -1447,11 +1435,11 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
     if !self.A_csc_col_ptr.is_empty() {
       /// Accumulate CSC entries for one matrix into a register accumulator.
       #[inline(always)]
-      fn accumulate_column<F: ff::PrimeField + MontgomeryLimbs>(
+      fn accumulate_column<F: ff::PrimeField + MontgomeryLimbs, CC: SmallCoeff>(
         rx_vals: &[F],
         col_ptr: &[usize],
         row_indices: &[u32],
-        values: &[i32],
+        values: &[CC],
         unit_ends: &[usize],
         c: usize,
       ) -> F {
@@ -1462,7 +1450,7 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
         // ±1 entries: add/sub only
         for j in start..unit_end {
           let row = row_indices[j] as usize;
-          if values[j] > 0 {
+          if values[j].is_positive() {
             acc += rx_vals[row];
           } else {
             acc -= rx_vals[row];
@@ -1485,15 +1473,15 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
         let col_start = tid * col_chunk;
         for (i, slot) in chunk.iter_mut().enumerate() {
           let c = col_start + i;
-          let sum_a = accumulate_column::<E::Scalar>(
+          let sum_a = accumulate_column::<E::Scalar, Coeff>(
             rx, &self.A_csc_col_ptr, &self.A_csc_row,
             &self.A_csc_data, &self.A_csc_unit_end, c,
           );
-          let sum_b = accumulate_column::<E::Scalar>(
+          let sum_b = accumulate_column::<E::Scalar, Coeff>(
             rx, &self.B_csc_col_ptr, &self.B_csc_row,
             &self.B_csc_data, &self.B_csc_unit_end, c,
           );
-          let sum_c = accumulate_column::<E::Scalar>(
+          let sum_c = accumulate_column::<E::Scalar, Coeff>(
             rx, &self.C_csc_col_ptr, &self.C_csc_row,
             &self.C_csc_data, &self.C_csc_unit_end, c,
           );

@@ -11,6 +11,7 @@
 //! to compute the `A z`, `B z`, and `C z` in Spartan.
 use crate::{
   errors::SpartanError,
+  small_constraint_system::SmallCoeff,
   small_field::{DelayedReduction, ExtensionBound, SmallValueField, WideMul},
 };
 use ff::PrimeField;
@@ -282,9 +283,9 @@ impl<Coeff: Copy + Default + std::ops::AddAssign + Send + Sync> SparseMatrix<Coe
   }
 }
 
-// ---- ±1 partitioning for i32 matrices ----
+// ---- ±1 partitioning for SmallCoeff matrices ----
 
-impl SparseMatrix<i32> {
+impl<C: SmallCoeff> SparseMatrix<C> {
   /// Reorder entries within each row so ±1 entries come first.
   /// Returns a `Vec<usize>` of per-row split points: entries in
   /// `[indptr[row]..unit_end[row])` are ±1, the rest are non-±1.
@@ -297,7 +298,7 @@ impl SparseMatrix<i32> {
       // Partition: ±1 entries first, others after
       let mut write = start;
       for read in start..end {
-        if self.data[read] == 1 || self.data[read] == -1 {
+        if self.data[read].is_unit() {
           self.data.swap(write, read);
           self.indices.swap(write, read);
           write += 1;

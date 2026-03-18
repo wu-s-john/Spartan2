@@ -12,7 +12,7 @@
 //! we reduce allocations from O(num_x_out) to O(num_threads).
 
 use super::accumulator::LagrangeAccumulators;
-use crate::small_field::{DelayedReduction, SmallValueField, WideMul};
+use crate::small_field::{DelayedReduction, SmallValueField, WitnessValue, WideMul};
 use ff::PrimeField;
 use std::ops::{Add, Sub};
 
@@ -191,25 +191,27 @@ where
 /// # Type Parameters
 ///
 /// - `F`: Field type with delayed reduction support
+/// - `W`: Witness value type (bool, i8, etc.)
 /// - `D`: Polynomial degree bound
-pub(crate) struct InnerThreadState<F, const D: usize>
+pub(crate) struct InnerThreadState<F, W: WitnessValue, const D: usize>
 where
   F: PrimeField
-    + DelayedReduction<i32>
+    + DelayedReduction<W::Extended>
     + DelayedReduction<F>
     + Send
     + Sync,
+  W::Extended: Copy + Default + Add<Output = W::Extended> + Sub<Output = W::Extended> + Send + Sync,
 {
   /// Partial sums indexed by β, accumulated over suffixes.
-  pub partial_sums: Vec<<F as DelayedReduction<i32>>::Accumulator>,
+  pub partial_sums: Vec<<F as DelayedReduction<W::Extended>>::Accumulator>,
   /// Bucket accumulators — plain field addition (no eq weighting).
   pub acc: LagrangeAccumulators<F, D>,
-  /// Prefix evaluations of z for current suffix. Size: 2^l0, widened from i8 to i32.
-  pub z_prefix_boolean_evals: Vec<i32>,
+  /// Prefix evaluations of z for current suffix. Size: 2^l0
+  pub z_prefix_evals: Vec<W::Extended>,
   /// Result buffer for z Lagrange extension. Size: 3^l0
-  pub z_extended_evals: Vec<i32>,
+  pub z_extended_evals: Vec<W::Extended>,
   /// Scratch buffer for z Lagrange extension.
-  pub z_extended_scratch: Vec<i32>,
+  pub z_extended_scratch: Vec<W::Extended>,
   /// Prefix evaluations of M̃ for current suffix. Size: 2^l0
   pub M_prefix_boolean_evals: Vec<F>,
   /// Result buffer for M̃ Lagrange extension. Size: 3^l0
@@ -218,21 +220,22 @@ where
   pub M_extended_scratch: Vec<F>,
 }
 
-impl<F, const D: usize> InnerThreadState<F, D>
+impl<F, W: WitnessValue, const D: usize> InnerThreadState<F, W, D>
 where
   F: PrimeField
-    + DelayedReduction<i32>
+    + DelayedReduction<W::Extended>
     + DelayedReduction<F>
     + Send
     + Sync,
+  W::Extended: Copy + Default + Add<Output = W::Extended> + Sub<Output = W::Extended> + Send + Sync,
 {
   pub fn new(l0: usize, num_betas: usize, prefix_size: usize, ext_size: usize) -> Self {
     Self {
       partial_sums: vec![Default::default(); num_betas],
       acc: LagrangeAccumulators::new(l0),
-      z_prefix_boolean_evals: vec![0i32; prefix_size],
-      z_extended_evals: vec![0i32; ext_size],
-      z_extended_scratch: vec![0i32; ext_size],
+      z_prefix_evals: vec![W::Extended::default(); prefix_size],
+      z_extended_evals: vec![W::Extended::default(); ext_size],
+      z_extended_scratch: vec![W::Extended::default(); ext_size],
       M_prefix_boolean_evals: vec![F::ZERO; prefix_size],
       M_extended_evals: vec![F::ZERO; ext_size],
       M_extended_scratch: vec![F::ZERO; ext_size],

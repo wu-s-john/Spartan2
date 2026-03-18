@@ -171,6 +171,56 @@ impl<F: MontgomeryLimbs + PrimeField> DelayedReduction<i8> for F {
 }
 
 // ============================================================================
+// DelayedReduction<i16> - for field × i16 products (from i8 × i8)
+// ============================================================================
+
+impl<F: MontgomeryLimbs + PrimeField> DelayedReduction<i16> for F {
+  /// Accumulator for field × i16 products.
+  ///
+  /// # Overflow Bounds
+  /// - Field element: 254 bits (BN254 Fr)
+  /// - i16 magnitude: 16 bits
+  /// - Product size: 270 bits (5 limbs)
+  /// - SignedWideLimbs<5>: 320 bits capacity
+  /// - Headroom: 50 bits → supports up to 2^50 accumulations
+  type Accumulator = SignedWideLimbs<5>;
+
+  #[inline(always)]
+  fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i16) {
+    let value64 = *value as i64;
+    let (target, mag) = if value64 >= 0 {
+      (&mut acc.pos, value64 as u64)
+    } else {
+      (&mut acc.neg, value64.wrapping_neg() as u64)
+    };
+    let a = field.to_limbs();
+    let (r0, c) = mac(target.0[0], a[0], mag, 0);
+    let (r1, c) = mac(target.0[1], a[1], mag, c);
+    let (r2, c) = mac(target.0[2], a[2], mag, c);
+    let (r3, c) = mac(target.0[3], a[3], mag, c);
+    target.0[0] = r0;
+    target.0[1] = r1;
+    target.0[2] = r2;
+    target.0[3] = r3;
+    target.0[4] = target.0[4].wrapping_add(c);
+  }
+
+  #[inline(always)]
+  fn reduce(acc: &Self::Accumulator) -> Self {
+    match sub_mag::<5>(&acc.pos.0, &acc.neg.0) {
+      SubMagResult::Positive(mag) => {
+        let padded = [mag[0], mag[1], mag[2], mag[3], mag[4], 0];
+        F::from_limbs(barrett_reduce_6::<F>(&padded))
+      }
+      SubMagResult::Negative(mag) => {
+        let padded = [mag[0], mag[1], mag[2], mag[3], mag[4], 0];
+        -F::from_limbs(barrett_reduce_6::<F>(&padded))
+      }
+    }
+  }
+}
+
+// ============================================================================
 // DelayedReduction<i32> - for field × i32 products (direct small values)
 // ============================================================================
 

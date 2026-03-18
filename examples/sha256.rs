@@ -15,11 +15,12 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::Parser;
+use ff::PrimeFieldBits;
 use spartan2::{
   cli::FieldChoice,
   provider::{Bn254Engine, PallasHyraxEngine, VestaHyraxEngine},
   sha256_circuits::SmallSha256Circuit,
-  small_field::{DelayedReduction, SmallValueField},
+  small_field::{DelayedReduction, SmallValueField, montgomery::MontgomeryLimbs},
   spartan::SpartanSNARK,
   timing::{
     ConstraintsData, SPARTAN_PHASES, TimingData, TimingLayer, clear_timings, print_table,
@@ -53,8 +54,8 @@ fn run_benchmark<E: Engine>(
     + DelayedReduction<i64>
     + DelayedReduction<i128>
     + DelayedReduction<E::Scalar>
-    + ff::PrimeFieldBits
-    + spartan2::small_field::montgomery::MontgomeryLimbs,
+    + PrimeFieldBits
+    + MontgomeryLimbs,
 {
   let msg_lengths: Vec<usize> = match bytes {
     Some(b) => vec![b],
@@ -139,7 +140,8 @@ fn run_benchmark<E: Engine>(
 
       // Prep: witness gen (shared + precommitted) + commit
       let t0 = Instant::now();
-      let prep = SpartanSNARK::<E>::prep_prove_small::<_, _, i8>(&pk_small, &circuit).expect("prep_prove_small failed");
+      let prep = SpartanSNARK::<E>::prep_prove_small::<_, _, i8>(&pk_small, &circuit)
+        .expect("prep_prove_small failed");
       let prep_ms = t0.elapsed().as_millis() as u64;
       info!(elapsed_ms = prep_ms, "prep_prove_small");
 
@@ -177,7 +179,12 @@ fn run_benchmark<E: Engine>(
       None => format!("===== msg={}B =====", msg_len),
     };
     print_table(&header, SPARTAN_PHASES, &small_timings, &large_timings);
-    print_table(&format!("{} [prep_int vs large]", header), SPARTAN_PHASES, &prep_int_timings, &large_timings);
+    print_table(
+      &format!("{} [prep_int vs large]", header),
+      SPARTAN_PHASES,
+      &prep_int_timings,
+      &large_timings,
+    );
 
     drop(root_span);
   }
@@ -200,7 +207,9 @@ fn main() {
     .init();
 
   match args.field {
-    FieldChoice::Bn254Fr => run_benchmark::<Bn254Engine>(&timing_data, &constraints_data, args.bytes),
+    FieldChoice::Bn254Fr => {
+      run_benchmark::<Bn254Engine>(&timing_data, &constraints_data, args.bytes)
+    }
     FieldChoice::PallasFq => {
       run_benchmark::<PallasHyraxEngine>(&timing_data, &constraints_data, args.bytes)
     }
