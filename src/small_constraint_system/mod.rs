@@ -13,6 +13,9 @@
 //! - No field elements are created until the inner sumcheck boundary
 
 pub mod bridge;
+pub mod circuit;
+pub mod r1cs;
+
 use std::marker::PhantomData;
 use std::ops::{Add, AddAssign, Neg, Sub};
 

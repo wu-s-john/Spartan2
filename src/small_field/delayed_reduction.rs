@@ -123,6 +123,20 @@ impl<F: PrimeField + Copy> DelayedReduction<bool> for F {
 // Shared helper for i8 / i16 MACs (both accumulate into SignedWideLimbs<5>)
 // ============================================================================
 
+/// Add a 4-limb field element into a 5-limb wide accumulator using plain adds with carry.
+///
+/// Equivalent to `target += field_limbs` (unsigned). No multiply instructions.
+/// Used by `unreduced_multiply_accumulate` as a fast path for value = ±1.
+#[inline(always)]
+fn add_field_limbs(target: &mut WideLimbs<5>, limbs: &[u64; 4]) {
+  let mut carry = false;
+  (target.0[0], carry) = target.0[0].carrying_add(limbs[0], carry);
+  (target.0[1], carry) = target.0[1].carrying_add(limbs[1], carry);
+  (target.0[2], carry) = target.0[2].carrying_add(limbs[2], carry);
+  (target.0[3], carry) = target.0[3].carrying_add(limbs[3], carry);
+  target.0[4] = target.0[4].wrapping_add(carry as u64);
+}
+
 /// Fused multiply-accumulate into a 5-limb signed accumulator.
 ///
 /// Equivalent to `acc += field_limbs × value64`, where the sign is tracked
@@ -162,7 +176,12 @@ impl<F: MontgomeryLimbs + PrimeField> DelayedReduction<i8> for F {
 
   #[inline(always)]
   fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i8) {
-    accumulate_signed_wide_5(acc, field.to_limbs(), *value as i64);
+    match *value {
+      0 => {}
+      1 => add_field_limbs(&mut acc.pos, field.to_limbs()),
+      -1 => add_field_limbs(&mut acc.neg, field.to_limbs()),
+      v => accumulate_signed_wide_5(acc, field.to_limbs(), v as i64),
+    }
   }
 
   #[inline(always)]
@@ -198,7 +217,12 @@ impl<F: MontgomeryLimbs + PrimeField> DelayedReduction<i16> for F {
 
   #[inline(always)]
   fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i16) {
-    accumulate_signed_wide_5(acc, field.to_limbs(), *value as i64);
+    match *value {
+      0 => {}
+      1 => add_field_limbs(&mut acc.pos, field.to_limbs()),
+      -1 => add_field_limbs(&mut acc.neg, field.to_limbs()),
+      v => accumulate_signed_wide_5(acc, field.to_limbs(), v as i64),
+    }
   }
 
   #[inline(always)]

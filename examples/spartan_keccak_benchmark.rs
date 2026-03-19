@@ -92,13 +92,13 @@ fn main() {
   info!(elapsed_ms = setup_small_ms, "setup_small");
 
   let t0 = Instant::now();
-  let prep_small = SpartanSNARK::<E>::prep_prove_small::<_, i8, bool>(&pk_small, &circuit)
+  let mut prep_small = SpartanSNARK::<E>::prep_prove_small::<_, i8, bool>(&pk_small, &circuit)
     .expect("prep_prove_small failed");
   let small_prep_ms = t0.elapsed().as_millis();
   info!(elapsed_ms = small_prep_ms, "prep_prove_small");
 
   let t0 = Instant::now();
-  let proof_small = SpartanSNARK::<E>::prove_small_value(&pk_small, circuit.clone(), &prep_small)
+  let proof_small = SpartanSNARK::<E>::prove_small_value(&pk_small, circuit.clone(), &mut prep_small)
     .expect("prove_small_value failed");
   let small_prove_ms = t0.elapsed().as_millis();
   info!(elapsed_ms = small_prove_ms, "prove_small_value");

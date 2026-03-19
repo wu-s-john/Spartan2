@@ -13,7 +13,7 @@
 use super::{
   accumulator::LagrangeAccumulators,
   domain::LagrangeIndex,
-  extension::extend_to_lagrange_domain,
+  extension::{extend_to_lagrange_domain, extend_to_lagrange_domain_in_place},
   index::CachedPrefixIndex,
   thread_state::{InnerThreadState, NeutronNovaThreadState, SpartanThreadState},
 };
@@ -581,44 +581,58 @@ where
   // Unlike the Spartan builder (which resets partial sums per x_in iteration because
   // the scatter involves per-suffix eq weighting), here the scatter is plain +=,
   // so we accumulate partial sums across all suffixes in a chunk and scatter once.
-  let fold_results: Vec<State<F, W>> = (0..suffix_size)
+  //
+  // GATHER_BATCH: process this many consecutive suffixes per fold closure call.
+  // The gather accesses z[p * suffix_size + suffix] with stride suffix_size — one
+  // element per cache line (64 bytes / 32 bytes for BN254 = 2 elements/line).
+  // Fetching GATHER_BATCH=2 consecutive suffixes per call uses both elements from
+  // each fetched cache line, halving effective cache misses for field-sized witnesses.
+  const GATHER_BATCH: usize = 2;
+
+  let fold_results: Vec<State<F, W>> = (0..suffix_size.div_ceil(GATHER_BATCH))
     .into_par_iter()
     .fold(
-      || State::<F, W>::new(l0, num_betas, prefix_size, ext_size),
-      |mut state: State<F, W>, suffix| {
-        // No reset_partial_sums: accumulate across all suffixes in this chunk
+      || State::<F, W>::new(l0, num_betas, ext_size),
+      |mut state: State<F, W>, batch_idx| {
+        let s_base = batch_idx * GATHER_BATCH;
+        let s_end = (s_base + GATHER_BATCH).min(suffix_size);
 
-        // GATHER: collect 2^l0 evals for this suffix
-        #[allow(clippy::needless_range_loop)]
-        for p in 0..prefix_size {
-          let idx = p * suffix_size + suffix;
-          state.z_prefix_evals[p] = z[idx].to_extended();
-          state.M_prefix_boolean_evals[p] = poly_M.Z[idx];
-        }
+        for suffix in s_base..s_end {
+          // GATHER: collect 2^l0 evals directly into the extension buffers.
+          // The first prefix_size slots of each buffer double as the gather
+          // target, eliminating the separate z_prefix_evals / M_prefix_boolean_evals
+          // buffers and the copy they previously required inside extend_to_lagrange_domain.
+          #[allow(clippy::needless_range_loop)]
+          for p in 0..prefix_size {
+            let idx = p * suffix_size + suffix;
+            state.z_extended_evals[p] = z[idx].to_extended();
+            state.M_extended_evals[p] = poly_M.Z[idx];
+          }
 
-        // EXTEND z: {0,1}^l0 → {∞,0,1}^l0 (integer add/sub)
-        let z_size = extend_to_lagrange_domain::<W::Extended, 2>(
-          &state.z_prefix_evals,
-          &mut state.z_extended_evals,
-          &mut state.z_extended_scratch,
-        );
-        let z_ext = &state.z_extended_evals[..z_size];
-
-        // EXTEND M̃: {0,1}^l0 → {∞,0,1}^l0 (field add/sub only)
-        let m_size = extend_to_lagrange_domain::<F, 2>(
-          &state.M_prefix_boolean_evals,
-          &mut state.M_extended_evals,
-          &mut state.M_extended_scratch,
-        );
-        let m_ext = &state.M_extended_evals[..m_size];
-
-        // ACCUMULATE: field × W::Extended → DelayedReduction<W::Extended> accumulator
-        for beta in 0..num_betas {
-          <F as DelayedReduction<W::Extended>>::unreduced_multiply_accumulate(
-            &mut state.partial_sums[beta],
-            &m_ext[beta],
-            &z_ext[beta],
+          // EXTEND z: {0,1}^l0 → {∞,0,1}^l0 (in-place, integer add/sub)
+          let z_size = extend_to_lagrange_domain_in_place::<W::Extended, 2>(
+            &mut state.z_extended_evals,
+            &mut state.z_extended_scratch,
+            prefix_size,
           );
+          let z_ext = &state.z_extended_evals[..z_size];
+
+          // EXTEND M̃: {0,1}^l0 → {∞,0,1}^l0 (in-place, field add/sub only)
+          let m_size = extend_to_lagrange_domain_in_place::<F, 2>(
+            &mut state.M_extended_evals,
+            &mut state.M_extended_scratch,
+            prefix_size,
+          );
+          let m_ext = &state.M_extended_evals[..m_size];
+
+          // ACCUMULATE: field × W::Extended → DelayedReduction<W::Extended> accumulator
+          for beta in 0..num_betas {
+            <F as DelayedReduction<W::Extended>>::unreduced_multiply_accumulate(
+              &mut state.partial_sums[beta],
+              &m_ext[beta],
+              &z_ext[beta],
+            );
+          }
         }
 
         state

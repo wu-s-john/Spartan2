@@ -140,14 +140,14 @@ fn run_benchmark<E: Engine>(
 
       // Prep: witness gen (shared + precommitted) + commit
       let t0 = Instant::now();
-      let prep = SpartanSNARK::<E>::prep_prove_small::<_, i32, i8>(&pk_small, &circuit)
+      let mut prep = SpartanSNARK::<E>::prep_prove_small::<_, i32, i8>(&pk_small, &circuit)
         .expect("prep_prove_small failed");
       let prep_ms = t0.elapsed().as_millis() as u64;
       info!(elapsed_ms = prep_ms, "prep_prove_small");
 
       // Prove: synthesize rest + commit + sumcheck + PCS
       let t0 = Instant::now();
-      let proof = SpartanSNARK::<E>::prove_small_value(&pk_small, circuit.clone(), &prep)
+      let proof = SpartanSNARK::<E>::prove_small_value(&pk_small, circuit.clone(), &mut prep)
         .expect("prove_small_value failed");
       let prove_ms = t0.elapsed().as_millis() as u64;
       info!(elapsed_ms = prove_ms, "prove_small_value");

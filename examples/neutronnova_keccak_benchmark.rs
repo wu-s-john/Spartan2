@@ -72,7 +72,7 @@ fn make_circuits<F: ff::PrimeField + ff::PrimeFieldBits>(
       let mut input = [0u8; 64];
       input[0] = i as u8;
       input[1] = (i >> 8) as u8;
-      KeccakChainCircuit::new(input, chain_length)
+      KeccakChainCircuit::new(input.to_vec(), chain_length)
     })
     .collect()
 }

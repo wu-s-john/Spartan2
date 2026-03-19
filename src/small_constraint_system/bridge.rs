@@ -11,6 +11,8 @@
 //! i32-coefficient constraints) inside the existing `SpartanCircuit<E>::precommitted`
 //! method, ensuring the field-path shape matches the integer-path shape exactly.
 
+use std::marker::PhantomData;
+
 use bellpepper_core::{ConstraintSystem, Index, LinearCombination, SynthesisError, Variable};
 use ff::PrimeField;
 
@@ -22,13 +24,13 @@ use crate::small_constraint_system::{SmallConstraintSystem, SmallLinearCombinati
 /// Constraints are recorded as proper bellpepper constraints with `Scalar` coefficients.
 pub struct SmallToBellpepperCS<'a, Scalar: PrimeField, CS: ConstraintSystem<Scalar>> {
   pub(crate) cs: &'a mut CS,
-  _marker: std::marker::PhantomData<Scalar>,
+  _marker: PhantomData<Scalar>,
 }
 
 impl<'a, Scalar: PrimeField, CS: ConstraintSystem<Scalar>> SmallToBellpepperCS<'a, Scalar, CS> {
   /// Wrap a bellpepper constraint system.
   pub fn new(cs: &'a mut CS) -> Self {
-    SmallToBellpepperCS { cs, _marker: std::marker::PhantomData }
+    SmallToBellpepperCS { cs, _marker: PhantomData }
   }
 
   /// Convert a `SmallLinearCombination<i32>` to a bellpepper `LinearCombination<Scalar>`.
