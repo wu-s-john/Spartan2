@@ -1104,6 +1104,17 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
     Ok(Self { x, y })
   }
 
+  /// Subtract a constant point from this point: self - constant.
+  /// Equivalent to adding the negation of the constant (negate y).
+  /// Assumes self != constant and self != -constant (incomplete subtraction).
+  pub fn sub_constant<CS: ConstraintSystem<E::Base>>(
+    &self,
+    cs: CS,
+    constant: (E::Base, E::Base),
+  ) -> Result<Self, SynthesisError> {
+    self.add_constant(cs, (constant.0, -constant.1))
+  }
+
   /// If condition outputs a otherwise outputs b
   pub fn conditionally_select<CS: ConstraintSystem<E::Base>>(
     mut cs: CS,
@@ -1217,6 +1228,75 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
       cs.namespace(|| "remove slack if necessary"),
       &acc,
       &acc_minus_initial,
+      &Boolean::from(scalar_bits[0].clone()),
+    )
+  }
+
+  /// Scalar multiplication with a fixed (compile-time constant) base point.
+  ///
+  /// All doublings are precomputed natively: `powers[i] = 2^i · base`.
+  /// Only additions against constants and conditional selects are done in-circuit.
+  /// Cost: num_bits × 5 + 5 variables/constraints (vs ~2,291 for scalar_mul_non_infinity).
+  pub fn scalar_mul_fixed_base<CS: ConstraintSystem<E::Base>>(
+    &self,
+    mut cs: CS,
+    scalar_bits: &[AllocatedBit],
+    powers: &[(E::Base, E::Base)],
+  ) -> Result<Self, SynthesisError> {
+    // self = base point = powers[0], already allocated as accumulator
+    let mut acc = self.clone();
+
+    // For each subsequent bit, add the corresponding constant power
+    for i in 1..scalar_bits.len() {
+      let temp = acc.add_constant(cs.namespace(|| format!("add {i}")), powers[i])?;
+      acc = AllocatedPointNonInfinity::conditionally_select(
+        cs.namespace(|| format!("acc_iteration_{i}")),
+        &temp,
+        &acc,
+        &Boolean::from(scalar_bits[i].clone()),
+      )?;
+    }
+
+    // Remove initial slack (assumption that bit[0]=1):
+    // subtract base point (constant) if bit[0]=0
+    let acc_adj = acc.sub_constant(cs.namespace(|| "sub_base"), powers[0])?;
+    AllocatedPointNonInfinity::conditionally_select(
+      cs.namespace(|| "remove slack if necessary"),
+      &acc,
+      &acc_adj,
+      &Boolean::from(scalar_bits[0].clone()),
+    )
+  }
+
+  /// Scalar multiplication using a precomputed in-circuit power table.
+  ///
+  /// `powers[i] = 2^i · base` (already allocated in-circuit, shared across cards).
+  /// Each card reuses the same power table, so the 254 doublings are paid once.
+  /// Cost per call: num_bits × 5 + 5 variables/constraints.
+  pub fn scalar_mul_with_powers<CS: ConstraintSystem<E::Base>>(
+    mut cs: CS,
+    scalar_bits: &[AllocatedBit],
+    powers: &[Self],
+  ) -> Result<Self, SynthesisError> {
+    // Assume first bit is 1: acc = powers[0]
+    let mut acc = powers[0].clone();
+
+    for i in 1..scalar_bits.len() {
+      let temp = acc.add_incomplete(cs.namespace(|| format!("add {i}")), &powers[i])?;
+      acc = AllocatedPointNonInfinity::conditionally_select(
+        cs.namespace(|| format!("acc_iteration_{i}")),
+        &temp,
+        &acc,
+        &Boolean::from(scalar_bits[i].clone()),
+      )?;
+    }
+
+    // Remove initial slack using sub_incomplete
+    let acc_adj = acc.sub_incomplete(cs.namespace(|| "sub_base"), &powers[0])?;
+    AllocatedPointNonInfinity::conditionally_select(
+      cs.namespace(|| "remove slack if necessary"),
+      &acc,
+      &acc_adj,
       &Boolean::from(scalar_bits[0].clone()),
     )
   }
