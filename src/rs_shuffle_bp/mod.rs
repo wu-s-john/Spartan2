@@ -31,6 +31,7 @@ pub const LEVELS: usize = 5;
 pub const BITS_NEEDED: usize = N * LEVELS; // 260 split bits total
 
 pub mod data_structures;
+pub mod encryption;
 pub mod native;
 pub mod permutation;
 
@@ -40,4 +41,8 @@ pub use data_structures::{
   SortedRow, SortedRowVar, UnsortedRow, UnsortedRowVar,
 };
 
+pub use encryption::{
+  native_reencrypt_parallel, reencrypt_deck_bp, rerandomize_ciphertext_bp,
+  NativeReencryptionData,
+};
 pub use native::{prepare_rs_witness_trace, run_rs_shuffle_permutation, RSShuffleTrace};
