@@ -120,6 +120,32 @@ impl<F: PrimeField + Copy> DelayedReduction<bool> for F {
 }
 
 // ============================================================================
+// Shared helper for i8 / i16 MACs (both accumulate into SignedWideLimbs<5>)
+// ============================================================================
+
+/// Fused multiply-accumulate into a 5-limb signed accumulator.
+///
+/// Equivalent to `acc += field_limbs × value64`, where the sign is tracked
+/// separately via the `pos` / `neg` halves of `acc`.
+#[inline(always)]
+fn accumulate_signed_wide_5(acc: &mut SignedWideLimbs<5>, field_limbs: &[u64; 4], value64: i64) {
+  let (target, mag) = if value64 >= 0 {
+    (&mut acc.pos, value64 as u64)
+  } else {
+    (&mut acc.neg, value64.wrapping_neg() as u64)
+  };
+  let (r0, c) = mac(target.0[0], field_limbs[0], mag, 0);
+  let (r1, c) = mac(target.0[1], field_limbs[1], mag, c);
+  let (r2, c) = mac(target.0[2], field_limbs[2], mag, c);
+  let (r3, c) = mac(target.0[3], field_limbs[3], mag, c);
+  target.0[0] = r0;
+  target.0[1] = r1;
+  target.0[2] = r2;
+  target.0[3] = r3;
+  target.0[4] = target.0[4].wrapping_add(c);
+}
+
+// ============================================================================
 // DelayedReduction<i8> - for field × i8 products (witness extension values)
 // ============================================================================
 
@@ -136,22 +162,7 @@ impl<F: MontgomeryLimbs + PrimeField> DelayedReduction<i8> for F {
 
   #[inline(always)]
   fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i8) {
-    let value64 = *value as i64;
-    let (target, mag) = if value64 >= 0 {
-      (&mut acc.pos, value64 as u64)
-    } else {
-      (&mut acc.neg, value64.wrapping_neg() as u64)
-    };
-    let a = field.to_limbs();
-    let (r0, c) = mac(target.0[0], a[0], mag, 0);
-    let (r1, c) = mac(target.0[1], a[1], mag, c);
-    let (r2, c) = mac(target.0[2], a[2], mag, c);
-    let (r3, c) = mac(target.0[3], a[3], mag, c);
-    target.0[0] = r0;
-    target.0[1] = r1;
-    target.0[2] = r2;
-    target.0[3] = r3;
-    target.0[4] = target.0[4].wrapping_add(c);
+    accumulate_signed_wide_5(acc, field.to_limbs(), *value as i64);
   }
 
   #[inline(always)]
@@ -187,22 +198,7 @@ impl<F: MontgomeryLimbs + PrimeField> DelayedReduction<i16> for F {
 
   #[inline(always)]
   fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i16) {
-    let value64 = *value as i64;
-    let (target, mag) = if value64 >= 0 {
-      (&mut acc.pos, value64 as u64)
-    } else {
-      (&mut acc.neg, value64.wrapping_neg() as u64)
-    };
-    let a = field.to_limbs();
-    let (r0, c) = mac(target.0[0], a[0], mag, 0);
-    let (r1, c) = mac(target.0[1], a[1], mag, c);
-    let (r2, c) = mac(target.0[2], a[2], mag, c);
-    let (r3, c) = mac(target.0[3], a[3], mag, c);
-    target.0[0] = r0;
-    target.0[1] = r1;
-    target.0[2] = r2;
-    target.0[3] = r3;
-    target.0[4] = target.0[4].wrapping_add(c);
+    accumulate_signed_wide_5(acc, field.to_limbs(), *value as i64);
   }
 
   #[inline(always)]

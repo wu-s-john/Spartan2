@@ -419,24 +419,16 @@ impl<E: Engine> SpartanSNARK<E> {
     z
   }
 
-  /// Build z = [W | 1 | public_values | challenges] converting small witness values to field elements.
-  fn build_z_field<W: Copy + Default + PartialEq>(
+  /// Build z = [W | 1 | public_values | challenges] converting witness values to field elements.
+  fn build_z_field<W: crate::small_field::WitnessValue>(
     w: &[W],
     pub_w: &[W],
     challenges: &[E::Scalar],
   ) -> Vec<E::Scalar> {
-    let zero_w = W::default();
-    let to_field = |v: &W| {
-      if *v == zero_w {
-        E::Scalar::ZERO
-      } else {
-        E::Scalar::ONE
-      }
-    };
     let mut z = Vec::with_capacity(w.len() + 1 + pub_w.len() + challenges.len());
-    z.extend(w.iter().map(to_field));
+    z.extend(w.iter().map(|v| v.to_field::<E::Scalar>()));
     z.push(E::Scalar::ONE);
-    z.extend(pub_w.iter().map(to_field));
+    z.extend(pub_w.iter().map(|v| v.to_field::<E::Scalar>()));
     z.extend_from_slice(challenges);
     z
   }

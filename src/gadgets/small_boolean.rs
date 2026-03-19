@@ -117,10 +117,13 @@ impl NegOne for i8 {
   }
 }
 
+/// Only valid for use with witness-only (no-op enforce) constraint systems such as
+/// `SmallSatisfyingAssignment<bool>`.  The returned value is a dummy — it is never
+/// used to build an actual constraint.  Do not implement `NegOne for bool` for any
+/// CS where `enforce` has real semantics, as the incorrect coefficient would silently
+/// produce wrong constraints.
 impl NegOne for bool {
   fn neg(_pos_coeff: bool) -> bool {
-    // For witness path (SmallSatisfyingAssignment<bool>), enforce is a no-op.
-    // This value is never actually used in constraints.
     false
   }
 }
@@ -338,10 +341,13 @@ impl Double for i8 {
   }
 }
 
+/// Only valid for use with witness-only (no-op enforce) constraint systems such as
+/// `SmallSatisfyingAssignment<bool>`.  The returned value is a dummy — it is never
+/// used to build an actual constraint.  Do not implement `Double for bool` for any
+/// CS where `enforce` has real semantics, as the incorrect coefficient would silently
+/// produce wrong constraints.
 impl Double for bool {
   fn double(self) -> bool {
-    // For witness path (SmallSatisfyingAssignment<bool>), enforce is a no-op.
-    // This value is never actually used in constraints.
     false
   }
 }

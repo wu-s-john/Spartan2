@@ -401,11 +401,9 @@ where
           &z_lo,
         );
 
-        // eval 2: a_bound × z_bound where z_bound = 2·z_hi - z_lo (as field elements)
+        // eval 2: a_bound × z_bound where z_bound = 2·z_hi - z_lo
         let a_bound = a_high + a_high - a_low;
-        let z_bound: E::Scalar =
-          z_hi.to_field::<E::Scalar>() + z_hi.to_field::<E::Scalar>() - z_lo.to_field::<E::Scalar>();
-        acc.1 += a_bound * z_bound;
+        acc.1 += W::eval_2_contribution(z_hi, z_lo, a_bound);
 
         acc
       },
@@ -424,15 +422,14 @@ where
 
 /// Bind a witness z polynomial with challenge r, producing field elements.
 ///
-/// Standard linear interpolation: z_bound[i] = z_lo[i].to_field() * (1-r) + z_hi[i].to_field() * r
+/// Standard linear interpolation: z_bound[i] = z_lo[i] * (1-r) + z_hi[i] * r.
+/// Binary witness types (e.g. bool) use a fast path with no field multiplies.
 fn bind_witness_z<F: PrimeField, W: WitnessValue>(z: &[W], r: &F) -> Vec<F> {
   let len = z.len() / 2;
   let one_minus_r = F::ONE - *r;
 
   let compute = |i: usize| -> F {
-    let lo: F = z[i].to_field();
-    let hi: F = z[len + i].to_field();
-    lo * one_minus_r + hi * *r
+    W::bind_lo_hi(z[i], z[len + i], *r, one_minus_r)
   };
 
   if len >= PAR_THRESHOLD {

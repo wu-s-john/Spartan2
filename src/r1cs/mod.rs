@@ -30,6 +30,45 @@ mod folds;
 mod sparse;
 pub(crate) use sparse::SparseMatrix;
 
+/// Parallel chunked buffer accumulation.
+///
+/// Allocates one `Vec<F>` of length `num_cols` per Rayon thread, fills it by
+/// calling `row_fn(buffer, row_idx)` for every row assigned to that thread,
+/// then reduces all thread buffers into a single output via parallel element-wise
+/// addition.  Thread count is capped so total buffer memory stays ≤ 512 MB.
+fn par_chunked_reduce<F, RowFn>(num_rows: usize, num_cols: usize, row_fn: RowFn) -> Vec<F>
+where
+  F: ff::PrimeField + Send + Sync,
+  RowFn: Fn(&mut Vec<F>, usize) + Send + Sync,
+{
+  let buffer_bytes = num_cols * std::mem::size_of::<F>();
+  let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
+  let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
+  let chunk_size = (num_rows + num_threads - 1) / num_threads;
+
+  let mut thread_buffers: Vec<Vec<F>> = (0..num_threads)
+    .into_par_iter()
+    .map(|thread_idx| {
+      let start = thread_idx * chunk_size;
+      let end = ((thread_idx + 1) * chunk_size).min(num_rows);
+      let mut buffer = vec![F::ZERO; num_cols];
+      for row_idx in start..end {
+        row_fn(&mut buffer, row_idx);
+      }
+      buffer
+    })
+    .collect();
+
+  let mut result = thread_buffers.swap_remove(0);
+  for buffer in thread_buffers {
+    result
+      .par_iter_mut()
+      .zip(buffer.par_iter())
+      .for_each(|(a, b)| *a += *b);
+  }
+  result
+}
+
 /// Fast-path field multiplication: avoids full mul for common ±1 coefficients.
 #[inline(always)]
 fn mul_field_fast<F: ff::PrimeField>(x: F, v: &F) -> F {
@@ -1079,53 +1118,26 @@ impl<E: Engine> SplitR1CSShape<E> {
     let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
     let num_cols = 2 * num_vars;
     let r_sq = r * r;
-    // Cap threads to limit total buffer memory (~512MB max) while preserving parallelism
-    let buffer_bytes = num_cols * std::mem::size_of::<E::Scalar>();
-    let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
-    let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
-    let chunk_size = (self.num_cons + num_threads - 1) / num_threads;
 
-    // Allocate + compute in parallel: each thread creates and fills its own buffer
-    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
-      .into_par_iter()
-      .map(|thread_idx| {
-        let start_row = thread_idx * chunk_size;
-        let end_row = ((thread_idx + 1) * chunk_size).min(self.num_cons);
-        let mut buffer = vec![E::Scalar::ZERO; num_cols];
+    par_chunked_reduce(self.num_cons, num_cols, |buffer, row_idx| {
+      let rx_row = rx[row_idx];
+      let rx_r = rx_row * r;
+      let rx_r_sq = rx_row * r_sq;
 
-        for row_idx in start_row..end_row {
-          let rx_row = rx[row_idx];
-          let rx_r = rx_row * r;
-          let rx_r_sq = rx_row * r_sq;
+      let a_ptrs = [self.A.indptr[row_idx], self.A.indptr[row_idx + 1]];
+      let b_ptrs = [self.B.indptr[row_idx], self.B.indptr[row_idx + 1]];
+      let c_ptrs = [self.C.indptr[row_idx], self.C.indptr[row_idx + 1]];
 
-          let a_ptrs = [self.A.indptr[row_idx], self.A.indptr[row_idx + 1]];
-          let b_ptrs = [self.B.indptr[row_idx], self.B.indptr[row_idx + 1]];
-          let c_ptrs = [self.C.indptr[row_idx], self.C.indptr[row_idx + 1]];
-
-          for (val, col) in self.A.get_row_unchecked(&a_ptrs) {
-            buffer[*col] += mul_field_fast(rx_row, val);
-          }
-          for (val, col) in self.B.get_row_unchecked(&b_ptrs) {
-            buffer[*col] += mul_field_fast(rx_r, val);
-          }
-          for (val, col) in self.C.get_row_unchecked(&c_ptrs) {
-            buffer[*col] += mul_field_fast(rx_r_sq, val);
-          }
-        }
-        buffer
-      })
-      .collect();
-
-    // Reduce: first buffer becomes result, add remaining with parallel inner loop
-    let mut result = thread_buffers.swap_remove(0);
-    for buffer in thread_buffers {
-      result
-        .par_iter_mut()
-        .zip(buffer.par_iter())
-        .for_each(|(a, b)| *a += *b);
-    }
-
-    result
+      for (val, col) in self.A.get_row_unchecked(&a_ptrs) {
+        buffer[*col] += mul_field_fast(rx_row, val);
+      }
+      for (val, col) in self.B.get_row_unchecked(&b_ptrs) {
+        buffer[*col] += mul_field_fast(rx_r, val);
+      }
+      for (val, col) in self.C.get_row_unchecked(&c_ptrs) {
+        buffer[*col] += mul_field_fast(rx_r_sq, val);
+      }
+    })
   }
 }
 
@@ -1639,50 +1651,26 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
     let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
     let num_cols = 2 * num_vars;
     let r_sq = r * r;
-    let buffer_bytes = num_cols * std::mem::size_of::<E::Scalar>();
-    let max_threads = std::cmp::max(2, 512_000_000 / buffer_bytes);
-    let num_threads = std::cmp::min(rayon::current_num_threads(), max_threads);
-    let chunk_size = (self.num_cons + num_threads - 1) / num_threads;
 
-    let mut thread_buffers: Vec<Vec<E::Scalar>> = (0..num_threads)
-      .into_par_iter()
-      .map(|thread_idx| {
-        let start_row = thread_idx * chunk_size;
-        let end_row = ((thread_idx + 1) * chunk_size).min(self.num_cons);
-        let mut buffer = vec![E::Scalar::ZERO; num_cols];
+    par_chunked_reduce(self.num_cons, num_cols, |buffer, row_idx| {
+      let rx_row = rx[row_idx];
+      let rx_r = rx_row * r;
+      let rx_r_sq = rx_row * r_sq;
 
-        for row_idx in start_row..end_row {
-          let rx_row = rx[row_idx];
-          let rx_r = rx_row * r;
-          let rx_r_sq = rx_row * r_sq;
+      let a_ptrs = [self.A.indptr[row_idx], self.A.indptr[row_idx + 1]];
+      let b_ptrs = [self.B.indptr[row_idx], self.B.indptr[row_idx + 1]];
+      let c_ptrs = [self.C.indptr[row_idx], self.C.indptr[row_idx + 1]];
 
-          let a_ptrs = [self.A.indptr[row_idx], self.A.indptr[row_idx + 1]];
-          let b_ptrs = [self.B.indptr[row_idx], self.B.indptr[row_idx + 1]];
-          let c_ptrs = [self.C.indptr[row_idx], self.C.indptr[row_idx + 1]];
-
-          for (val, col) in self.A.get_row_unchecked(&a_ptrs) {
-            buffer[*col] += val.mul_field(&rx_row);
-          }
-          for (val, col) in self.B.get_row_unchecked(&b_ptrs) {
-            buffer[*col] += val.mul_field(&rx_r);
-          }
-          for (val, col) in self.C.get_row_unchecked(&c_ptrs) {
-            buffer[*col] += val.mul_field(&rx_r_sq);
-          }
-        }
-        buffer
-      })
-      .collect();
-
-    let mut result = thread_buffers.swap_remove(0);
-    for buffer in thread_buffers {
-      result
-        .par_iter_mut()
-        .zip(buffer.par_iter())
-        .for_each(|(a, b)| *a += *b);
-    }
-
-    result
+      for (val, col) in self.A.get_row_unchecked(&a_ptrs) {
+        buffer[*col] += val.mul_field(&rx_row);
+      }
+      for (val, col) in self.B.get_row_unchecked(&b_ptrs) {
+        buffer[*col] += val.mul_field(&rx_r);
+      }
+      for (val, col) in self.C.get_row_unchecked(&c_ptrs) {
+        buffer[*col] += val.mul_field(&rx_r_sq);
+      }
+    })
   }
 }
 

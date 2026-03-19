@@ -15,7 +15,7 @@ use std::marker::PhantomData;
 
 use crate::traits::{Engine, circuit::{SmallSpartanCircuit, SpartanCircuit}};
 use crate::gadgets::{SmallBoolean, small_keccak256};
-use crate::gadgets::small_boolean::{NegOne, SmallBit};
+use crate::gadgets::small_boolean::{Double, NegOne, SmallBit};
 use crate::small_constraint_system::{SmallConstraintSystem, SmallToBellpepperCS};
 
 /// Keccak-256 chain circuit using bellpepper-keccak.
@@ -160,6 +160,33 @@ impl<Scalar: PrimeField + PrimeFieldBits> Circuit<Scalar> for KeccakChainCircuit
 
 // ── SmallSpartanCircuit impls ─────────────────────────────────────────────
 
+/// Run the Keccak-256 chain and expose the final 256 bits as public inputs.
+///
+/// Shared body for all `SmallSpartanCircuit` precommitted impls — only the
+/// value type `V` differs between them.
+fn keccak_chain_precommitted<V, CS>(
+  cs: &mut CS,
+  input: &[u8],
+  chain_length: usize,
+) -> Result<Vec<bellpepper_core::Variable>, SynthesisError>
+where
+  V: Copy + From<bool> + NegOne + Double,
+  CS: SmallConstraintSystem<V>,
+{
+  let mut current_bits = alloc_input_small_bits(cs, input, "input")?;
+  for chain_idx in 0..chain_length {
+    let mut ns = cs.namespace(|| format!("keccak_{chain_idx}"));
+    let hash_bits = small_keccak256::<V, _>(&mut ns, &current_bits)?;
+    drop(ns);
+    current_bits = hash_bits;
+  }
+  for bit in &current_bits[..256] {
+    let val = bit.get_value().map(V::from);
+    cs.alloc_input(|| "hash_bit", || val.ok_or(SynthesisError::AssignmentMissing))?;
+  }
+  Ok(vec![])
+}
+
 /// Allocate input bytes as SmallBoolean bits (LSB-first per byte, matching Keccak standard).
 fn alloc_input_small_bits<V, CS>(
   cs: &mut CS,
@@ -217,22 +244,7 @@ where
     cs: &mut CS,
     _shared: &[bellpepper_core::Variable],
   ) -> Result<Vec<bellpepper_core::Variable>, SynthesisError> {
-    let mut current_bits = alloc_input_small_bits(cs, &self.input, "input")?;
-
-    for chain_idx in 0..self.chain_length {
-      let mut ns = cs.namespace(|| format!("keccak_{chain_idx}"));
-      let hash_bits = small_keccak256::<i8, _>(&mut ns, &current_bits)?;
-      drop(ns);
-      current_bits = hash_bits;
-    }
-
-    // Expose final hash as public inputs
-    for bit in &current_bits[..256] {
-      let val = bit.get_value().map(|b| if b { 1i8 } else { 0i8 });
-      cs.alloc_input(|| "hash_bit", || val.ok_or(SynthesisError::AssignmentMissing))?;
-    }
-
-    Ok(vec![])
+    keccak_chain_precommitted::<i8, _>(cs, &self.input, self.chain_length)
   }
 
   fn num_challenges(&self) -> usize { 0 }
@@ -277,23 +289,7 @@ where
     cs: &mut CS,
     _shared: &[bellpepper_core::Variable],
   ) -> Result<Vec<bellpepper_core::Variable>, SynthesisError> {
-    // Allocate input bits as bool witnesses
-    let mut current_bits = alloc_input_small_bits(cs, &self.input, "input")?;
-
-    for chain_idx in 0..self.chain_length {
-      let mut ns = cs.namespace(|| format!("keccak_{chain_idx}"));
-      let hash_bits = small_keccak256::<bool, _>(&mut ns, &current_bits)?;
-      drop(ns);
-      current_bits = hash_bits;
-    }
-
-    // Expose final hash as public inputs (bool)
-    for bit in &current_bits[..256] {
-      let val = bit.get_value();
-      cs.alloc_input(|| "hash_bit", || val.ok_or(SynthesisError::AssignmentMissing))?;
-    }
-
-    Ok(vec![])
+    keccak_chain_precommitted::<bool, _>(cs, &self.input, self.chain_length)
   }
 
   fn num_challenges(&self) -> usize { 0 }
