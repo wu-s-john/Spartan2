@@ -6,14 +6,14 @@
 
 use super::data_structures::{ElGamalCiphertext, ElGamalCiphertextVar};
 use crate::{
-  gadgets::{ecc::AllocatedPoint, utils::le_bits_to_num},
+  gadgets::ecc::AllocatedPointNonInfinity,
   traits::{Engine, Group},
 };
 use bellpepper_core::{
   boolean::AllocatedBit, num::AllocatedNum, ConstraintSystem, Index, LinearCombination,
   SynthesisError, Variable,
 };
-use ff::{PrimeField, PrimeFieldBits};
+use ff::{Field, PrimeField, PrimeFieldBits};
 use rayon::prelude::*;
 
 // ============================================================================
@@ -311,42 +311,39 @@ pub fn native_reencrypt_parallel<E: Engine, const N: usize>(
 /// Re-encrypt one ciphertext — the core gadget.
 ///
 /// Per card:
-/// 1. Bit-decompose randomization scalar (NUM_BITS AllocatedBit, constrained via le_bits_to_num)
-/// 2. Scalar mul r·G (generator allocated as point)
-/// 3. Scalar mul r·PK
+/// 1. Bit-decompose randomization scalar (constrained inline)
+/// 2. Scalar mul r·G (generator passed in, shared across cards)
+/// 3. Scalar mul r·PK (pk passed in as non-infinity)
 /// 4. c1' = c1 + r·G, c2' = c2 + r·PK
 pub fn rerandomize_ciphertext_bp<E: Engine, CS: ConstraintSystem<E::Base>>(
   mut cs: CS,
   ct: &ElGamalCiphertextVar<E>,
   randomization: &AllocatedNum<E::Base>,
-  pk: &AllocatedPoint<E>,
-  generator_coords: (E::Base, E::Base),
+  pk: &AllocatedPointNonInfinity<E>,
+  generator: &AllocatedPointNonInfinity<E>,
 ) -> Result<ElGamalCiphertextVar<E>, SynthesisError> {
   let num_bits = E::Base::NUM_BITS as usize;
 
   // Step 1: Bit-decompose the randomization scalar
   let r_bits = alloc_scalar_bits::<E, _>(cs.namespace(|| "r_bits"), randomization, num_bits)?;
 
-  // Step 2: r·G
-  let gen_point = AllocatedPoint::<E>::alloc(
-    cs.namespace(|| "generator"),
-    Some((generator_coords.0, generator_coords.1, false)),
-  )?;
-  let r_g = gen_point.scalar_mul(cs.namespace(|| "r_G"), &r_bits)?;
+  // Step 2: r·G using non-infinity scalar mul (generator is never infinity)
+  let r_g = generator.scalar_mul_non_infinity(cs.namespace(|| "r_G"), &r_bits)?;
 
-  // Step 3: r·PK
-  let r_pk = pk.scalar_mul(cs.namespace(|| "r_PK"), &r_bits)?;
+  // Step 3: r·PK using non-infinity scalar mul (PK is never infinity)
+  let r_pk = pk.scalar_mul_non_infinity(cs.namespace(|| "r_PK"), &r_bits)?;
 
-  // Step 4: c1' = c1 + r·G
-  let c1_prime = ct.c1.add(cs.namespace(|| "c1_plus_rG"), &r_g)?;
+  // Step 4: c1' = c1 + r·G using incomplete addition (safe: unrelated random points)
+  let c1_prime = ct.c1.add_incomplete(cs.namespace(|| "c1_plus_rG"), &r_g)?;
 
-  // Step 5: c2' = c2 + r·PK
-  let c2_prime = ct.c2.add(cs.namespace(|| "c2_plus_rPK"), &r_pk)?;
+  // Step 5: c2' = c2 + r·PK using incomplete addition (safe: unrelated random points)
+  let c2_prime = ct.c2.add_incomplete(cs.namespace(|| "c2_plus_rPK"), &r_pk)?;
 
   Ok(ElGamalCiphertextVar::new(c1_prime, c2_prime))
 }
 
-/// Bit-decompose a scalar and constrain via le_bits_to_num
+/// Bit-decompose a scalar and constrain directly: Σ(2^i × bit_i) = scalar
+/// This saves 1 variable + 1 constraint per call vs le_bits_to_num + enforce.
 fn alloc_scalar_bits<E: Engine, CS: ConstraintSystem<E::Base>>(
   mut cs: CS,
   scalar: &AllocatedNum<E::Base>,
@@ -371,15 +368,19 @@ fn alloc_scalar_bits<E: Engine, CS: ConstraintSystem<E::Base>>(
     allocated_bits.push(ab);
   }
 
-  // Constrain: bits reconstruct the scalar
-  let reconstructed = le_bits_to_num(cs.namespace(|| "le_bits_to_num"), &allocated_bits)?;
-
-  // Enforce equality
+  // Constrain directly: Σ(2^i × bit_i) = scalar (no intermediate variable)
+  let mut coeff = E::Base::ONE;
   cs.enforce(
     || "scalar_bits_match",
-    |lc| lc + scalar.get_variable() - reconstructed.get_variable(),
+    |mut lc| {
+      for bit in &allocated_bits {
+        lc = lc + (coeff, bit.get_variable());
+        coeff = coeff.double();
+      }
+      lc
+    },
     |lc| lc + CS::one(),
-    |lc| lc,
+    |lc| lc + scalar.get_variable(),
   );
 
   Ok(allocated_bits)
@@ -401,9 +402,9 @@ pub fn reencrypt_deck_bp<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
   cs: &mut CS,
   input_deck: &[ElGamalCiphertextVar<E>; N],
   randomizations: &[AllocatedNum<E::Base>; N],
-  pk: &AllocatedPoint<E>,
+  pk: &AllocatedPointNonInfinity<E>,
   _native_data: &NativeReencryptionData<E, N>,
-  generator_coords: (E::Base, E::Base),
+  generator: &AllocatedPointNonInfinity<E>,
 ) -> Result<(), SynthesisError> {
   if cs.is_witness_generator() {
     reencrypt_deck_parallel_witness::<E, CS, N>(
@@ -411,10 +412,10 @@ pub fn reencrypt_deck_bp<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
       input_deck,
       randomizations,
       pk,
-      generator_coords,
+      generator,
     )
   } else {
-    reencrypt_deck_serial::<E, CS, N>(cs, input_deck, randomizations, pk, generator_coords)?;
+    reencrypt_deck_serial::<E, CS, N>(cs, input_deck, randomizations, pk, generator)?;
     Ok(())
   }
 }
@@ -424,8 +425,8 @@ fn reencrypt_deck_serial<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
   cs: &mut CS,
   input_deck: &[ElGamalCiphertextVar<E>; N],
   randomizations: &[AllocatedNum<E::Base>; N],
-  pk: &AllocatedPoint<E>,
-  generator_coords: (E::Base, E::Base),
+  pk: &AllocatedPointNonInfinity<E>,
+  generator: &AllocatedPointNonInfinity<E>,
 ) -> Result<[ElGamalCiphertextVar<E>; N], SynthesisError> {
   let mut results = Vec::with_capacity(N);
   for i in 0..N {
@@ -434,7 +435,7 @@ fn reencrypt_deck_serial<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
       &input_deck[i],
       &randomizations[i],
       pk,
-      generator_coords,
+      generator,
     )?;
     results.push(ct);
   }
@@ -453,11 +454,13 @@ fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, con
   cs: &mut CS,
   input_deck: &[ElGamalCiphertextVar<E>; N],
   randomizations: &[AllocatedNum<E::Base>; N],
-  pk: &AllocatedPoint<E>,
-  generator_coords: (E::Base, E::Base),
+  pk: &AllocatedPointNonInfinity<E>,
+  generator: &AllocatedPointNonInfinity<E>,
 ) -> Result<(), SynthesisError> {
   let pk_x_val = pk.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
   let pk_y_val = pk.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+  let gen_x_val = generator.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+  let gen_y_val = generator.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
 
   struct CardInputs<F: PrimeField> {
     ct_c1_x: F,
@@ -495,13 +498,19 @@ fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, con
       let r_var = AllocatedNum::alloc(mini_cs.namespace(|| "r"), || Ok(inputs.randomization))
         .expect("alloc r");
 
-      let pk_var = AllocatedPoint::<E>::alloc(
+      let pk_var = AllocatedPointNonInfinity::<E>::alloc(
         mini_cs.namespace(|| "pk"),
-        Some((pk_x_val, pk_y_val, false)),
+        Some((pk_x_val, pk_y_val)),
       )
       .expect("alloc pk");
 
-      // Record how many aux vars were allocated for inputs (ct + r + pk).
+      let gen_var = AllocatedPointNonInfinity::<E>::alloc(
+        mini_cs.namespace(|| "gen"),
+        Some((gen_x_val, gen_y_val)),
+      )
+      .expect("alloc gen");
+
+      // Record how many aux vars were allocated for inputs (ct + r + pk + gen).
       // These already exist on the main CS — we must skip them when copying.
       let input_aux_count = mini_cs.aux_assignment.len();
 
@@ -510,7 +519,7 @@ fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, con
         &ct_var,
         &r_var,
         &pk_var,
-        generator_coords,
+        &gen_var,
       )
       .expect("rerandomize failed");
 
@@ -586,18 +595,24 @@ mod tests {
     let r_var = AllocatedNum::alloc(cs.namespace(|| "r"), || Ok(r)).expect("alloc r");
 
     let pk_native = find_point_on_curve(a, b);
-    let pk_var = AllocatedPoint::<E>::alloc(
+    let pk_var = AllocatedPointNonInfinity::<E>::alloc(
       cs.namespace(|| "pk"),
-      Some((pk_native.0, pk_native.1, false)),
+      Some((pk_native.0, pk_native.1)),
     )
     .expect("alloc pk");
+
+    let gen_var = AllocatedPointNonInfinity::<E>::alloc(
+      cs.namespace(|| "gen"),
+      Some(gen_coords),
+    )
+    .expect("alloc gen");
 
     let result = rerandomize_ciphertext_bp::<E, _>(
       cs.namespace(|| "reencrypt"),
       &ct_var,
       &r_var,
       &pk_var,
-      gen_coords,
+      &gen_var,
     );
 
     assert!(result.is_ok(), "Gadget failed: {:?}", result.err());
@@ -773,9 +788,14 @@ mod tests {
         AllocatedNum::alloc(cs_serial.namespace(|| format!("r_{}", i)), || Ok(r_arr[i])).unwrap(),
       );
     }
-    let pk_serial = AllocatedPoint::<E>::alloc(
+    let pk_serial = AllocatedPointNonInfinity::<E>::alloc(
       cs_serial.namespace(|| "pk"),
-      Some((pk_coords.0, pk_coords.1, false)),
+      Some((pk_coords.0, pk_coords.1)),
+    )
+    .unwrap();
+    let gen_serial = AllocatedPointNonInfinity::<E>::alloc(
+      cs_serial.namespace(|| "gen"),
+      Some(gen_coords),
     )
     .unwrap();
 
@@ -789,7 +809,7 @@ mod tests {
       &rand_arr,
       &pk_serial,
       &native_data,
-      gen_coords,
+      &gen_serial,
     );
 
     assert!(serial_result.is_ok(), "Serial gadget failed: {:?}", serial_result.err());
@@ -822,9 +842,14 @@ mod tests {
           .unwrap(),
       );
     }
-    let pk_par = AllocatedPoint::<E>::alloc(
+    let pk_par = AllocatedPointNonInfinity::<E>::alloc(
       cs_parallel.namespace(|| "pk"),
-      Some((pk_coords.0, pk_coords.1, false)),
+      Some((pk_coords.0, pk_coords.1)),
+    )
+    .unwrap();
+    let gen_par = AllocatedPointNonInfinity::<E>::alloc(
+      cs_parallel.namespace(|| "gen"),
+      Some(gen_coords),
     )
     .unwrap();
 
@@ -838,7 +863,7 @@ mod tests {
       &rand_arr_par,
       &pk_par,
       &native_data,
-      gen_coords,
+      &gen_par,
     );
 
     assert!(par_result.is_ok(), "Parallel gadget failed: {:?}", par_result.err());
@@ -891,9 +916,14 @@ mod tests {
           AllocatedNum::alloc(cs.namespace(|| format!("r_{}", i)), || Ok(r_arr[i])).unwrap(),
         );
       }
-      let pk = AllocatedPoint::<E>::alloc(
+      let pk = AllocatedPointNonInfinity::<E>::alloc(
         cs.namespace(|| "pk"),
-        Some((pk_coords.0, pk_coords.1, false)),
+        Some((pk_coords.0, pk_coords.1)),
+      )
+      .unwrap();
+      let gen_pt = AllocatedPointNonInfinity::<E>::alloc(
+        cs.namespace(|| "gen"),
+        Some(gen_coords),
       )
       .unwrap();
 
@@ -907,7 +937,7 @@ mod tests {
           &deck_arr[i],
           &rand_arr[i],
           &pk,
-          gen_coords,
+          &gen_pt,
         )
         .unwrap();
       }
@@ -929,9 +959,14 @@ mod tests {
           AllocatedNum::alloc(cs.namespace(|| format!("r_{}", i)), || Ok(r_arr[i])).unwrap(),
         );
       }
-      let pk = AllocatedPoint::<E>::alloc(
+      let pk = AllocatedPointNonInfinity::<E>::alloc(
         cs.namespace(|| "pk"),
-        Some((pk_coords.0, pk_coords.1, false)),
+        Some((pk_coords.0, pk_coords.1)),
+      )
+      .unwrap();
+      let gen_pt = AllocatedPointNonInfinity::<E>::alloc(
+        cs.namespace(|| "gen"),
+        Some(gen_coords),
       )
       .unwrap();
 
@@ -944,7 +979,7 @@ mod tests {
         &rand_arr,
         &pk,
         &native_data,
-        gen_coords,
+        &gen_pt,
       )
       .unwrap();
     }

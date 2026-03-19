@@ -3,7 +3,7 @@
 //! This module defines both native and circuit variable versions of
 //! the shuffle witness data and ElGamal ciphertexts.
 
-use crate::{gadgets::ecc::AllocatedPoint, traits::Engine};
+use crate::{gadgets::ecc::AllocatedPointNonInfinity, traits::Engine};
 use bellpepper_core::{
   boolean::AllocatedBit, num::AllocatedNum, ConstraintSystem, SynthesisError,
 };
@@ -286,15 +286,15 @@ impl<E: Engine> ElGamalCiphertext<E> {
   }
 }
 
-/// Circuit variable for ElGamal ciphertext using AllocatedPoint
+/// Circuit variable for ElGamal ciphertext using non-infinity points
 #[derive(Clone)]
 pub struct ElGamalCiphertextVar<E: Engine> {
-  pub c1: AllocatedPoint<E>,
-  pub c2: AllocatedPoint<E>,
+  pub c1: AllocatedPointNonInfinity<E>,
+  pub c2: AllocatedPointNonInfinity<E>,
 }
 
 impl<E: Engine> ElGamalCiphertextVar<E> {
-  pub fn new(c1: AllocatedPoint<E>, c2: AllocatedPoint<E>) -> Self {
+  pub fn new(c1: AllocatedPointNonInfinity<E>, c2: AllocatedPointNonInfinity<E>) -> Self {
     Self { c1, c2 }
   }
 
@@ -303,13 +303,13 @@ impl<E: Engine> ElGamalCiphertextVar<E> {
     mut cs: CS,
     ct: &ElGamalCiphertext<E>,
   ) -> Result<Self, SynthesisError> {
-    let c1 = AllocatedPoint::alloc(
+    let c1 = AllocatedPointNonInfinity::alloc(
       cs.namespace(|| "c1"),
-      Some((ct.c1_x, ct.c1_y, false)), // not infinity
+      Some((ct.c1_x, ct.c1_y)),
     )?;
-    let c2 = AllocatedPoint::alloc(
+    let c2 = AllocatedPointNonInfinity::alloc(
       cs.namespace(|| "c2"),
-      Some((ct.c2_x, ct.c2_y, false)), // not infinity
+      Some((ct.c2_x, ct.c2_y)),
     )?;
     Ok(Self::new(c1, c2))
   }
@@ -319,9 +319,14 @@ impl<E: Engine> ElGamalCiphertextVar<E> {
     mut cs: CS,
     ct: &ElGamalCiphertext<E>,
   ) -> Result<Self, SynthesisError> {
-    // Allocate points and then inputize the coordinates
-    let c1 = AllocatedPoint::alloc(cs.namespace(|| "c1"), Some((ct.c1_x, ct.c1_y, false)))?;
-    let c2 = AllocatedPoint::alloc(cs.namespace(|| "c2"), Some((ct.c2_x, ct.c2_y, false)))?;
+    let c1 = AllocatedPointNonInfinity::alloc(
+      cs.namespace(|| "c1"),
+      Some((ct.c1_x, ct.c1_y)),
+    )?;
+    let c2 = AllocatedPointNonInfinity::alloc(
+      cs.namespace(|| "c2"),
+      Some((ct.c2_x, ct.c2_y)),
+    )?;
 
     // Inputize the coordinates
     c1.x.inputize(cs.namespace(|| "c1_x_input"))?;

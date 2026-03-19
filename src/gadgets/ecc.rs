@@ -904,6 +904,65 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
     Ok(Self { x, y })
   }
 
+  /// Subtract a point: self - other, using incomplete addition with negation
+  /// folded into the linear combination (no extra variable for -other.y).
+  /// Assumes self != other and self != -other.
+  pub fn sub_incomplete<CS>(&self, mut cs: CS, other: &Self) -> Result<Self, SynthesisError>
+  where
+    CS: ConstraintSystem<E::Base>,
+  {
+    // lambda = (-other.y - self.y) / (other.x - self.x)
+    let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
+      let other_x = other.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      if other_x == self_x {
+        Ok(E::Base::ONE)
+      } else {
+        let other_y = other.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        Ok((-other_y - self_y) * (other_x - self_x).invert().unwrap())
+      }
+    })?;
+    // Constraint: lambda * (other.x - self.x) = -other.y - self.y
+    cs.enforce(
+      || "Check that lambda is computed correctly",
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + other.x.get_variable() - self.x.get_variable(),
+      |lc| lc - other.y.get_variable() - self.y.get_variable(),
+    );
+
+    // x = lambda² - self.x - other.x
+    let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
+      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let other_x = other.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      Ok(lambda_val * lambda_val - self_x - other_x)
+    })?;
+    cs.enforce(
+      || "check that x is correct",
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + x.get_variable() + self.x.get_variable() + other.x.get_variable(),
+    );
+
+    // y = lambda * (self.x - x) - self.y
+    let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
+      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let x_val = x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      Ok(lambda_val * (self_x - x_val) - self_y)
+    })?;
+    cs.enforce(
+      || "Check that y is correct",
+      |lc| lc + lambda.get_variable(),
+      |lc| lc + self.x.get_variable() - x.get_variable(),
+      |lc| lc + y.get_variable() + self.y.get_variable(),
+    );
+
+    Ok(Self { x, y })
+  }
+
   /// doubles the point; since this is called with a point not at infinity, it is guaranteed to be not infinity
   pub fn double_incomplete<CS: ConstraintSystem<E::Base>>(
     &self,
@@ -1106,5 +1165,59 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
     );
 
     Ok(())
+  }
+
+  /// Scalar multiplication optimized for known non-infinity points.
+  ///
+  /// Compared to `AllocatedPoint::scalar_mul`, this method:
+  /// - Uses incomplete addition for ALL bits (no complete tail)
+  /// - Skips infinity handling (no default point / conditional select at end)
+  /// - Uses incomplete addition for slack removal
+  ///
+  /// These are safe when the base point is known to never be infinity
+  /// and the scalar is a random field element (as in re-encryption).
+  pub fn scalar_mul_non_infinity<CS: ConstraintSystem<E::Base>>(
+    &self,
+    mut cs: CS,
+    scalar_bits: &[AllocatedBit],
+  ) -> Result<Self, SynthesisError> {
+    // Use ALL bits with incomplete addition (no complete tail split)
+    let mut p = self.clone();
+
+    // Assume first bit is 1: initialize acc = self, then double p
+    let mut acc = p.clone();
+    p = acc.double_incomplete(cs.namespace(|| "double"))?;
+
+    // Double-and-add loop with incomplete addition for all bits
+    // Skip the last double since the doubled value is never used after the final iteration
+    let last_idx = scalar_bits.len() - 1;
+    for (i, bit) in scalar_bits.iter().enumerate().skip(1) {
+      let temp = acc.add_incomplete(cs.namespace(|| format!("add {i}")), &p)?;
+      acc = AllocatedPointNonInfinity::conditionally_select(
+        cs.namespace(|| format!("acc_iteration_{i}")),
+        &temp,
+        &acc,
+        &Boolean::from(bit.clone()),
+      )?;
+
+      if i < last_idx {
+        p = p.double_incomplete(cs.namespace(|| format!("double {i}")))?;
+      }
+    }
+
+    // Remove the initial slack (assumption that bit[0]=1) using sub_incomplete
+    // acc_minus_initial = acc - self (3 constraints, no neg_y allocation needed)
+    let acc_minus_initial = acc.sub_incomplete(
+      cs.namespace(|| "remove slack incomplete"),
+      self,
+    )?;
+
+    // Select based on bit[0]: if bit[0]=1, keep acc; else use acc_minus_initial
+    AllocatedPointNonInfinity::conditionally_select(
+      cs.namespace(|| "remove slack if necessary"),
+      &acc,
+      &acc_minus_initial,
+      &Boolean::from(scalar_bits[0].clone()),
+    )
   }
 }

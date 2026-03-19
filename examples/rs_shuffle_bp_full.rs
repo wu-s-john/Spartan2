@@ -15,7 +15,7 @@ use std::time::Instant;
 use tracing_subscriber::prelude::*;
 
 use spartan2::{
-  gadgets::ecc::AllocatedPoint,
+  gadgets::ecc::AllocatedPointNonInfinity,
   provider::{pasta::pallas, PallasHyraxEngine, VestaHyraxEngine},
   rs_shuffle_bp::{
     data_structures::{
@@ -195,10 +195,16 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
     }
     let rand_arr: [AllocatedNum<Scalar>; N] = rand_vars.try_into().ok().unwrap();
 
-    // Allocate public key
-    let pk_var = AllocatedPoint::<ECEngine>::alloc(
+    // Allocate public key (non-infinity)
+    let pk_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
       cs.namespace(|| "pk"),
-      Some((self.pk_coords.0, self.pk_coords.1, false)),
+      Some((self.pk_coords.0, self.pk_coords.1)),
+    )?;
+
+    // Allocate generator (shared across all cards)
+    let gen_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
+      cs.namespace(|| "generator"),
+      Some(self.gen_coords),
     )?;
 
     // Re-encrypt the deck
@@ -208,7 +214,7 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       &rand_arr,
       &pk_var,
       &self._native_reencrypt_data,
-      self.gen_coords,
+      &gen_var,
     )?;
 
     Ok(())
@@ -323,9 +329,9 @@ fn main() {
   let sizes = pk.sizes();
   println!("  Constraints (unpadded): {}", sizes[0]);
   println!("  Constraints (padded):   {}", sizes[4]);
-  println!("  Variables (shared):     {}", sizes[5]);
-  println!("  Variables (precommit):  {}", sizes[6]);
-  println!("  Variables (rest):       {}", sizes[7]);
+  println!("  Variables (shared):     {} (unpadded: {})", sizes[5], sizes[1]);
+  println!("  Variables (precommit):  {} (unpadded: {})", sizes[6], sizes[2]);
+  println!("  Variables (rest):       {} (unpadded: {})", sizes[7], sizes[3]);
 
   // =========================================================================
   // Step 5: Prep Prove
