@@ -16,19 +16,18 @@ use crate::{
     r1cs::{MultiRoundSpartanWitness, MultiRoundState},
     solver::SatisfyingAssignment,
   },
+  small_field::DelayedReduction,
   errors::SpartanError,
   polys::{
     multilinear::MultilinearPolynomial,
     univariate::{CompressedUniPoly, UniPoly},
   },
   r1cs::SplitMultiRoundR1CSShape,
-  small_field::DelayedReduction,
   start_span,
   traits::{Engine, transcript::TranscriptEngineTrait},
   zk::{NeutronNovaVerifierCircuit, SpartanVerifierCircuit},
 };
 use ff::Field;
-use num_traits::Zero;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -169,7 +168,7 @@ impl<E: Engine> SumcheckProof<E> {
   /// # Returns
   /// A tuple `(eval_0, eval_2)` containing evaluations at points 0 and 2.
   #[inline]
-  fn compute_eval_points_quad(
+  pub(crate) fn compute_eval_points_quad(
     poly_A: &MultilinearPolynomial<E::Scalar>,
     poly_B: &MultilinearPolynomial<E::Scalar>,
   ) -> (E::Scalar, E::Scalar)
@@ -183,7 +182,7 @@ impl<E: Engine> SumcheckProof<E> {
     let (acc_0, acc_2) = (0..len)
       .into_par_iter()
       .fold(
-        || (Acc::<E::Scalar>::zero(), Acc::<E::Scalar>::zero()),
+        || (Acc::<E::Scalar>::default(), Acc::<E::Scalar>::default()),
         |mut acc, i| {
           let a_low = &poly_A[i];
           let a_high = &poly_A[len + i];
@@ -206,7 +205,7 @@ impl<E: Engine> SumcheckProof<E> {
         },
       )
       .reduce(
-        || (Acc::<E::Scalar>::zero(), Acc::<E::Scalar>::zero()),
+        || (Acc::<E::Scalar>::default(), Acc::<E::Scalar>::default()),
         |mut a, b| {
           a.0 += b.0;
           a.1 += b.1;
@@ -322,9 +321,9 @@ impl<E: Engine> SumcheckProof<E> {
       .fold(
         || {
           (
-            Acc::<E::Scalar>::zero(),
-            Acc::<E::Scalar>::zero(),
-            Acc::<E::Scalar>::zero(),
+            Acc::<E::Scalar>::default(),
+            Acc::<E::Scalar>::default(),
+            Acc::<E::Scalar>::default(),
           )
         },
         |mut acc, i| {
@@ -369,9 +368,9 @@ impl<E: Engine> SumcheckProof<E> {
       .reduce(
         || {
           (
-            Acc::<E::Scalar>::zero(),
-            Acc::<E::Scalar>::zero(),
-            Acc::<E::Scalar>::zero(),
+            Acc::<E::Scalar>::default(),
+            Acc::<E::Scalar>::default(),
+            Acc::<E::Scalar>::default(),
           )
         },
         |mut a, b| {
@@ -442,18 +441,18 @@ impl<E: Engine> SumcheckProof<E> {
       .fold(
         || {
           (
-            Acc::<E::Scalar>::zero(),
-            Acc::<E::Scalar>::zero(),
-            Acc::<E::Scalar>::zero(),
+            Acc::<E::Scalar>::default(),
+            Acc::<E::Scalar>::default(),
+            Acc::<E::Scalar>::default(),
           )
         },
         |mut outer_acc, i| {
           let pow_left = &pow_tau_left[i];
 
           // Inner loop: accumulate in wide limbs
-          let mut inner_0 = Acc::<E::Scalar>::zero();
-          let mut inner_2 = Acc::<E::Scalar>::zero();
-          let mut inner_3 = Acc::<E::Scalar>::zero();
+          let mut inner_0 = Acc::<E::Scalar>::default();
+          let mut inner_2 = Acc::<E::Scalar>::default();
+          let mut inner_3 = Acc::<E::Scalar>::default();
 
           for j in 0..right {
             let low = i + j * left;
@@ -528,9 +527,9 @@ impl<E: Engine> SumcheckProof<E> {
       .reduce(
         || {
           (
-            Acc::<E::Scalar>::zero(),
-            Acc::<E::Scalar>::zero(),
-            Acc::<E::Scalar>::zero(),
+            Acc::<E::Scalar>::default(),
+            Acc::<E::Scalar>::default(),
+            Acc::<E::Scalar>::default(),
           )
         },
         |mut a, b| {
@@ -1040,7 +1039,6 @@ pub(crate) mod eq_sumcheck {
     polys::multilinear::MultilinearPolynomial, small_field::DelayedReduction, traits::Engine,
   };
   use ff::{Field, PrimeField};
-  use num_traits::Zero;
   use rayon::{iter::ZipEq, prelude::*, slice::Iter};
 
   pub struct EqSumCheckInstance<E: Engine> {
@@ -1243,18 +1241,18 @@ pub(crate) mod eq_sumcheck {
           .fold(
             || {
               (
-                Acc::<E::Scalar>::zero(),
-                Acc::<E::Scalar>::zero(),
-                Acc::<E::Scalar>::zero(),
+                Acc::<E::Scalar>::default(),
+                Acc::<E::Scalar>::default(),
+                Acc::<E::Scalar>::default(),
               )
             },
             |mut outer_acc, x_out| {
               let e_out = &poly_eq_left[x_out];
 
               // Phase 1: Inner loop - accumulate E_in[x_in] ⊗ q_k(g) in wide limbs
-              let mut inner_0 = Acc::<E::Scalar>::zero();
-              let mut inner_2 = Acc::<E::Scalar>::zero();
-              let mut inner_3 = Acc::<E::Scalar>::zero();
+              let mut inner_0 = Acc::<E::Scalar>::default();
+              let mut inner_2 = Acc::<E::Scalar>::default();
+              let mut inner_3 = Acc::<E::Scalar>::default();
 
               for (x_in, e_in) in poly_eq_right.iter().enumerate() {
                 let id = (x_out << second_half) | x_in;
@@ -1314,9 +1312,9 @@ pub(crate) mod eq_sumcheck {
           .reduce(
             || {
               (
-                Acc::<E::Scalar>::zero(),
-                Acc::<E::Scalar>::zero(),
-                Acc::<E::Scalar>::zero(),
+                Acc::<E::Scalar>::default(),
+                Acc::<E::Scalar>::default(),
+                Acc::<E::Scalar>::default(),
               )
             },
             |mut a, b| {
@@ -1346,9 +1344,9 @@ pub(crate) mod eq_sumcheck {
           .fold(
             || {
               (
-                Acc::<E::Scalar>::zero(),
-                Acc::<E::Scalar>::zero(),
-                Acc::<E::Scalar>::zero(),
+                Acc::<E::Scalar>::default(),
+                Acc::<E::Scalar>::default(),
+                Acc::<E::Scalar>::default(),
               )
             },
             |mut acc, id| {
@@ -1379,9 +1377,9 @@ pub(crate) mod eq_sumcheck {
           .reduce(
             || {
               (
-                Acc::<E::Scalar>::zero(),
-                Acc::<E::Scalar>::zero(),
-                Acc::<E::Scalar>::zero(),
+                Acc::<E::Scalar>::default(),
+                Acc::<E::Scalar>::default(),
+                Acc::<E::Scalar>::default(),
               )
             },
             |mut a, b| {

@@ -30,17 +30,18 @@ use crate::{
   errors::SpartanError,
   lagrange_accumulator::{
     EqRoundFactor, LagrangeAccumulators, LagrangeBasisFactory, LagrangeCoeff, LagrangeEvals,
-    LagrangeHatEvals, SPARTAN_T_DEGREE, build_accumulators_spartan, derive_t1,
+    LagrangeHatEvals, SPARTAN_T_DEGREE, build_accumulators_inner, build_accumulators_spartan,
+    derive_t1,
   },
   polys::{eq::EqPolynomial, multilinear::MultilinearPolynomial, univariate::UniPoly},
-  small_field::{DelayedReduction, SmallValueField, WideMul},
+  small_field::{DelayedReduction, SmallValueField, WitnessValue, WideMul},
   start_span,
   sumcheck::{SumcheckProof, eq_sumcheck},
   traits::{Engine, transcript::TranscriptEngineTrait},
 };
-use ff::PrimeField;
-use num_traits::Zero;
+use ff::{Field, PrimeField};
 use rayon::prelude::*;
+use std::ops::{Add, Sub};
 use tracing::info;
 
 use crate::sumcheck::PAR_THRESHOLD;
@@ -163,9 +164,9 @@ where
 
   // Suffix-outer parallel loop: accumulators live on stack per thread
   let compute = |s: usize| -> (F, F, F) {
-    let mut acc_a = Acc::<F, SV>::zero();
-    let mut acc_b = Acc::<F, SV>::zero();
-    let mut acc_c = Acc::<F, SV>::zero();
+    let mut acc_a = Acc::<F, SV>::default();
+    let mut acc_b = Acc::<F, SV>::default();
+    let mut acc_c = Acc::<F, SV>::default();
 
     for (p, eq_p) in eq_table.iter().enumerate() {
       let idx = p * stride + s;
@@ -230,7 +231,6 @@ where
   SmallValue: WideMul
     + Copy
     + Default
-    + num_traits::Zero
     + std::ops::Add<Output = SmallValue>
     + std::ops::Sub<Output = SmallValue>
     + Send
@@ -368,6 +368,341 @@ where
   ))
 }
 
+/// Compute eval points for the quadratic sumcheck `poly_A × z` when z is a witness type.
+///
+/// For witness z, uses `DelayedReduction<W>` for eval_0 (field × witness accumulation)
+/// and field arithmetic for eval_2.
+fn compute_eval_points_quad_witness_z<E: Engine, W: WitnessValue>(
+  poly_A: &MultilinearPolynomial<E::Scalar>,
+  z: &[W],
+) -> (E::Scalar, E::Scalar)
+where
+  E::Scalar: DelayedReduction<W>,
+{
+  let len = poly_A.Z.len() / 2;
+  debug_assert_eq!(z.len(), poly_A.Z.len());
+
+  type Acc<F2, W2> = <F2 as DelayedReduction<W2>>::Accumulator;
+
+  let (acc_0, acc_2) = (0..len)
+    .into_par_iter()
+    .fold(
+      || (Acc::<E::Scalar, W>::default(), E::Scalar::ZERO),
+      |mut acc, i| {
+        let a_low = poly_A[i];
+        let z_lo = z[i];
+        let a_high = poly_A[len + i];
+        let z_hi = z[len + i];
+
+        // eval 0: field × witness accumulation
+        <E::Scalar as DelayedReduction<W>>::unreduced_multiply_accumulate(
+          &mut acc.0,
+          &a_low,
+          &z_lo,
+        );
+
+        // eval 2: a_bound × z_bound where z_bound = 2·z_hi - z_lo
+        let a_bound = a_high + a_high - a_low;
+        acc.1 += W::eval_2_contribution(z_hi, z_lo, a_bound);
+
+        acc
+      },
+    )
+    .reduce(
+      || (Acc::<E::Scalar, W>::default(), E::Scalar::ZERO),
+      |mut a, b| {
+        a.0 += b.0;
+        a.1 += b.1;
+        a
+      },
+    );
+
+  (<E::Scalar as DelayedReduction<W>>::reduce(&acc_0), acc_2)
+}
+
+/// Bind a witness z polynomial with challenge r, producing field elements.
+///
+/// Standard linear interpolation: z_bound[i] = z_lo[i] * (1-r) + z_hi[i] * r.
+/// Binary witness types (e.g. bool) use a fast path with no field multiplies.
+fn bind_witness_z<F: PrimeField, W: WitnessValue>(z: &[W], r: &F) -> Vec<F> {
+  let len = z.len() / 2;
+  let one_minus_r = F::ONE - *r;
+
+  let compute = |i: usize| -> F {
+    W::bind_lo_hi(z[i], z[len + i], *r, one_minus_r)
+  };
+
+  if len >= PAR_THRESHOLD {
+    (0..len).into_par_iter().map(compute).collect()
+  } else {
+    (0..len).map(compute).collect()
+  }
+}
+
+/// Prove a quadratic sumcheck `poly_A × z` where z is a witness type.
+///
+/// Round 0 uses `compute_eval_points_quad_witness_z` (optimized for witness types),
+/// then `bind_witness_z` to convert z to field elements. Rounds 1+ use
+/// standard `compute_eval_points_quad` with delayed reduction.
+pub fn prove_quad_with_witness_z<E: Engine, W: WitnessValue>(
+  claim: &E::Scalar,
+  num_rounds: usize,
+  poly_A: &mut MultilinearPolynomial<E::Scalar>,
+  z: &[W],
+  transcript: &mut E::TE,
+) -> Result<(SumcheckProof<E>, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
+where
+  E::Scalar: DelayedReduction<W> + DelayedReduction<E::Scalar>,
+{
+  let mut r: Vec<E::Scalar> = Vec::with_capacity(num_rounds);
+  let mut polys: Vec<crate::polys::univariate::CompressedUniPoly<E::Scalar>> =
+    Vec::with_capacity(num_rounds);
+  let mut claim_per_round = *claim;
+
+  // === Round 0: witness z fast path ===
+  let (eval_point_0, eval_point_2) =
+    compute_eval_points_quad_witness_z::<E, W>(poly_A, z);
+
+  let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
+  let poly = UniPoly::from_evals(&evals)?;
+
+  transcript.absorb(b"p", &poly);
+  let r_0 = transcript.squeeze(b"c")?;
+  r.push(r_0);
+  polys.push(poly.compress());
+  claim_per_round = poly.evaluate(&r_0);
+
+  // Bind: witness z → field, poly_A standard bind
+  let poly_B_vec = bind_witness_z(z, &r_0);
+  let mut poly_B = MultilinearPolynomial::new(poly_B_vec);
+  poly_A.bind_poly_var_top(&r_0);
+
+  // === Rounds 1..num_rounds: standard quad sumcheck ===
+  for round in 1..num_rounds {
+    let (_round_span, round_t) = start_span!("sumcheck_quad_round", round = round);
+
+    let poly = {
+      let (eval_point_0, eval_point_2) =
+        SumcheckProof::<E>::compute_eval_points_quad(poly_A, &poly_B);
+
+      let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
+      UniPoly::from_evals(&evals)?
+    };
+
+    transcript.absorb(b"p", &poly);
+    let r_i = transcript.squeeze(b"c")?;
+    r.push(r_i);
+    polys.push(poly.compress());
+    claim_per_round = poly.evaluate(&r_i);
+
+    let (_bind_span, bind_t) = start_span!("bind_poly_vars_quad");
+    rayon::join(
+      || poly_A.bind_poly_var_top(&r_i),
+      || poly_B.bind_poly_var_top(&r_i),
+    );
+    info!(elapsed_ms = %bind_t.elapsed().as_millis(), "bind_poly_vars_quad");
+    info!(elapsed_ms = %round_t.elapsed().as_millis(), round = round, "sumcheck_quad_round");
+  }
+
+  Ok((
+    SumcheckProof::new(polys),
+    r,
+    vec![poly_A[0], poly_B[0]],
+  ))
+}
+
+/// Batch-bind l0 top variables of M̃ (field) and z (witness) using eq-weighted accumulation.
+///
+/// Computes: `out[s] = Σ_{p ∈ {0,1}^l0} eq(challenges, p) · input[p * stride + s]`
+/// for both M̃ and z in one pass using delayed reduction.
+fn bind_inner_polys_batched<F, W>(
+  poly_M: &MultilinearPolynomial<F>,
+  z: &[W],
+  challenges: &[F],
+) -> (MultilinearPolynomial<F>, MultilinearPolynomial<F>)
+where
+  F: PrimeField + DelayedReduction<W> + DelayedReduction<F>,
+  W: WitnessValue + Send + Sync,
+{
+  let l0 = challenges.len();
+  let n = poly_M.Z.len();
+  debug_assert_eq!(z.len(), n);
+  debug_assert_eq!(n % (1 << l0), 0);
+
+  let stride = n >> l0;
+
+  // Precompute eq(challenges, p) for all p ∈ {0,1}^l0
+  let eq_table = EqPolynomial::evals_from_points(challenges);
+
+  type AccF<F2> = <F2 as DelayedReduction<F2>>::Accumulator;
+  type AccW<F2, W2> = <F2 as DelayedReduction<W2>>::Accumulator;
+
+  let compute = |s: usize| -> (F, F) {
+    let mut acc_m = AccF::<F>::default();
+    let mut acc_z = AccW::<F, W>::default();
+
+    for (p, eq_p) in eq_table.iter().enumerate() {
+      let idx = p * stride + s;
+      F::unreduced_multiply_accumulate(&mut acc_m, eq_p, &poly_M.Z[idx]);
+      <F as DelayedReduction<W>>::unreduced_multiply_accumulate(&mut acc_z, eq_p, &z[idx]);
+    }
+
+    (
+      <F as DelayedReduction<F>>::reduce(&acc_m),
+      <F as DelayedReduction<W>>::reduce(&acc_z),
+    )
+  };
+
+  let results: Vec<(F, F)> = if stride >= PAR_THRESHOLD {
+    (0..stride).into_par_iter().map(compute).collect()
+  } else {
+    (0..stride).map(compute).collect()
+  };
+
+  let mut out_m = Vec::with_capacity(stride);
+  let mut out_z = Vec::with_capacity(stride);
+  for (m, z) in results {
+    out_m.push(m);
+    out_z.push(z);
+  }
+
+  (
+    MultilinearPolynomial::new(out_m),
+    MultilinearPolynomial::new(out_z),
+  )
+}
+
+/// Prove a quadratic sumcheck `M̃(y) · z(y)` using Lagrange accumulators for
+/// the first l0 rounds, then standard quadratic sumcheck for the rest.
+///
+/// This is the inner sumcheck optimization. Unlike the outer sumcheck:
+/// - No eq(τ,y) factor → round polynomial is degree 2 (not 3)
+/// - M̃ is field-valued, z is witness-valued
+/// - All betas contribute (no R1CS identity shortcut)
+///
+/// # Arguments
+/// * `claim` - The claimed sum
+/// * `num_rounds` - Total number of sumcheck rounds
+/// * `poly_M` - Field-valued multilinear polynomial (from bind_row_vars_combined_int)
+/// * `z` - Witness values
+/// * `l0` - Number of small-value rounds (typically 3-4)
+/// * `transcript` - Fiat-Shamir transcript
+pub fn prove_quad_small_value<E: Engine, W>(
+  claim: &E::Scalar,
+  num_rounds: usize,
+  poly_M: &mut MultilinearPolynomial<E::Scalar>,
+  z: &[W],
+  l0: usize,
+  transcript: &mut E::TE,
+) -> Result<(SumcheckProof<E>, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
+where
+  W: WitnessValue + Send + Sync,
+  W::Extended: Copy + Default + Add<Output = W::Extended> + Sub<Output = W::Extended> + Send + Sync,
+  E::Scalar: DelayedReduction<W> + DelayedReduction<W::Extended> + DelayedReduction<E::Scalar>,
+{
+  let mut r: Vec<E::Scalar> = Vec::with_capacity(num_rounds);
+  let mut polys: Vec<crate::polys::univariate::CompressedUniPoly<E::Scalar>> =
+    Vec::with_capacity(num_rounds);
+  let mut claim_per_round = *claim;
+
+  // Clamp l0: must leave at least 1 round for the standard phase
+  let l0 = std::cmp::min(l0, num_rounds.saturating_sub(1));
+
+  if l0 == 0 {
+    // Fall back to prove_quad_with_witness_z (round 0 witness + standard)
+    return prove_quad_with_witness_z::<E, W>(claim, num_rounds, poly_M, z, transcript);
+  }
+
+  // ===== Pre-computation: build accumulators =====
+  let (_acc_span, acc_t) = start_span!("build_accumulators_inner");
+  let accumulators = build_accumulators_inner(poly_M, z, l0);
+  info!(elapsed_ms = %acc_t.elapsed().as_millis(), "build_accumulators_inner");
+
+  let basis_factory =
+    LagrangeBasisFactory::<E::Scalar, SPARTAN_T_DEGREE>::new(|i| E::Scalar::from(i as u64));
+  let mut coeff = LagrangeCoeff::<E::Scalar, SPARTAN_T_DEGREE>::new();
+
+  // ===== Small-value rounds (0 to l0-1) =====
+  // No eq factor: round polynomial is directly t_i(X) (degree 2)
+  #[allow(clippy::needless_range_loop)]
+  for round in 0..l0 {
+    let (_round_span, round_t) = start_span!("inner_smallvalue_round", round = round);
+
+    // Get t_i evaluations from accumulators
+    let t_all = accumulators.round(round).eval_t_all_u(&coeff);
+    let t_inf = t_all.at_infinity();
+    let t0 = t_all.at_zero();
+
+    // t(1) = claim - t(0) (since s(0) + s(1) = claim and s = t, no eq factor)
+    let t1 = claim_per_round - t0;
+
+    // Build degree-2 polynomial from evaluations at 0, 1, 2
+    // t(X) = aX² + bX + c where a = t(∞), c = t(0), b = t(1) - a - c
+    let a = t_inf;
+    let c = t0;
+    let b = t1 - a - c;
+    // eval at 2: 4a + 2b + c
+    let eval_2 = a.double().double() + b.double() + c;
+
+    let evals = vec![t0, t1, eval_2];
+    let poly = UniPoly::from_evals(&evals)?;
+
+    // Transcript interaction
+    transcript.absorb(b"p", &poly);
+    let r_i = transcript.squeeze(b"c")?;
+    r.push(r_i);
+    polys.push(poly.compress());
+    claim_per_round = poly.evaluate(&r_i);
+
+    // Advance Lagrange coefficient state
+    coeff.extend(&basis_factory.basis_at(r_i));
+
+    info!(
+      elapsed_ms = %round_t.elapsed().as_millis(),
+      round = round,
+      "inner_smallvalue_round"
+    );
+  }
+
+  // ===== Transition: bind M̃ and z by l0 challenges =====
+  let (_bind_span, bind_t) = start_span!("bind_inner_transition");
+  let (mut poly_M_bound, mut poly_z_bound) =
+    bind_inner_polys_batched(poly_M, z, &r[..l0]);
+  info!(elapsed_ms = %bind_t.elapsed().as_millis(), "bind_inner_transition");
+
+  // ===== Remaining rounds (l0 to num_rounds-1): standard quadratic =====
+  for round in l0..num_rounds {
+    let (_round_span, round_t) = start_span!("inner_quad_round", round = round);
+
+    let poly = {
+      let (eval_point_0, eval_point_2) =
+        SumcheckProof::<E>::compute_eval_points_quad(&poly_M_bound, &poly_z_bound);
+      let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
+      UniPoly::from_evals(&evals)?
+    };
+
+    transcript.absorb(b"p", &poly);
+    let r_i = transcript.squeeze(b"c")?;
+    r.push(r_i);
+    polys.push(poly.compress());
+    claim_per_round = poly.evaluate(&r_i);
+
+    let (_bind_span, bind_t) = start_span!("bind_poly_vars_quad");
+    rayon::join(
+      || poly_M_bound.bind_poly_var_top(&r_i),
+      || poly_z_bound.bind_poly_var_top(&r_i),
+    );
+    info!(elapsed_ms = %bind_t.elapsed().as_millis(), "bind_poly_vars_quad");
+    info!(elapsed_ms = %round_t.elapsed().as_millis(), round = round, "inner_quad_round");
+  }
+
+  Ok((
+    SumcheckProof::new(polys),
+    r,
+    vec![poly_M_bound[0], poly_z_bound[0]],
+  ))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -394,7 +729,6 @@ mod tests {
     V: WideMul
       + Copy
       + Default
-      + num_traits::Zero
       + Add<Output = V>
       + Sub<Output = V>
       + Mul<Output = V>
@@ -721,5 +1055,122 @@ mod tests {
 
     // Test BatchingEq<21> (i64 path)
     run_sha256_equivalence_test(preimage_len, true);
+  }
+
+  // ===== Inner sumcheck (prove_quad_small_value) tests =====
+
+  /// Test that prove_quad_small_value produces identical output to prove_quad_with_witness_z.
+  ///
+  /// Generates random M̃ (field) and z (binary), computes claim = Σ M̃(y) · z(y),
+  /// and verifies both methods produce the same proof, challenges, and evaluations.
+  #[test]
+  fn test_inner_sumcheck_small_value_equivalence() {
+    const NUM_VARS: usize = 8;
+    let n = 1usize << NUM_VARS;
+
+    // Generate deterministic M̃ (field) and z (binary)
+    let poly_M_vals: Vec<F> = (0..n).map(|i| F::from((i * 7 + 3) as u64)).collect();
+    let z_bool: Vec<bool> = (0..n).map(|i| ((i * 13 + 5) % 2) != 0).collect();
+
+    // Compute claim = Σ M̃(y) · z(y)
+    let claim: F = poly_M_vals
+      .iter()
+      .zip(z_bool.iter())
+      .map(|(&m, &z)| if z { m } else { F::ZERO })
+      .sum();
+
+    // Run prove_quad_with_witness_z (reference)
+    let mut transcript1 = <E as Engine>::TE::new(b"test_inner");
+    let mut poly_M1 = MultilinearPolynomial::new(poly_M_vals.clone());
+    let (proof1, r1, evals1) = prove_quad_with_witness_z::<E, bool>(
+      &claim,
+      NUM_VARS,
+      &mut poly_M1,
+      &z_bool,
+      &mut transcript1,
+    )
+    .expect("witness_z prove should succeed");
+
+    // Run prove_quad_small_value
+    let mut transcript2 = <E as Engine>::TE::new(b"test_inner");
+    let mut poly_M2 = MultilinearPolynomial::new(poly_M_vals);
+    let (proof2, r2, evals2) = prove_quad_small_value::<E, bool>(
+      &claim,
+      NUM_VARS,
+      &mut poly_M2,
+      &z_bool,
+      3, // l0 = 3
+      &mut transcript2,
+    )
+    .expect("small_value prove should succeed");
+
+    assert_eq!(r1, r2, "challenges must match");
+    assert_eq!(proof1, proof2, "proofs must match");
+    assert_eq!(evals1, evals2, "final evals must match");
+  }
+
+  /// Test inner sumcheck accumulator correctness against naive direct evaluation.
+  #[test]
+  fn test_build_accumulators_inner_matches_direct() {
+    use crate::lagrange_accumulator::{LagrangeCoeff, build_accumulators_inner};
+
+    const NUM_VARS: usize = 6;
+    const L0: usize = 3;
+    let n = 1usize << NUM_VARS;
+
+    // Generate deterministic M̃ (field) and z (binary)
+    let poly_M_vals: Vec<F> = (0..n).map(|i| F::from((i * 11 + 7) as u64)).collect();
+    let z_bool: Vec<bool> = (0..n).map(|i| ((i * 3 + 1) % 2) != 0).collect();
+
+    let poly_M = MultilinearPolynomial::new(poly_M_vals.clone());
+
+    // Build accumulators using our optimized function
+    let acc = build_accumulators_inner(&poly_M, &z_bool, L0);
+
+    // Verify claim = Σ M̃(y) · z(y) by checking round 0
+    let claim: F = poly_M_vals
+      .iter()
+      .zip(z_bool.iter())
+      .map(|(&m, &z)| if z { m } else { F::ZERO })
+      .sum();
+
+    // Round 0: coeff = [1], t(0) + t(1) should equal claim
+    let coeff = LagrangeCoeff::<F, 2>::new();
+    let t_all = acc.round(0).eval_t_all_u(&coeff);
+    let t0 = t_all.at_zero();
+    let t_inf = t_all.at_infinity();
+
+    // Verify t(0) + t(1) = claim where t(1) = claim - t(0)
+    // This is trivially true by construction, but verify t_inf is non-trivial
+    assert!(
+      t0 != F::ZERO || t_inf != F::ZERO,
+      "accumulators should have non-trivial values"
+    );
+
+    // Verify consistency: run the full protocol and check it matches
+    let mut transcript1 = <E as Engine>::TE::new(b"test_acc");
+    let mut poly_M1 = MultilinearPolynomial::new(poly_M_vals.clone());
+    let (proof, _r, _evals) = prove_quad_small_value::<E, bool>(
+      &claim,
+      NUM_VARS,
+      &mut poly_M1,
+      &z_bool,
+      L0,
+      &mut transcript1,
+    )
+    .expect("prove should succeed");
+
+    // Verify the proof
+    let mut transcript_v = <E as Engine>::TE::new(b"test_acc");
+    let (final_claim, r_v) = proof
+      .verify(claim, NUM_VARS, 2, &mut transcript_v)
+      .expect("verification should succeed");
+
+    // Evaluate M̃ and z at r_v to check final claim
+    let eq_evals = EqPolynomial::evals_from_points(&r_v);
+    let m_eval: F = eq_evals.iter().zip(poly_M_vals.iter()).map(|(&e, &m)| e * m).sum();
+    let z_field: Vec<F> = z_bool.iter().map(|&z| F::from(z as u64)).collect();
+    let z_eval: F = eq_evals.iter().zip(z_field.iter()).map(|(&e, &z)| e * z).sum();
+    assert_eq!(final_claim, m_eval * z_eval, "final claim should match M̃(r) · z(r)");
   }
 }

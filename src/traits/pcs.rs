@@ -8,6 +8,7 @@
 //! We require the commitment engine to provide a commitment to vectors with a single group element
 use crate::{
   errors::SpartanError,
+  small_field::{DelayedReduction, WitnessValue},
   traits::{Engine, TranscriptReprTrait},
 };
 use core::fmt::Debug;
@@ -63,6 +64,14 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
     is_small: bool,
   ) -> Result<Self::Commitment, SpartanError>;
 
+  /// Commits to a witness vector using the witness type's MSM implementation.
+  /// Works for both bool (conditional add) and i8 (signed small MSM) witnesses.
+  fn commit_witness<W: WitnessValue>(
+    ck: &Self::CommitmentKey,
+    v: &[W],
+    r: &Self::Blind,
+  ) -> Result<Self::Commitment, SpartanError>;
+
   /// Checks if the provided commitment commits to a vector of the specified length
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError>;
 
@@ -109,6 +118,22 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
     comm_eval: &Self::Commitment,
     blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError>;
+
+  /// Proves evaluation of a witness polynomial using generic binding.
+  /// Works for both bool and i8 witnesses via `WitnessValue` + `DelayedReduction`.
+  fn prove_witness<W: WitnessValue>(
+    ck: &Self::CommitmentKey,
+    ck_eval: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    comm: &Self::Commitment,
+    poly: &[W],
+    blind: &Self::Blind,
+    point: &[E::Scalar],
+    comm_eval: &Self::Commitment,
+    blind_eval: &Self::Blind,
+  ) -> Result<Self::EvaluationArgument, SpartanError>
+  where
+    E::Scalar: DelayedReduction<W>;
 
   /// A method to verify the purported evaluation of a multilinear polynomials
   fn verify(

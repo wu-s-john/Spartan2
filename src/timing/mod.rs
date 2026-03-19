@@ -112,15 +112,30 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for TimingLayer {
 
 /// Extract timing values for the given phases from collected data.
 /// Returns a map keyed by short_name for easier access.
+/// Special entries:
+/// - `"__computed_total__"`: computed as the sum of all real span phases
+/// - `"__prep__"`, `"__prove__"`: wall-clock times, looked up in the map but NOT summed into total
 pub fn snapshot_timings(
   data: &TimingData,
   phases: &[(&str, &'static str)],
 ) -> HashMap<&'static str, u64> {
   let map = data.lock().unwrap();
-  phases
-    .iter()
-    .map(|(phase, short_name)| (*short_name, map.get(*phase).copied().unwrap_or(0)))
-    .collect()
+  let mut result = HashMap::new();
+  let mut sum: u64 = 0;
+  for (phase, short_name) in phases {
+    if *phase == "__computed_total__" {
+      result.insert(*short_name, sum);
+    } else if phase.starts_with("__") {
+      // Wall-clock entries (e.g. __prep__, __prove__) — lookup but don't sum
+      let v = map.get(*phase).copied().unwrap_or(0);
+      result.insert(*short_name, v);
+    } else {
+      let v = map.get(*phase).copied().unwrap_or(0);
+      sum += v;
+      result.insert(*short_name, v);
+    }
+  }
+  result
 }
 
 /// Clear all collected timing data.
@@ -170,6 +185,8 @@ pub fn collect_timings(
 // ============================================================================
 
 /// Spartan prove phases: (tracing_name, short_display_name).
+/// `"__computed_total__"` is a computed sum of all preceding phases (not a span).
+/// `"__prep__"` and `"__prove__"` are wall-clock times injected by the benchmark.
 pub const SPARTAN_PHASES: &[(&str, &str)] = &[
   ("precommitted_witness_synthesize", "synth_pre"),
   ("commit_witness_precommitted", "commit_pre"),
@@ -183,7 +200,9 @@ pub const SPARTAN_PHASES: &[(&str, &str)] = &[
   ("prepare_poly_z", "poly_z"),
   ("inner_sumcheck", "inner_sc"),
   ("pcs_prove", "pcs"),
-  ("spartan_snark_prove", "prove_total"),
+  ("__prep__", "prep"),
+  ("__prove__", "prove"),
+  ("__computed_total__", "total"),
 ];
 
 // ============================================================================
@@ -201,6 +220,35 @@ pub const NEUTRONNOVA_PHASES: &[(&str, &str)] = &[
   ("fold_instances", "fold_U"),
   ("nifs_prove", "nifs_prove"),
   ("end_to_end_total", "end_to_end"),
+];
+
+// ============================================================================
+// Spartan ZK prove-phase constants
+// ============================================================================
+
+/// Spartan ZK prove phases: (tracing_name, short_display_name).
+pub const SPARTAN_ZK_PHASES: &[(&str, &str)] = &[
+  // Prep phases
+  ("shared_witness_synthesize", "shared_syn"),
+  ("commit_witness_shared", "commit_shared"),
+  ("precommitted_witness_synthesize", "precom_syn"),
+  ("commit_witness_precommitted", "commit_pre"),
+  // Prove phases
+  ("rerandomize_prep_state", "rerand"),
+  ("r1cs_instance_and_witness", "r1cs_inst"),
+  ("circuit_synthesize_rest", "synth_rest"),
+  ("commit_witness_rest", "commit_rest"),
+  ("sample_taus", "taus"),
+  ("matrix_vector_multiply", "mat_vec"),
+  ("prepare_multilinear_polys", "prep_mle"),
+  ("outer_sumcheck", "outer_sc"),
+  ("compute_eval_rx", "eval_rx"),
+  ("compute_eval_table_sparse", "eval_sparse"),
+  ("prepare_poly_z", "poly_z"),
+  ("inner_sumcheck", "inner_sc"),
+  ("finalize_and_nifs", "nifs"),
+  ("pcs_prove", "pcs"),
+  ("spartan_zk_prove", "prove_total"),
 ];
 
 /// NeutronNova full ZkSNARK prove phases: (tracing_name, short_display_name).

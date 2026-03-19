@@ -13,6 +13,8 @@ keywords = ["zkSNARKs", "cryptography", "proofs"]
 [dependencies]
 bellpepper-core = "0.4.0"
 bellpepper = "0.4.0"
+bellpepper-keccak = { git = "https://github.com/lurk-lab/bellpepper-gadgets", branch = "main" }
+bellpepper-uint64 = { git = "https://github.com/lurk-lab/bellpepper-gadgets", branch = "main" }
 ff = { version = "0.13.0", features = ["derive"] }
 digest = "0.10"
 sha3 = "0.10"
@@ -39,6 +41,30 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
 tikv-jemallocator = { version = "0.6.0", optional = true }
 clap = { version = "4", features = ["derive"] }
 
+# ============================================================================
+# Arkworks Dependencies (for RS Shuffle Gadget)
+# Using stable 0.5.x crates.io versions with vanilla R1CS
+# ============================================================================
+
+# Core algebra crates
+ark-ff = { version = "0.5", default-features = false, features = ["std", "asm"] }
+ark-ec = { version = "0.5", default-features = false, features = ["std"] }
+ark-serialize = { version = "0.5", default-features = false, features = ["std", "derive"] }
+ark-std = { version = "0.5", default-features = false, features = ["std"] }
+
+# SNARK/R1CS libraries (vanilla R1CS)
+ark-snark = { version = "0.5", default-features = false }
+ark-groth16 = { version = "0.5", default-features = false, features = ["std"] }
+ark-relations = { version = "0.5", default-features = false, features = ["std"] }
+ark-r1cs-std = { version = "0.5", default-features = false, features = ["std"] }
+
+# Crypto primitives (Poseidon sponge with R1CS constraints)
+ark-crypto-primitives = { version = "0.5", default-features = false, features = ["std", "sponge", "r1cs"] }
+
+# Curve implementations
+ark-bn254 = { version = "0.5", default-features = false, features = ["std", "curve"] }
+ark-grumpkin = { version = "0.5", default-features = false, features = ["std"] }
+
 [target.wasm32-unknown-unknown.dependencies]
 # see https://github.com/rust-random/rand/pull/948
 getrandom = { version = "0.2.0", default-features = false, features = ["js"] }
@@ -49,7 +75,11 @@ hex = "0.4.3"
 cfg-if = "1.0.0"
 sha2 = "0.10.7"
 proptest = "1.2.0"
+criterion = { version = "0.5", features = ["html_reports"] }
 
+[[bench]]
+name = "sha256"
+harness = false
 
 [features]
 default = []

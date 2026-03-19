@@ -16,15 +16,17 @@ pub(crate) mod barrett;
 mod delayed_reduction;
 pub(crate) mod field_reduction_constants;
 pub(crate) mod limbs;
-pub(crate) mod montgomery;
+pub mod montgomery;
 mod small_value_field;
 mod wide_mul;
+mod witness_value;
 
 // Public exports
 pub use delayed_reduction::DelayedReduction;
 pub use limbs::{SignedWideLimbs, SubMagResult, WideLimbs, sub_mag};
 pub use small_value_field::{SmallValueField, i64_to_field, try_field_to_i64};
 pub use wide_mul::WideMul;
+pub use witness_value::WitnessValue;
 
 use crate::errors::SpartanError;
 use num_traits::{Bounded, One, Signed};

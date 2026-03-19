@@ -39,6 +39,24 @@ impl WideMul for i64 {
   }
 }
 
+impl WideMul for i8 {
+  type Product = i16;
+
+  #[inline(always)]
+  fn wide_mul(a: i8, b: i8) -> i16 {
+    (a as i16) * (b as i16)
+  }
+}
+
+impl WideMul for bool {
+  type Product = i32;
+
+  #[inline(always)]
+  fn wide_mul(a: bool, b: bool) -> i32 {
+    (a as i32) * (b as i32)
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

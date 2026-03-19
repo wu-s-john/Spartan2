@@ -321,6 +321,52 @@ pub(super) fn mul_3x4_lo4(a: &[u64; 3], b: &[u64; 4]) -> [u64; 4] {
   result
 }
 
+/// Multiply 2-limb by 5-limb, producing all 7 limbs.
+///
+/// Used in 5-limb Barrett reduction: q1 (2 limbs) × μ (5 limbs) → q2 (7 limbs).
+/// Saves ~5 multiplications vs the 3×5 path (which wastes a row multiplying by 0).
+#[inline(always)]
+pub(super) fn mul_2x5_to_7(a: &[u64; 2], b: &[u64; 5]) -> [u64; 7] {
+  let mut result = [0u64; 7];
+  for i in 0..2 {
+    let mut carry = 0u128;
+    for j in 0..5 {
+      let prod = (a[i] as u128) * (b[j] as u128) + (result[i + j] as u128) + carry;
+      result[i + j] = prod as u64;
+      carry = prod >> 64;
+    }
+    result[i + 5] = carry as u64;
+  }
+  result
+}
+
+/// Multiply 2-limb by 4-limb, returning only low 4 limbs.
+///
+/// Used in 5-limb Barrett reduction: q3 (2 limbs) × p (4 limbs) → t (low 4 limbs).
+/// Saves ~3 multiplications vs the 3×4 path.
+#[inline(always)]
+pub(super) fn mul_2x4_lo4(a: &[u64; 2], b: &[u64; 4]) -> [u64; 4] {
+  let mut result = [0u64; 4];
+
+  // a[0] * b[0..4] → contributes to limbs 0-3
+  let mut carry = 0u128;
+  for j in 0..4 {
+    let prod = (a[0] as u128) * (b[j] as u128) + carry;
+    result[j] = prod as u64;
+    carry = prod >> 64;
+  }
+
+  // a[1] * b[0..3] → contributes to limbs 1-3
+  carry = 0;
+  for j in 0..3 {
+    let prod = (a[1] as u128) * (b[j] as u128) + (result[1 + j] as u128) + carry;
+    result[1 + j] = prod as u64;
+    carry = prod >> 64;
+  }
+
+  result
+}
+
 // ============================================================================
 // Limb subtraction operations
 // ============================================================================

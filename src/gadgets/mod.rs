@@ -18,14 +18,29 @@
 //! - [`SmallUInt32`]: 32-bit unsigned integer with bit operations
 //! - [`small_sha256`]: SHA-256 function using small-value compatible gadgets
 //! - [`CubicChainCircuit`]: Parameterized circuit for testing with varying round counts
+//! - [`ecc`]: Elliptic curve gadgets (AllocatedPoint, scalar multiplication)
+//! - [`utils`]: Utility gadgets (conditional select, equality checks)
 
 mod addmany;
 mod cubic_chain;
+pub mod ecc;
+pub mod small_boolean;
+mod small_keccak;
 mod small_multi_eq;
 mod small_sha256;
 mod small_uint32;
+pub mod utils;
 
 pub use cubic_chain::CubicChainCircuit;
+pub use ecc::{AllocatedPoint, AllocatedPointNonInfinity};
+pub use small_boolean::{SmallBit, SmallBoolean};
+pub use small_keccak::small_keccak256;
 pub use small_multi_eq::{BatchingEq, NoBatchEq, SmallMultiEq};
-pub use small_sha256::{small_sha256, small_sha256_with_prefix, small_sha256_with_small_multi_eq};
+pub use small_sha256::{
+  small_sha256,
+  small_sha256_int,
+  small_sha256_int_with_prefix,
+  small_sha256_with_prefix,
+  small_sha256_with_small_multi_eq,
+};
 pub use small_uint32::SmallUInt32;

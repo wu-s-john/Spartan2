@@ -14,7 +14,7 @@ pub mod pcs;
 pub mod pt256;
 pub mod traits;
 
-mod msm;
+pub(crate) mod msm;
 
 use crate::{
   provider::{

@@ -17,8 +17,8 @@ use crate::{
   CommitmentKey,
   bellpepper::{
     r1cs::{
-      MultiRoundSpartanShape, MultiRoundSpartanWitness, PrecommittedState, RerandomizationTrait,
-      SpartanShape, SpartanWitness,
+      MultiRoundSpartanShape, MultiRoundSpartanWitness, RerandomizationTrait, SpartanShape,
+      SpartanWitness,
     },
     shape_cs::ShapeCS,
     solver::SatisfyingAssignment,
@@ -220,7 +220,7 @@ where
   (0..dim)
     .into_par_iter()
     .map(|j| {
-      let mut acc = <F as DelayedReduction<SV>>::Accumulator::zero();
+      let mut acc = <F as DelayedReduction<SV>>::Accumulator::default();
       for (i, wi) in weights.iter().enumerate() {
         <F as DelayedReduction<SV>>::unreduced_multiply_accumulate(&mut acc, wi, &vectors[i][j]);
       }
@@ -317,7 +317,7 @@ where
   (0..num_cons)
     .into_par_iter()
     .map(|k| {
-      let mut acc = <E::Scalar as DelayedReduction<SV>>::Accumulator::zero();
+      let mut acc = <E::Scalar as DelayedReduction<SV>>::Accumulator::default();
       for i in 0..n_inst {
         // Single-value accumulation (field × small with delayed reduction)
         <E::Scalar as DelayedReduction<SV>>::unreduced_multiply_accumulate(
@@ -349,7 +349,7 @@ where
 
       (0..dim)
         .map(|j| {
-          let mut acc = <F as DelayedReduction<F>>::Accumulator::zero();
+          let mut acc = <F as DelayedReduction<F>>::Accumulator::default();
           <F as DelayedReduction<F>>::unreduced_multiply_accumulate(&mut acc, &one_minus_r, &lo[j]);
           <F as DelayedReduction<F>>::unreduced_multiply_accumulate(&mut acc, &r, &hi[j]);
           <F as DelayedReduction<F>>::reduce(&acc)
@@ -380,7 +380,7 @@ where
       // Fold witness vectors with DMR
       let W_folded: Vec<E::Scalar> = (0..dim)
         .map(|j| {
-          let mut acc = <E::Scalar as DelayedReduction<E::Scalar>>::Accumulator::zero();
+          let mut acc = <E::Scalar as DelayedReduction<E::Scalar>>::Accumulator::default();
           <E::Scalar as DelayedReduction<E::Scalar>>::unreduced_multiply_accumulate(
             &mut acc,
             &one_minus_r,
@@ -530,11 +530,11 @@ where
     let (acc_e0, acc_quad) = (0..right)
       .into_par_iter()
       .fold(
-        || (Acc::<E::Scalar>::zero(), Acc::<E::Scalar>::zero()),
+        || (Acc::<E::Scalar>::default(), Acc::<E::Scalar>::default()),
         |mut middle_acc, i| {
           // Inner level: accumulate over j (0..left) - NO reductions in this loop!
-          let mut inner_e0 = Acc::<E::Scalar>::zero();
-          let mut inner_quad = Acc::<E::Scalar>::zero();
+          let mut inner_e0 = Acc::<E::Scalar>::default();
+          let mut inner_quad = Acc::<E::Scalar>::default();
 
           for (j, e_j) in e[..left].iter().enumerate() {
             let k = i * left + j;
@@ -581,7 +581,7 @@ where
         },
       )
       .reduce(
-        || (Acc::<E::Scalar>::zero(), Acc::<E::Scalar>::zero()),
+        || (Acc::<E::Scalar>::default(), Acc::<E::Scalar>::default()),
         |mut a, b| {
           a.0 += b.0;
           a.1 += b.1;
@@ -1386,7 +1386,7 @@ where
         .zip(C_layers.par_chunks(2))
         .enumerate()
         .fold(
-          || (Acc::<E::Scalar>::zero(), Acc::<E::Scalar>::zero()),
+          || (Acc::<E::Scalar>::default(), Acc::<E::Scalar>::default()),
           |mut outer_acc, (pair_idx, ((pair_a, pair_b), pair_c))| {
             // Two-level DMR prove_helper
             // Pass global round index t (not t-l0) so round 0 optimization only
@@ -1422,7 +1422,7 @@ where
           },
         )
         .reduce(
-          || (Acc::<E::Scalar>::zero(), Acc::<E::Scalar>::zero()),
+          || (Acc::<E::Scalar>::default(), Acc::<E::Scalar>::default()),
           |mut a, b| {
             a.0 += b.0;
             a.1 += b.1;
@@ -1586,9 +1586,9 @@ impl<E: Engine> DigestHelperTrait<E> for NeutronNovaVerifierKey<E> {
 #[serde(bound = "")]
 pub struct NeutronNovaPrepZkSNARK<E: Engine> {
   /// Pre-committed state for each step circuit
-  pub ps_step: Vec<PrecommittedState<E>>,
+  pub ps_step: Vec<crate::spartan::SpartanPrepSNARK<E>>,
   /// Pre-committed state for the core circuit
-  pub ps_core: PrecommittedState<E>,
+  pub ps_core: crate::spartan::SpartanPrepSNARK<E>,
 }
 
 /// Holds the proof produced by the NeutronNova folding scheme followed by NeutronNova SNARK
@@ -1773,8 +1773,7 @@ where
         ps_i.rerandomize_with_shared(
           &pk.ck,
           &pk.S_step,
-          &ps_core.comm_W_shared,
-          &ps_core.r_W_shared,
+          &ps_core.comm_shared,
         )
       })
       .collect::<Result<Vec<_>, _>>()?;
@@ -1988,20 +1987,9 @@ where
     info!(elapsed_ms = %eval_rx_t.elapsed().as_millis(), "compute_eval_rx");
 
     let (_sparse_span, sparse_t) = start_span!("compute_eval_table_sparse");
-    let (evals_A_step, evals_B_step, evals_C_step) = pk.S_step.bind_row_vars(&evals_rx);
-    let (evals_A_core, evals_B_core, evals_C_core) = pk.S_core.bind_row_vars(&evals_rx);
+    let poly_ABC_step = pk.S_step.bind_row_vars_combined(&evals_rx, r);
+    let poly_ABC_core = pk.S_core.bind_row_vars_combined(&evals_rx, r);
     info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
-
-    let (_abc_span, abc_t) = start_span!("prepare_poly_ABC");
-    let poly_ABC_step = (0..evals_A_step.len())
-      .into_par_iter()
-      .map(|i| evals_A_step[i] + r * evals_B_step[i] + r * r * evals_C_step[i])
-      .collect::<Vec<E::Scalar>>();
-    let poly_ABC_core = (0..evals_A_core.len())
-      .into_par_iter()
-      .map(|i| evals_A_core[i] + r * evals_B_core[i] + r * r * evals_C_core[i])
-      .collect::<Vec<E::Scalar>>();
-    info!(elapsed_ms = %abc_t.elapsed().as_millis(), "prepare_poly_ABC");
 
     // inner sum-check
     let (_sc2_span, sc2_t) = start_span!("inner_sumcheck_batched");

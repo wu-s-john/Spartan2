@@ -9,10 +9,62 @@
 use super::{
   field_reduction_constants::FieldReductionConstants,
   limbs::{
-    add_4_4, gte_4_4, mul_2_by_1, mul_3x4_lo4, mul_3x5_to_8, mul_4_by_1, select_4, sub_4_4,
-    sub_4_4_with_borrow, sub_5_4,
+    add_4_4, gte_4_4, mul_2_by_1, mul_2x4_lo4, mul_2x5_to_7, mul_3x4_lo4, mul_3x5_to_8,
+    mul_4_by_1, select_4, sub_4_4, sub_4_4_with_borrow, sub_5_4,
   },
 };
+
+// ==========================================================================
+// 5-limb Barrett reduction (for field × u32 products: 4 limbs × 1 limb = 5 limbs)
+// ==========================================================================
+
+/// Barrett reduction for 5-limb input (field × u32 product).
+///
+/// For BN254: uses a dedicated 2-limb quotient path (saves ~10 muls vs 6-limb).
+/// For Pasta: uses the efficient 2-fold reduction.
+/// For T256: falls back to 6-limb generic path.
+#[inline(always)]
+pub(crate) fn barrett_reduce_5<F: FieldReductionConstants>(a: &[u64; 5]) -> [u64; 4] {
+  if F::PASTA_STYLE_MODULUS {
+    let c = [a[0], a[1], a[2], a[3], a[4], 0];
+    barrett_reduce_6_pasta::<F>(&c)
+  } else if F::USE_4_LIMB_BARRETT {
+    barrett_reduce_5_bn254::<F>(a)
+  } else {
+    let c = [a[0], a[1], a[2], a[3], a[4], 0];
+    barrett_reduce_6_generic::<F>(&c)
+  }
+}
+
+/// 5-limb Barrett for BN254 (where 2p < b⁴).
+///
+/// Input x has 5 limbs (field × u32, at most 288 bits).
+/// q1 = [c[3], c[4]] (2 limbs, since c[5]=0 implicitly).
+/// q2 = q1 × μ (2×5 → 7 limbs, saves 5 muls vs 3×5).
+/// q3 = [q2[5], q2[6]] (quotient estimate, 2 limbs).
+/// t = q3 × p (2×4 low 4 limbs, saves 3 muls vs 3×4).
+/// Total: ~15 muls vs ~24 for the 6-limb path.
+#[inline]
+fn barrett_reduce_5_bn254<F: FieldReductionConstants>(c: &[u64; 5]) -> [u64; 4] {
+  let q1 = [c[3], c[4]];
+  let q2 = mul_2x5_to_7(&q1, &F::BARRETT_MU);
+  let q3 = [q2[5], q2[6]];
+
+  let t = mul_2x4_lo4(&q3, &F::MODULUS);
+  let x_lo4 = [c[0], c[1], c[2], c[3]];
+  let mut r = sub_4_4(&x_lo4, &t);
+
+  if gte_4_4(&r, &F::MODULUS) {
+    r = sub_4_4(&r, &F::MODULUS);
+  }
+
+  debug_assert!(
+    !gte_4_4(&r, &F::MODULUS),
+    "Barrett 5-limb reduction produced non-canonical result"
+  );
+
+  r
+}
 
 // ==========================================================================
 // 6-limb Barrett reduction (for SignedWideLimbs<6>, i.e. DelayedReduction<i64>::Accumulator)

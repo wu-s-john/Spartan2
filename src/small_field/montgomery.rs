@@ -24,7 +24,7 @@ use halo2curves::{
 ///
 /// Field elements are stored as `value * R mod p` where R = 2^256.
 /// This trait provides direct access to those R-scaled limbs.
-pub(crate) trait MontgomeryLimbs: FieldReductionConstants {
+pub trait MontgomeryLimbs: FieldReductionConstants {
   /// Construct a field element from 4 Montgomery-form limbs.
   fn from_limbs(limbs: [u64; 4]) -> Self;
 

@@ -13,9 +13,9 @@
 use super::{
   accumulator::LagrangeAccumulators,
   domain::LagrangeIndex,
-  extension::extend_to_lagrange_domain,
+  extension::{extend_to_lagrange_domain, extend_to_lagrange_domain_in_place},
   index::CachedPrefixIndex,
-  thread_state::{NeutronNovaThreadState, SpartanThreadState},
+  thread_state::{InnerThreadState, NeutronNovaThreadState, SpartanThreadState},
 };
 use crate::{
   csr::Csr,
@@ -23,10 +23,9 @@ use crate::{
     eq::{EqPolynomial, compute_suffix_eq_pyramid},
     multilinear::MultilinearPolynomial,
   },
-  small_field::{DelayedReduction, SmallValueField, WideMul},
+  small_field::{DelayedReduction, SmallValueField, WitnessValue, WideMul},
 };
 use ff::PrimeField;
-use num_traits::Zero;
 use rayon::prelude::*;
 use std::ops::{Add, Sub};
 
@@ -85,7 +84,6 @@ where
   SmallValue: WideMul
     + Copy
     + Default
-    + Zero
     + Add<Output = SmallValue>
     + Sub<Output = SmallValue>
     + Send
@@ -214,7 +212,7 @@ where
         // This eliminates closure call overhead in the accumulator building loop
         // Reuse pre-allocated buffer to avoid per-iteration allocations
         for &beta_idx in &betas_with_infty {
-          if state.partial_sums[beta_idx].is_zero() {
+          if state.partial_sums[beta_idx] == Default::default() {
             continue;
           }
           // Reduce partial sum to field element
@@ -262,7 +260,7 @@ where
   for (round_idx, round) in merged.acc.rounds.iter().enumerate() {
     for (v_idx, row) in round.data().iter().enumerate() {
       for (u_idx, elem) in row.iter().enumerate() {
-        if !elem.is_zero() {
+        if *elem != Default::default() {
           result.rounds[round_idx].data_mut()[v_idx][u_idx] =
             <F as DelayedReduction<F>>::reduce(elem);
         }
@@ -330,7 +328,6 @@ where
   SmallValue: WideMul
     + Copy
     + Default
-    + Zero
     + Add<Output = SmallValue>
     + Sub<Output = SmallValue>
     + Send
@@ -501,7 +498,7 @@ where
         // Reduce partial sums to field elements
         for &beta_idx in &betas_with_infty {
           let unreduced = &state.partial_sums[beta_idx];
-          if !unreduced.is_zero() {
+          if *unreduced != Default::default() {
             let val = <F as DelayedReduction<SmallValue::Product>>::reduce(unreduced);
             state.beta_values.push((beta_idx, val));
           }
@@ -538,6 +535,137 @@ where
   merged
     .scatter_acc
     .map(|acc| <F as DelayedReduction<F>>::reduce(acc))
+}
+
+/// Build accumulators A_i(v, u) for the inner sumcheck: g(y) = M̃(y) · z(y).
+///
+/// Unlike `build_accumulators_spartan`, there is no eq(τ,y) factor, so:
+/// - No suffix split or eq_cache precomputation
+/// - Scatter uses plain `+=` instead of eq-weighted multiply-accumulate
+/// - All betas contribute (no binary-beta-zero shortcut — M̃ is field-valued,
+///   not an R1CS identity)
+/// - Round polynomial is degree 2 (not degree 3)
+///
+/// # Arguments
+/// * `poly_M` - Field-valued multilinear polynomial (from `bind_row_vars_combined_int`)
+/// * `z` - Witness values (bool, i8, etc.)
+/// * `l0` - Number of small-value rounds
+pub fn build_accumulators_inner<F, W>(
+  poly_M: &MultilinearPolynomial<F>,
+  z: &[W],
+  l0: usize,
+) -> LagrangeAccumulators<F, 2>
+where
+  F: PrimeField + DelayedReduction<W::Extended> + DelayedReduction<F> + Send + Sync,
+  W: WitnessValue + Send + Sync,
+  W::Extended: Copy + Default + Add<Output = W::Extended> + Sub<Output = W::Extended> + Send + Sync,
+{
+  let base: usize = 3; // D + 1 = 2 + 1 = 3
+  let l = poly_M.Z.len().trailing_zeros() as usize;
+  debug_assert_eq!(poly_M.Z.len(), 1usize << l, "poly size must be power of 2");
+  debug_assert_eq!(z.len(), poly_M.Z.len());
+  debug_assert!(l0 < l, "l0 must be < ℓ");
+
+  let prefix_size = 1usize << l0;
+  let suffix_size = 1usize << (l - l0);
+  let ext_size = base.pow(l0 as u32); // 3^l0
+
+  let BetaPrefixCache {
+    cache: beta_prefix_cache,
+    num_betas,
+  } = build_beta_cache::<2>(l0);
+
+  type State<F2, W2> = InnerThreadState<F2, W2, 2>;
+
+  // Parallel over suffixes with thread-local state.
+  // Unlike the Spartan builder (which resets partial sums per x_in iteration because
+  // the scatter involves per-suffix eq weighting), here the scatter is plain +=,
+  // so we accumulate partial sums across all suffixes in a chunk and scatter once.
+  //
+  // GATHER_BATCH: process this many consecutive suffixes per fold closure call.
+  // The gather accesses z[p * suffix_size + suffix] with stride suffix_size — one
+  // element per cache line (64 bytes / 32 bytes for BN254 = 2 elements/line).
+  // Fetching GATHER_BATCH=2 consecutive suffixes per call uses both elements from
+  // each fetched cache line, halving effective cache misses for field-sized witnesses.
+  const GATHER_BATCH: usize = 2;
+
+  let fold_results: Vec<State<F, W>> = (0..suffix_size.div_ceil(GATHER_BATCH))
+    .into_par_iter()
+    .fold(
+      || State::<F, W>::new(l0, num_betas, ext_size),
+      |mut state: State<F, W>, batch_idx| {
+        let s_base = batch_idx * GATHER_BATCH;
+        let s_end = (s_base + GATHER_BATCH).min(suffix_size);
+
+        for suffix in s_base..s_end {
+          // GATHER: collect 2^l0 evals directly into the extension buffers.
+          // The first prefix_size slots of each buffer double as the gather
+          // target, eliminating the separate z_prefix_evals / M_prefix_boolean_evals
+          // buffers and the copy they previously required inside extend_to_lagrange_domain.
+          #[allow(clippy::needless_range_loop)]
+          for p in 0..prefix_size {
+            let idx = p * suffix_size + suffix;
+            state.z_extended_evals[p] = z[idx].to_extended();
+            state.M_extended_evals[p] = poly_M.Z[idx];
+          }
+
+          // EXTEND z: {0,1}^l0 → {∞,0,1}^l0 (in-place, integer add/sub)
+          let z_size = extend_to_lagrange_domain_in_place::<W::Extended, 2>(
+            &mut state.z_extended_evals,
+            &mut state.z_extended_scratch,
+            prefix_size,
+          );
+          let z_ext = &state.z_extended_evals[..z_size];
+
+          // EXTEND M̃: {0,1}^l0 → {∞,0,1}^l0 (in-place, field add/sub only)
+          let m_size = extend_to_lagrange_domain_in_place::<F, 2>(
+            &mut state.M_extended_evals,
+            &mut state.M_extended_scratch,
+            prefix_size,
+          );
+          let m_ext = &state.M_extended_evals[..m_size];
+
+          // ACCUMULATE: field × W::Extended → DelayedReduction<W::Extended> accumulator
+          for beta in 0..num_betas {
+            <F as DelayedReduction<W::Extended>>::unreduced_multiply_accumulate(
+              &mut state.partial_sums[beta],
+              &m_ext[beta],
+              &z_ext[beta],
+            );
+          }
+        }
+
+        state
+      },
+    )
+    .collect();
+
+  // Sequential merge of thread-local accumulators.
+  // Two-phase: first reduce partial_sums and scatter, then merge acc.
+  // We need to reduce+scatter before merging because partial_sums are per-fold-chunk.
+  let mut result: LagrangeAccumulators<F, 2> = LagrangeAccumulators::new(l0);
+
+  for mut state in fold_results {
+    // Reduce partial sums and scatter into state.acc
+    for beta in 0..num_betas {
+      if state.partial_sums[beta] == Default::default() {
+        continue;
+      }
+      let val = <F as DelayedReduction<W::Extended>>::reduce(&state.partial_sums[beta]);
+      if val == F::ZERO {
+        continue;
+      }
+      // Scatter: plain += (no eq weighting)
+      for pref in &beta_prefix_cache[beta] {
+        state.acc.rounds[pref.round_0].data_mut()[pref.v_idx][pref.u_idx] += val;
+      }
+    }
+
+    // Merge into global result
+    result.merge(&state.acc);
+  }
+
+  result
 }
 
 // =============================================================================

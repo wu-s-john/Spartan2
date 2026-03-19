@@ -11,7 +11,7 @@
 use crate::{
   math::Math,
   polys::eq::EqPolynomial,
-  small_field::{SmallValueField, vec_to_small},
+  small_field::{DelayedReduction, SmallValueField, WitnessValue, vec_to_small},
   zip_with_for_each,
 };
 use core::ops::Index;
@@ -97,6 +97,39 @@ impl<T: Field> MultilinearPolynomial<T> {
           acc += L[j] * poly[j * r_len + i];
         }
         acc
+      })
+      .collect()
+  }
+}
+
+impl<T: PrimeField> MultilinearPolynomial<T> {
+  /// Bind row variables for a witness polynomial using delayed reduction.
+  ///
+  /// Generic over `W: WitnessValue` — works for both bool and i8 witnesses.
+  /// `output[i] = Σ_j L[j] * poly[j * r_len + i]`
+  pub fn bind_with_witness<W>(poly: &[W], l: &[T], r_len: usize) -> Vec<T>
+  where
+    W: WitnessValue,
+    T: DelayedReduction<W>,
+  {
+    assert_eq!(
+      poly.len(),
+      l.len() * r_len,
+      "poly length ({}) must equal L.len() * r_len ({} * {}) = {}",
+      poly.len(),
+      l.len(),
+      r_len,
+      l.len() * r_len
+    );
+
+    (0..r_len)
+      .into_par_iter()
+      .map(|i| {
+        let mut acc = <T as DelayedReduction<W>>::Accumulator::default();
+        for j in 0..l.len() {
+          T::unreduced_multiply_accumulate(&mut acc, &l[j], &poly[j * r_len + i]);
+        }
+        <T as DelayedReduction<W>>::reduce(&acc)
       })
       .collect()
   }

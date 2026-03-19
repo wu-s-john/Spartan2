@@ -10,8 +10,8 @@ use crate::{
   CommitmentKey,
   bellpepper::{
     r1cs::{
-      MultiRoundSpartanShape, MultiRoundSpartanWitness, PrecommittedState, RerandomizationTrait,
-      SpartanShape, SpartanWitness,
+      MultiRoundSpartanShape, MultiRoundSpartanWitness, RerandomizationTrait, SpartanShape,
+      SpartanWitness,
     },
     shape_cs::ShapeCS,
     solver::SatisfyingAssignment,
@@ -42,7 +42,6 @@ use crate::{
 };
 use ff::Field;
 use once_cell::sync::OnceCell;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -106,11 +105,7 @@ impl<E: Engine> DigestHelperTrait<E> for SpartanVerifierKey<E> {
 }
 
 /// A type that holds the pre-processed state for proving
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound = "")]
-pub struct SpartanPrepZkSNARK<E: Engine> {
-  ps: PrecommittedState<E>,
-}
+pub type SpartanPrepZkSNARK<E> = crate::spartan::SpartanPrepSNARK<E>;
 
 /// A succinct non-interactive argument of knowledge (SNARK) for a relaxed R1CS instance,
 /// produced using Spartan's combination of sum-check protocols and polynomial commitments.
@@ -196,7 +191,7 @@ where
     let mut ps = SatisfyingAssignment::shared_witness(&pk.S, &pk.ck, &circuit, is_small)?;
     SatisfyingAssignment::precommitted_witness(&mut ps, &pk.S, &pk.ck, &circuit, is_small)?;
 
-    Ok(SpartanPrepZkSNARK { ps })
+    Ok(ps)
   }
 
   /// produces a succinct proof of satisfiability of an R1CS instance
@@ -213,7 +208,7 @@ where
 
     // rerandomize the prep state
     let (_rerandomize_span, rerandomize_t) = start_span!("rerandomize_prep_state");
-    let mut ps = prep_snark.ps.rerandomize(&pk.ck, &pk.S)?;
+    let mut ps = prep_snark.rerandomize(&pk.ck, &pk.S)?;
     info!(elapsed_ms = %rerandomize_t.elapsed().as_millis(), "rerandomize_prep_state");
 
     let mut transcript = E::TE::new(b"SpartanZkSNARK");
@@ -312,15 +307,8 @@ where
     info!(elapsed_ms = %eval_rx_t.elapsed().as_millis(), "compute_eval_rx");
 
     let (_sparse_span, sparse_t) = start_span!("compute_eval_table_sparse");
-    let (evals_A, evals_B, evals_C) = pk.S.bind_row_vars(&evals_rx);
+    let poly_ABC = pk.S.bind_row_vars_combined(&evals_rx, r);
     info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
-
-    let (_abc_span, abc_t) = start_span!("prepare_poly_ABC");
-    let poly_ABC: Vec<E::Scalar> = (0..evals_A.len())
-      .into_par_iter()
-      .map(|i| evals_A[i] + r * evals_B[i] + r * r * evals_C[i])
-      .collect();
-    info!(elapsed_ms = %abc_t.elapsed().as_millis(), "prepare_poly_ABC");
 
     let (_z_span, z_t) = start_span!("prepare_poly_z");
     z.resize(num_vars * 2, E::Scalar::ZERO);

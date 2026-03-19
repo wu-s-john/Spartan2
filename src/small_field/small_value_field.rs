@@ -38,6 +38,9 @@ pub trait SmallValueField<SmallValue>: PrimeField {
 // Marker traits for blanket implementations
 // ============================================================================
 
+/// Marker trait: field supports `SmallValueField<i8>` via blanket impl.
+pub(crate) trait SupportsSmallI8: MontgomeryLimbs {}
+
 /// Marker trait: field supports `SmallValueField<i32>` via blanket impl.
 pub(crate) trait SupportsSmallI32: MontgomeryLimbs {}
 
@@ -45,6 +48,10 @@ pub(crate) trait SupportsSmallI32: MontgomeryLimbs {}
 pub(crate) trait SupportsSmallI64: MontgomeryLimbs {}
 
 // Marker trait implementations
+impl SupportsSmallI8 for halo2curves::pasta::Fp {}
+impl SupportsSmallI8 for halo2curves::pasta::Fq {}
+impl SupportsSmallI8 for Bn254Fr {}
+impl SupportsSmallI8 for T256Fq {}
 impl SupportsSmallI32 for halo2curves::pasta::Fp {}
 impl SupportsSmallI32 for halo2curves::pasta::Fq {}
 impl SupportsSmallI64 for halo2curves::pasta::Fp {}
@@ -129,6 +136,21 @@ pub fn try_field_to_i64<F: PrimeField>(val: &F) -> Option<i64> {
   }
 
   None
+}
+
+// ============================================================================
+// Blanket SmallValueField<i8> for all SupportsSmallI8 fields
+// ============================================================================
+
+impl<F: SupportsSmallI8 + PrimeField> SmallValueField<i8> for F {
+  #[inline]
+  fn small_to_field(val: i8) -> Self {
+    i64_to_field(val as i64)
+  }
+
+  fn try_field_to_small(val: &Self) -> Option<i8> {
+    try_field_to_i64(val).and_then(|v| i8::try_from(v).ok())
+  }
 }
 
 // ============================================================================

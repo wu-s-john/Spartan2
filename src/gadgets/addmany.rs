@@ -6,88 +6,18 @@
 
 //! Addition algorithms for SmallUInt32 values.
 //!
-//! This module provides two addition algorithms optimized for different
-//! coefficient bounds in the small-value sumcheck optimization:
+//! This module provides the limbed addition algorithm optimized for the
+//! small-value sumcheck with i32 coefficients.
 //!
 //! - [`limbed`]: 16-bit limbed addition, max coefficient 2^18 (fits i32)
-//! - [`full`]: Full 35-bit addition, max coefficient 2^34 (fits i64)
+//!   Used by NoBatchEq for the pure-integer proving path.
 
 use super::{small_multi_eq::SmallMultiEq, small_uint32::SmallUInt32};
-use bellpepper_core::{
-  LinearCombination, SynthesisError,
-  boolean::{AllocatedBit, Boolean},
-};
-use ff::PrimeField;
+use crate::gadgets::small_boolean::{SmallBit, SmallBoolean};
+use crate::small_constraint_system::SmallLinearCombination;
+use bellpepper_core::SynthesisError;
 
-/// Full 35-bit addition for i64 path.
-///
-/// Computes the sum of multiple SmallUInt32 operands, allocating enough bits
-/// to represent the full sum before truncating to 32 bits.
-///
-/// Max coefficient: 2^34 (for 5 operands producing 35-bit result).
-pub(crate) fn full<Scalar, M>(
-  cs: &mut M,
-  operands: &[SmallUInt32],
-) -> Result<SmallUInt32, SynthesisError>
-where
-  Scalar: PrimeField,
-  M: SmallMultiEq<Scalar>,
-{
-  // Compute the maximum value of the sum
-  let max_value = (operands.len() as u64) * (u32::MAX as u64);
-
-  // How many bits do we need to represent the result?
-  let result_bits = 64 - max_value.leading_zeros() as usize;
-
-  // Compute the value of the result
-  let result_value = operands
-    .iter()
-    .try_fold(0u64, |acc, op| op.get_value().map(|v| acc + (v as u64)));
-
-  // Allocate each bit of the result
-  let mut result_bits_vec: Vec<Boolean> = Vec::with_capacity(result_bits);
-  let mut coeff = Scalar::ONE;
-  let mut lc = LinearCombination::zero();
-  let mut all_operands_lc = LinearCombination::zero();
-
-  for i in 0..result_bits {
-    // Allocate the bit
-    let bit = AllocatedBit::alloc(
-      cs.namespace(|| format!("result bit {}", i)),
-      result_value.map(|v| (v >> i) & 1 == 1),
-    )?;
-
-    // Add to linear combination
-    lc = lc + (coeff, bit.get_variable());
-
-    result_bits_vec.push(Boolean::from(bit));
-    coeff = coeff.double();
-  }
-
-  // Compute linear combination of all operand bits
-  for op in operands.iter() {
-    let mut coeff = Scalar::ONE;
-    for bit in op.bits_le() {
-      all_operands_lc = all_operands_lc + &bit.lc(M::one(), coeff);
-      coeff = coeff.double();
-    }
-  }
-
-  // Enforce that the result equals the sum of operands
-  cs.enforce_equal(&lc, &all_operands_lc);
-
-  // Truncate to 32 bits
-  let bits: [Boolean; 32] = result_bits_vec
-    .into_iter()
-    .take(32)
-    .collect::<Vec<_>>()
-    .try_into()
-    .unwrap();
-
-  Ok(SmallUInt32::from_bits_le(&bits))
-}
-
-/// 16-bit limbed addition for i32 path.
+/// 16-bit limbed addition for i32/i8 path.
 ///
 /// Splits each 32-bit value into two 16-bit limbs and adds them separately.
 /// This keeps the maximum coefficient at 2^18, which fits in i32.
@@ -97,13 +27,12 @@ where
 ///
 /// Constraint 2 (high limb):
 ///   Σ(operand_hi) + carry = result_hi + overflow × 2^16
-pub(crate) fn limbed<Scalar, M>(
+pub(crate) fn limbed<M>(
   cs: &mut M,
   operands: &[SmallUInt32],
 ) -> Result<SmallUInt32, SynthesisError>
 where
-  Scalar: PrimeField,
-  M: SmallMultiEq<Scalar>,
+  M: SmallMultiEq<i32>,
 {
   // For N operands, each 16-bit limb sum can be up to N * (2^16 - 1)
   // For 10 operands: 10 * 65535 = 655350, needs 20 bits
@@ -129,40 +58,41 @@ where
   // Sum of low 16 bits of each operand = low 16 bits of result + carry × 2^16
 
   // Build LHS: sum of all operand low limbs
-  let mut lo_operands_lc = LinearCombination::zero();
+  // Coefficients are powers of 2: 1, 2, 4, ..., 2^15 (max 2^15, fits i32)
+  let mut lo_operands_lc = SmallLinearCombination::zero();
   for op in operands.iter() {
-    let mut coeff = Scalar::ONE;
+    let mut coeff: i32 = 1;
     for bit in &op.bits_le()[0..16] {
-      lo_operands_lc = lo_operands_lc + &bit.lc(M::one(), coeff);
-      coeff = coeff.double();
+      add_boolean_to_lc(&mut lo_operands_lc, bit, coeff);
+      coeff *= 2;
     }
   }
 
   // Allocate result low bits (0..15) from lo_sum
-  let mut lo_result_lc = LinearCombination::zero();
-  let mut bits = [const { Boolean::Constant(false) }; 32];
-  let mut carry_bits: Vec<AllocatedBit> = Vec::with_capacity(num_carry_bits);
+  let mut lo_result_lc = SmallLinearCombination::zero();
+  let mut bits = [const { SmallBoolean::Constant(false) }; 32];
+  let mut carry_bits: Vec<SmallBit> = Vec::with_capacity(num_carry_bits);
 
-  let mut coeff = Scalar::ONE;
+  let mut coeff: i32 = 1;
   for (i, slot) in bits.iter_mut().enumerate().take(16) {
-    let bit = AllocatedBit::alloc(
-      cs.namespace(|| format!("lo{i}")),
+    let bit = SmallBit::alloc(
+      &mut cs.namespace(|| format!("lo{i}")),
       lo_sum.map(|v| (v >> i) & 1 == 1),
     )?;
-    lo_result_lc = lo_result_lc + (coeff, bit.get_variable());
-    *slot = Boolean::from(bit);
-    coeff = coeff.double();
+    lo_result_lc.add_term(bit.get_variable(), coeff);
+    *slot = SmallBoolean::Is(bit);
+    coeff *= 2;
   }
 
   // Allocate carry bits from lo_sum (bits 16+)
   for i in 0..num_carry_bits {
-    let bit = AllocatedBit::alloc(
-      cs.namespace(|| format!("c{i}")),
+    let bit = SmallBit::alloc(
+      &mut cs.namespace(|| format!("c{i}")),
       lo_sum.map(|v| (v >> (16 + i)) & 1 == 1),
     )?;
-    lo_result_lc = lo_result_lc + (coeff, bit.get_variable());
+    lo_result_lc.add_term(bit.get_variable(), coeff);
     carry_bits.push(bit);
-    coeff = coeff.double();
+    coeff *= 2;
   }
 
   // Enforce: lo_operands_lc = lo_result_lc
@@ -172,47 +102,135 @@ where
   // Sum of high 16 bits of each operand + carry = high 16 bits of result + overflow × 2^16
 
   // Build LHS: sum of all operand high limbs + carry
-  let mut hi_operands_lc = LinearCombination::zero();
+  let mut hi_operands_lc = SmallLinearCombination::zero();
   for op in operands.iter() {
-    let mut coeff = Scalar::ONE;
+    let mut coeff: i32 = 1;
     for bit in &op.bits_le()[16..32] {
-      hi_operands_lc = hi_operands_lc + &bit.lc(M::one(), coeff);
-      coeff = coeff.double();
+      add_boolean_to_lc(&mut hi_operands_lc, bit, coeff);
+      coeff *= 2;
     }
   }
 
   // Add carry from low limb
-  let mut coeff = Scalar::ONE;
+  let mut coeff: i32 = 1;
   for carry_bit in &carry_bits {
-    hi_operands_lc = hi_operands_lc + (coeff, carry_bit.get_variable());
-    coeff = coeff.double();
+    hi_operands_lc.add_term(carry_bit.get_variable(), coeff);
+    coeff *= 2;
   }
 
   // Allocate result high bits (16..31) from hi_sum_with_carry
-  let mut hi_result_lc = LinearCombination::zero();
-  let mut coeff = Scalar::ONE;
+  let mut hi_result_lc = SmallLinearCombination::zero();
+  let mut coeff: i32 = 1;
   for i in 0..16 {
-    let bit = AllocatedBit::alloc(
-      cs.namespace(|| format!("hi{i}")),
+    let bit = SmallBit::alloc(
+      &mut cs.namespace(|| format!("hi{i}")),
       hi_sum_with_carry.map(|v| (v >> i) & 1 == 1),
     )?;
-    hi_result_lc = hi_result_lc + (coeff, bit.get_variable());
-    bits[16 + i] = Boolean::from(bit);
-    coeff = coeff.double();
+    hi_result_lc.add_term(bit.get_variable(), coeff);
+    bits[16 + i] = SmallBoolean::Is(bit);
+    coeff *= 2;
   }
 
   // Allocate overflow bits from hi_sum_with_carry (bits 16+, discarded)
   for i in 0..num_carry_bits {
-    let bit = AllocatedBit::alloc(
-      cs.namespace(|| format!("o{i}")),
+    let bit = SmallBit::alloc(
+      &mut cs.namespace(|| format!("o{i}")),
       hi_sum_with_carry.map(|v| (v >> (16 + i)) & 1 == 1),
     )?;
-    hi_result_lc = hi_result_lc + (coeff, bit.get_variable());
-    coeff = coeff.double();
+    hi_result_lc.add_term(bit.get_variable(), coeff);
+    coeff *= 2;
   }
 
   // Enforce: hi_operands_lc = hi_result_lc
   cs.enforce_equal(&hi_operands_lc, &hi_result_lc);
 
   Ok(SmallUInt32::from_bits_le(&bits))
+}
+
+/// Witness-only version of `limbed` for `SmallConstraintSystem<i8>`.
+///
+/// Allocates the same set of variables as `limbed` (so witness indices match the shape)
+/// but uses i8 values. `enforce_equal` calls are no-ops in the witness gen backend.
+pub(crate) fn limbed_witness<M>(
+  cs: &mut M,
+  operands: &[SmallUInt32],
+) -> Result<SmallUInt32, SynthesisError>
+where
+  M: SmallMultiEq<i8>,
+{
+  let num_carry_bits =
+    64 - ((operands.len() as u64) * (u16::MAX as u64)).leading_zeros() as usize - 16;
+  let num_carry_bits = num_carry_bits.max(1);
+
+  let lo_sum: Option<u64> = operands.iter().try_fold(0u64, |acc, op| {
+    op.get_value().map(|v| acc + ((v as u64) & 0xFFFF))
+  });
+  let hi_sum: Option<u64> = operands.iter().try_fold(0u64, |acc, op| {
+    op.get_value().map(|v| acc + (((v as u64) >> 16) & 0xFFFF))
+  });
+  let hi_sum_with_carry: Option<u64> = hi_sum.and_then(|h| lo_sum.map(|l| h + (l >> 16)));
+
+  let mut bits = [const { SmallBoolean::Constant(false) }; 32];
+
+  for (i, slot) in bits.iter_mut().enumerate().take(16) {
+    let bit = SmallBit::alloc(
+      &mut cs.namespace(|| format!("lo{i}")),
+      lo_sum.map(|v| (v >> i) & 1 == 1),
+    )?;
+    *slot = SmallBoolean::Is(bit);
+  }
+  for i in 0..num_carry_bits {
+    SmallBit::alloc(
+      &mut cs.namespace(|| format!("c{i}")),
+      lo_sum.map(|v| (v >> (16 + i)) & 1 == 1),
+    )?;
+  }
+
+  // No enforce_equal for lo limb (no-op in witness gen)
+
+  for i in 0..16 {
+    let bit = SmallBit::alloc(
+      &mut cs.namespace(|| format!("hi{i}")),
+      hi_sum_with_carry.map(|v| (v >> i) & 1 == 1),
+    )?;
+    bits[16 + i] = SmallBoolean::Is(bit);
+  }
+  for i in 0..num_carry_bits {
+    SmallBit::alloc(
+      &mut cs.namespace(|| format!("o{i}")),
+      hi_sum_with_carry.map(|v| (v >> (16 + i)) & 1 == 1),
+    )?;
+  }
+
+  // No enforce_equal for hi limb (no-op in witness gen)
+
+  Ok(SmallUInt32::from_bits_le(&bits))
+}
+
+/// Helper: add a SmallBoolean's contribution to a SmallLinearCombination<i32>.
+///
+/// - `Constant(false)` → nothing
+/// - `Constant(true)` → add coeff to ONE term
+/// - `Is(bit)` → add coeff * bit
+/// - `Not(bit)` → add coeff * ONE, add -coeff * bit
+fn add_boolean_to_lc(
+  lc: &mut SmallLinearCombination<i32>,
+  boolean: &SmallBoolean,
+  coeff: i32,
+) {
+  use bellpepper_core::Index;
+  let one_var = bellpepper_core::Variable::new_unchecked(Index::Input(0));
+  match boolean {
+    SmallBoolean::Constant(false) => {}
+    SmallBoolean::Constant(true) => {
+      lc.add_term(one_var, coeff);
+    }
+    SmallBoolean::Is(bit) => {
+      lc.add_term(bit.get_variable(), coeff);
+    }
+    SmallBoolean::Not(bit) => {
+      lc.add_term(one_var, coeff);
+      lc.add_term(bit.get_variable(), -coeff);
+    }
+  }
 }

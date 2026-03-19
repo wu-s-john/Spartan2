@@ -12,6 +12,23 @@ use super::domain::LagrangeIndex;
 use std::ops::{Add, Sub};
 
 // ============================================================================
+// Const-generic helpers
+// ============================================================================
+
+/// Compile-time power function: computes BASE^EXP.
+/// Used for computing array sizes like 3^L0 for Lagrange domain extension.
+#[allow(dead_code)] // Will be used for future const-generic optimizations
+pub const fn const_pow<const BASE: usize, const EXP: usize>() -> usize {
+  let mut result = 1;
+  let mut i = 0;
+  while i < EXP {
+    result *= BASE;
+    i += 1;
+  }
+  result
+}
+
+// ============================================================================
 // Helper functions for Lagrange extension
 // ============================================================================
 
@@ -204,6 +221,66 @@ where
   }
 
   // Ensure result ends up in buf_curr (swap if result is currently in buf_scratch)
+  if num_vars % 2 == 1 {
+    std::mem::swap(buf_curr, buf_scratch);
+  }
+  final_size
+}
+
+/// Like [`extend_to_lagrange_domain`], but assumes `buf_curr[..prefix_size]`
+/// already contains the boolean-hypercube evaluations. Skips the initial copy.
+///
+/// The caller must write `prefix_size` values into `buf_curr[..prefix_size]`
+/// before calling this function. `prefix_size` must be a power of two and
+/// both buffers must already be at least `(D+1)^log2(prefix_size)` long.
+pub(crate) fn extend_to_lagrange_domain_in_place<T, const D: usize>(
+  buf_curr: &mut Vec<T>,
+  buf_scratch: &mut Vec<T>,
+  prefix_size: usize,
+) -> usize
+where
+  T: Copy + Default + Add<Output = T> + Sub<Output = T>,
+{
+  let base: usize = D + 1;
+  let num_vars = prefix_size.trailing_zeros() as usize;
+  debug_assert_eq!(prefix_size, 1 << num_vars, "prefix_size must be a power of 2");
+
+  if num_vars == 0 {
+    return 1;
+  }
+
+  let final_size = base.pow(num_vars as u32);
+  debug_assert!(buf_curr.len() >= final_size, "buf_curr too small for in-place extension");
+  debug_assert!(buf_scratch.len() >= final_size, "buf_scratch too small for in-place extension");
+
+  for j in 1..=num_vars {
+    let prefix_count = base.pow((j - 1) as u32);
+    let suffix_count = 1usize << (num_vars - j);
+    let current_stride = 2 * suffix_count;
+    let next_stride = base * suffix_count;
+
+    let (src, dst) = if j % 2 == 1 {
+      (&buf_curr[..], &mut buf_scratch[..])
+    } else {
+      (&buf_scratch[..], &mut buf_curr[..])
+    };
+
+    for prefix_idx in 0..prefix_count {
+      let base_src = prefix_idx * current_stride;
+      let base_dst = prefix_idx * next_stride;
+      let mut s = 0;
+
+      while s + 4 <= suffix_count {
+        extend_batch4::<T, D>(src, dst, base_src, base_dst, suffix_count, s);
+        s += 4;
+      }
+      while s < suffix_count {
+        extend_single::<T, D>(src, dst, base_src, base_dst, suffix_count, s);
+        s += 1;
+      }
+    }
+  }
+
   if num_vars % 2 == 1 {
     std::mem::swap(buf_curr, buf_scratch);
   }

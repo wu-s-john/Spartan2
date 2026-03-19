@@ -79,12 +79,12 @@ use std::ops::AddAssign;
 ///
 /// # Type Parameter
 ///
-/// - `Value`: The type being multiplied with the field element (i32, i64, i128, or Self)
+/// - `Value`: The type being multiplied with the field element (bool, i8, i32, i64, i128, or Self)
 pub trait DelayedReduction<Value>: Sized {
   /// Wide accumulator type for unreduced products.
   ///
   /// Must support addition without overflow for the expected number of terms.
-  type Accumulator: Copy + Clone + Default + AddAssign + Send + Sync + num_traits::Zero;
+  type Accumulator: Copy + Clone + Default + PartialEq + AddAssign + Send + Sync;
 
   /// Accumulate: `acc += field × value`
   ///
@@ -95,6 +95,149 @@ pub trait DelayedReduction<Value>: Sized {
   ///
   /// Performs the deferred modular reduction.
   fn reduce(acc: &Self::Accumulator) -> Self;
+}
+
+// ============================================================================
+// DelayedReduction<bool> - for field × bool products (conditional add)
+// ============================================================================
+
+impl<F: PrimeField + Copy> DelayedReduction<bool> for F {
+  /// Accumulator is `F` directly — since bool values are {0,1}, MAC reduces to
+  /// conditional add and the accumulator stays reduced throughout.
+  type Accumulator = F;
+
+  #[inline(always)]
+  fn unreduced_multiply_accumulate(acc: &mut F, field: &F, value: &bool) {
+    if *value {
+      *acc += *field;
+    }
+  }
+
+  #[inline(always)]
+  fn reduce(acc: &F) -> F {
+    *acc
+  }
+}
+
+// ============================================================================
+// Shared helper for i8 / i16 MACs (both accumulate into SignedWideLimbs<5>)
+// ============================================================================
+
+/// Add a 4-limb field element into a 5-limb wide accumulator using plain adds with carry.
+///
+/// Equivalent to `target += field_limbs` (unsigned). No multiply instructions.
+/// Used by `unreduced_multiply_accumulate` as a fast path for value = ±1.
+#[inline(always)]
+fn add_field_limbs(target: &mut WideLimbs<5>, limbs: &[u64; 4]) {
+  let mut carry = false;
+  (target.0[0], carry) = target.0[0].carrying_add(limbs[0], carry);
+  (target.0[1], carry) = target.0[1].carrying_add(limbs[1], carry);
+  (target.0[2], carry) = target.0[2].carrying_add(limbs[2], carry);
+  (target.0[3], carry) = target.0[3].carrying_add(limbs[3], carry);
+  target.0[4] = target.0[4].wrapping_add(carry as u64);
+}
+
+/// Fused multiply-accumulate into a 5-limb signed accumulator.
+///
+/// Equivalent to `acc += field_limbs × value64`, where the sign is tracked
+/// separately via the `pos` / `neg` halves of `acc`.
+#[inline(always)]
+fn accumulate_signed_wide_5(acc: &mut SignedWideLimbs<5>, field_limbs: &[u64; 4], value64: i64) {
+  let (target, mag) = if value64 >= 0 {
+    (&mut acc.pos, value64 as u64)
+  } else {
+    (&mut acc.neg, value64.wrapping_neg() as u64)
+  };
+  let (r0, c) = mac(target.0[0], field_limbs[0], mag, 0);
+  let (r1, c) = mac(target.0[1], field_limbs[1], mag, c);
+  let (r2, c) = mac(target.0[2], field_limbs[2], mag, c);
+  let (r3, c) = mac(target.0[3], field_limbs[3], mag, c);
+  target.0[0] = r0;
+  target.0[1] = r1;
+  target.0[2] = r2;
+  target.0[3] = r3;
+  target.0[4] = target.0[4].wrapping_add(c);
+}
+
+// ============================================================================
+// DelayedReduction<i8> - for field × i8 products (witness extension values)
+// ============================================================================
+
+impl<F: MontgomeryLimbs + PrimeField> DelayedReduction<i8> for F {
+  /// Accumulator for field × i8 products.
+  ///
+  /// # Overflow Bounds
+  /// - Field element: 254 bits (BN254 Fr)
+  /// - i8 magnitude: 8 bits
+  /// - Product size: 262 bits (5 limbs)
+  /// - SignedWideLimbs<5>: 320 bits capacity
+  /// - Headroom: 58 bits → supports up to 2^58 accumulations
+  type Accumulator = SignedWideLimbs<5>;
+
+  #[inline(always)]
+  fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i8) {
+    match *value {
+      0 => {}
+      1 => add_field_limbs(&mut acc.pos, field.to_limbs()),
+      -1 => add_field_limbs(&mut acc.neg, field.to_limbs()),
+      v => accumulate_signed_wide_5(acc, field.to_limbs(), v as i64),
+    }
+  }
+
+  #[inline(always)]
+  fn reduce(acc: &Self::Accumulator) -> Self {
+    // Pad to 6 limbs and reuse barrett_reduce_6
+    match sub_mag::<5>(&acc.pos.0, &acc.neg.0) {
+      SubMagResult::Positive(mag) => {
+        let padded = [mag[0], mag[1], mag[2], mag[3], mag[4], 0];
+        F::from_limbs(barrett_reduce_6::<F>(&padded))
+      }
+      SubMagResult::Negative(mag) => {
+        let padded = [mag[0], mag[1], mag[2], mag[3], mag[4], 0];
+        -F::from_limbs(barrett_reduce_6::<F>(&padded))
+      }
+    }
+  }
+}
+
+// ============================================================================
+// DelayedReduction<i16> - for field × i16 products (from i8 × i8)
+// ============================================================================
+
+impl<F: MontgomeryLimbs + PrimeField> DelayedReduction<i16> for F {
+  /// Accumulator for field × i16 products.
+  ///
+  /// # Overflow Bounds
+  /// - Field element: 254 bits (BN254 Fr)
+  /// - i16 magnitude: 16 bits
+  /// - Product size: 270 bits (5 limbs)
+  /// - SignedWideLimbs<5>: 320 bits capacity
+  /// - Headroom: 50 bits → supports up to 2^50 accumulations
+  type Accumulator = SignedWideLimbs<5>;
+
+  #[inline(always)]
+  fn unreduced_multiply_accumulate(acc: &mut Self::Accumulator, field: &Self, value: &i16) {
+    match *value {
+      0 => {}
+      1 => add_field_limbs(&mut acc.pos, field.to_limbs()),
+      -1 => add_field_limbs(&mut acc.neg, field.to_limbs()),
+      v => accumulate_signed_wide_5(acc, field.to_limbs(), v as i64),
+    }
+  }
+
+  #[inline(always)]
+  fn reduce(acc: &Self::Accumulator) -> Self {
+    match sub_mag::<5>(&acc.pos.0, &acc.neg.0) {
+      SubMagResult::Positive(mag) => {
+        let padded = [mag[0], mag[1], mag[2], mag[3], mag[4], 0];
+        F::from_limbs(barrett_reduce_6::<F>(&padded))
+      }
+      SubMagResult::Negative(mag) => {
+        let padded = [mag[0], mag[1], mag[2], mag[3], mag[4], 0];
+        -F::from_limbs(barrett_reduce_6::<F>(&padded))
+      }
+    }
+  }
 }
 
 // ============================================================================
@@ -301,16 +444,38 @@ mod tests {
     small_field::{SmallValueField, WideMul},
   };
   use ff::Field;
-  use num_traits::Zero;
   use rand_core::{OsRng, RngCore};
   use std::ops::{Add, Sub};
 
   type Scalar = pallas::Scalar;
 
   #[test]
+  fn test_delayed_reduction_i8() {
+    let mut rng = OsRng;
+    let mut acc = <Scalar as DelayedReduction<i8>>::Accumulator::default();
+    let mut expected = Scalar::ZERO;
+
+    for i in 0..100 {
+      let field = Scalar::random(&mut rng);
+      let value: i8 = if i % 2 == 0 { (i % 3) as i8 } else { -((i % 3) as i8) };
+
+      <Scalar as DelayedReduction<i8>>::unreduced_multiply_accumulate(&mut acc, &field, &value);
+      let field_value = match value {
+        0 => Scalar::ZERO,
+        v if v > 0 => Scalar::from(v as u64),
+        v => -Scalar::from((-v) as u64),
+      };
+      expected += field * field_value;
+    }
+
+    let result = <Scalar as DelayedReduction<i8>>::reduce(&acc);
+    assert_eq!(result, expected);
+  }
+
+  #[test]
   fn test_delayed_reduction_i64() {
     let mut rng = OsRng;
-    let mut acc = SignedWideLimbs::<6>::zero();
+    let mut acc = <Scalar as DelayedReduction<i64>>::Accumulator::default();
     let mut expected = Scalar::ZERO;
 
     // Sum 100 field × i64 products (mix of positive and negative)
@@ -330,7 +495,7 @@ mod tests {
   #[test]
   fn test_delayed_reduction_i128() {
     let mut rng = OsRng;
-    let mut acc = SignedWideLimbs::<7>::zero();
+    let mut acc = <Scalar as DelayedReduction<i128>>::Accumulator::default();
     let mut expected = Scalar::ZERO;
 
     // Sum 100 field × i128 products (mix of positive and negative)
@@ -362,7 +527,7 @@ mod tests {
   #[test]
   fn test_delayed_reduction_field() {
     let mut rng = OsRng;
-    let mut acc = WideLimbs::<9>::zero();
+    let mut acc = <Scalar as DelayedReduction<Scalar>>::Accumulator::default();
     let mut expected = Scalar::ZERO;
 
     // Sum 100 field × field products
@@ -390,7 +555,6 @@ mod tests {
       SmallValue: WideMul
         + Copy
         + Default
-        + num_traits::Zero
         + Add<Output = SmallValue>
         + Sub<Output = SmallValue>
         + Send
