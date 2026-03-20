@@ -49,6 +49,9 @@ pub trait R1CSSNARKTrait<E: Engine>:
 
   /// Verifies a SNARK for a relaxed R1CS and returns the public IO
   fn verify(&self, vk: &Self::VerifierKey) -> Result<Vec<E::Scalar>, SpartanError>;
+
+  /// Returns sizes associated with the prover key's R1CS shape
+  fn pk_sizes(pk: &Self::ProverKey) -> [usize; 10];
 }
 
 /// A type representing the digest of a verifier's key
