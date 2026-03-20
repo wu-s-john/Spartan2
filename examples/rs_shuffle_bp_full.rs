@@ -23,7 +23,7 @@ use spartan2::{
       PermutationWitnessTraceVar,
     },
     encryption::{
-      native_reencrypt_parallel, precompute_fixed_base_powers, reencrypt_deck_bp,
+      native_reencrypt_parallel, precompute_native_powers, reencrypt_deck_bp,
       NativeReencryptionData,
     },
     native::run_rs_shuffle_permutation,
@@ -81,12 +81,11 @@ struct RSShuffleReencryptCircuit {
   pk_coords: (Scalar, Scalar),
   /// Generator coords
   gen_coords: (Scalar, Scalar),
+  /// Natively precomputed generator power table: powers[i] = 2^i · G
+  gen_powers_native: Vec<(Scalar, Scalar)>,
 
   /// Pre-computed native re-encryption data (for future parallel witness path)
   _native_reencrypt_data: NativeReencryptionData<ECEngine, N>,
-
-  /// Precomputed generator power table: gen_powers[i] = 2^i · G (compile-time constants)
-  gen_powers: Vec<(Scalar, Scalar)>,
 }
 
 impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
@@ -166,10 +165,10 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
     // Order must match public_values(): gen, pk, input deck, output deck
     // =========================================================================
 
-    // Allocate generator (shared across all cards) — public input
+    // Allocate generator from native powers[0] — public input
     let gen_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
       cs.namespace(|| "generator"),
-      Some(self.gen_coords),
+      Some(self.gen_powers_native[0]),
     )?;
     gen_var.x.inputize(cs.namespace(|| "gen_x_pub"))?;
     gen_var.y.inputize(cs.namespace(|| "gen_y_pub"))?;
@@ -226,8 +225,7 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       &rand_arr,
       &pk_var,
       &self._native_reencrypt_data,
-      &gen_var,
-      &self.gen_powers,
+      &self.gen_powers_native,
     )?;
 
     // =========================================================================
@@ -387,10 +385,8 @@ fn main() {
   // =========================================================================
   println!("\n--- Circuit Construction ---");
 
-  // Precompute generator power table (compile-time constants for fixed-base scalar mul)
-  let (curve_a, _, _, _) = <ECEngine as Engine>::GE::group_params();
   let num_bits = Scalar::NUM_BITS as usize;
-  let gen_powers = precompute_fixed_base_powers(gen_coords, curve_a, num_bits);
+  let gen_powers_native = precompute_native_powers::<ECEngine>(gen_coords, num_bits);
 
   let circuit = RSShuffleReencryptCircuit {
     witness_trace: trace.witness_trace.clone(),
@@ -399,8 +395,8 @@ fn main() {
     permutation,
     pk_coords,
     gen_coords,
+    gen_powers_native,
     _native_reencrypt_data: native_data,
-    gen_powers,
   };
 
   // =========================================================================

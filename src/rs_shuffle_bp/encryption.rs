@@ -252,26 +252,6 @@ fn jacobian_add_affine<F: PrimeField>(
   (x3, y3, z3)
 }
 
-/// Precompute constant power table for fixed-base scalar multiplication.
-/// Returns `powers[i] = 2^i · base` for `i = 0..num_bits`.
-pub fn precompute_fixed_base_powers<F: PrimeField>(
-  base: (F, F),
-  curve_a: F,
-  num_bits: usize,
-) -> Vec<(F, F)> {
-  let mut powers = Vec::with_capacity(num_bits);
-  powers.push(base);
-  for _ in 1..num_bits {
-    let (x, y) = *powers.last().unwrap();
-    let (dx, dy, dz) = jacobian_double(x, y, F::ONE, curve_a);
-    let z_inv = dz.invert().unwrap();
-    let z_inv2 = z_inv.square();
-    let z_inv3 = z_inv2 * z_inv;
-    powers.push((dx * z_inv2, dy * z_inv3));
-  }
-  powers
-}
-
 /// Affine point addition: P + Q (handles P == Q by using Jacobian internally)
 fn affine_add_safe<F: PrimeField>(x1: F, y1: F, x2: F, y2: F, a: F) -> (F, F) {
   // Use Jacobian to handle all cases
@@ -326,38 +306,64 @@ pub fn native_reencrypt_parallel<E: Engine, const N: usize>(
 }
 
 // ============================================================================
+// Native power table precomputation
+// ============================================================================
+
+/// Natively compute `powers[i] = 2^i · base` using the affine doubling formula.
+///
+/// Called once at circuit construction time. The result is shared by `&` reference
+/// across all cards, enabling `scalar_mul_fixed_base` without any in-circuit doublings.
+pub fn precompute_native_powers<E: Engine>(
+  base: (E::Base, E::Base),
+  num_bits: usize,
+) -> Vec<(E::Base, E::Base)> {
+  let (a, _, _, _) = E::GE::group_params();
+  let mut powers = Vec::with_capacity(num_bits);
+  powers.push(base);
+  for i in 1..num_bits {
+    let (px, py) = powers[i - 1];
+    // Affine doubling: use Jacobian double then convert back
+    let (dx, dy, dz) = jacobian_double(px, py, E::Base::ONE, a);
+    let z_inv = dz.invert().unwrap();
+    let z_inv2 = z_inv.square();
+    let z_inv3 = z_inv2 * z_inv;
+    powers.push((dx * z_inv2, dy * z_inv3));
+  }
+  powers
+}
+
+// ============================================================================
 // Single-card gadget
 // ============================================================================
 
-/// Re-encrypt one ciphertext — the core gadget.
+/// Re-encrypt one ciphertext — the core gadget (self-contained per card).
 ///
 /// Per card:
 /// 1. Bit-decompose randomization scalar (constrained inline)
-/// 2. Scalar mul r·G using fixed-base (generator powers are compile-time constants)
-/// 3. Scalar mul r·PK using precomputed in-circuit power table
+/// 2. r·G via `scalar_mul_fixed_base` with natively precomputed powers (5 constraints/bit)
+/// 3. r·PK via `scalar_mul_variable_base` with inline doublings (9 constraints/bit)
 /// 4. c1' = c1 + r·G, c2' = c2 + r·PK
 pub fn rerandomize_ciphertext_bp<E: Engine, CS: ConstraintSystem<E::Base>>(
   mut cs: CS,
   ct: &ElGamalCiphertextVar<E>,
   randomization: &AllocatedNum<E::Base>,
-  pk_powers: &[AllocatedPointNonInfinity<E>],
-  generator: &AllocatedPointNonInfinity<E>,
-  gen_powers: &[(E::Base, E::Base)],
+  pk: &AllocatedPointNonInfinity<E>,
+  gen_powers_native: &[(E::Base, E::Base)],
 ) -> Result<ElGamalCiphertextVar<E>, SynthesisError> {
   let num_bits = E::Base::NUM_BITS as usize;
 
   // Step 1: Bit-decompose the randomization scalar
   let r_bits = alloc_scalar_bits::<E, _>(cs.namespace(|| "r_bits"), randomization, num_bits)?;
 
-  // Step 2: r·G using fixed-base scalar mul (all doublings precomputed as constants)
-  let r_g = generator.scalar_mul_fixed_base(cs.namespace(|| "r_G"), &r_bits, gen_powers)?;
-
-  // Step 3: r·PK using precomputed power table (doublings shared across all cards)
-  let r_pk = AllocatedPointNonInfinity::scalar_mul_with_powers(
-    cs.namespace(|| "r_PK"),
-    &r_bits,
-    pk_powers,
+  // Step 2: r·G using fixed-base scalar mul (natively precomputed powers, 5/bit)
+  let gen_base = AllocatedPointNonInfinity::<E>::alloc(
+    cs.namespace(|| "gen_base"),
+    Some(gen_powers_native[0]),
   )?;
+  let r_g = gen_base.scalar_mul_fixed_base(cs.namespace(|| "r_G"), &r_bits, gen_powers_native)?;
+
+  // Step 3: r·PK using variable-base scalar mul (inline doublings, 9/bit)
+  let r_pk = pk.scalar_mul_variable_base(cs.namespace(|| "r_PK"), &r_bits)?;
 
   // Step 4: c1' = c1 + r·G using incomplete addition (safe: unrelated random points)
   let c1_prime = ct.c1.add_incomplete(cs.namespace(|| "c1_plus_rG"), &r_g)?;
@@ -430,39 +436,19 @@ pub fn reencrypt_deck_bp<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
   randomizations: &[AllocatedNum<E::Base>; N],
   pk: &AllocatedPointNonInfinity<E>,
   native_data: &NativeReencryptionData<E, N>,
-  generator: &AllocatedPointNonInfinity<E>,
-  gen_powers: &[(E::Base, E::Base)],
+  gen_powers_native: &[(E::Base, E::Base)],
 ) -> Result<(), SynthesisError> {
-  let num_bits = E::Base::NUM_BITS as usize;
-
-  // Precompute PK power table in-circuit: pk_powers[i] = 2^i · PK
-  // 254 doublings = 1,016 vars, shared across all N cards
-  let mut pk_powers = Vec::with_capacity(num_bits);
-  pk_powers.push(pk.clone());
-  for i in 1..num_bits {
-    let next = pk_powers[i - 1].double_incomplete(cs.namespace(|| format!("pk_power_{}", i)))?;
-    pk_powers.push(next);
-  }
-
   if cs.is_witness_generator() {
     reencrypt_deck_parallel_witness::<E, CS, N>(
       cs,
       input_deck,
       randomizations,
-      &pk_powers,
-      generator,
-      gen_powers,
+      pk,
+      gen_powers_native,
       native_data,
     )
   } else {
-    reencrypt_deck_serial::<E, CS, N>(
-      cs,
-      input_deck,
-      randomizations,
-      &pk_powers,
-      generator,
-      gen_powers,
-    )
+    reencrypt_deck_serial::<E, CS, N>(cs, input_deck, randomizations, pk, gen_powers_native)
   }
 }
 
@@ -472,18 +458,16 @@ fn reencrypt_deck_serial<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
   cs: &mut CS,
   input_deck: &[ElGamalCiphertextVar<E>; N],
   randomizations: &[AllocatedNum<E::Base>; N],
-  pk_powers: &[AllocatedPointNonInfinity<E>],
-  generator: &AllocatedPointNonInfinity<E>,
-  gen_powers: &[(E::Base, E::Base)],
+  pk: &AllocatedPointNonInfinity<E>,
+  gen_powers_native: &[(E::Base, E::Base)],
 ) -> Result<(), SynthesisError> {
   for i in 0..N {
     let ct = rerandomize_ciphertext_bp::<E, _>(
       cs.namespace(|| format!("reencrypt_{}", i)),
       &input_deck[i],
       &randomizations[i],
-      pk_powers,
-      generator,
-      gen_powers,
+      pk,
+      gen_powers_native,
     )?;
     ct.c1.x.inputize(cs.namespace(|| format!("output_ct_{}_c1x", i)))?;
     ct.c1.y.inputize(cs.namespace(|| format!("output_ct_{}_c1y", i)))?;
@@ -507,24 +491,16 @@ fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, con
   cs: &mut CS,
   input_deck: &[ElGamalCiphertextVar<E>; N],
   randomizations: &[AllocatedNum<E::Base>; N],
-  pk_powers: &[AllocatedPointNonInfinity<E>],
-  generator: &AllocatedPointNonInfinity<E>,
-  gen_powers: &[(E::Base, E::Base)],
+  pk: &AllocatedPointNonInfinity<E>,
+  gen_powers_native: &[(E::Base, E::Base)],
   native_data: &NativeReencryptionData<E, N>,
 ) -> Result<(), SynthesisError> {
   // === Phase 1: Extract native values (serial, cheap) ===
-  let gen_x_val = generator.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-  let gen_y_val = generator.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-
-  let pk_power_vals: Vec<(E::Base, E::Base)> = pk_powers
-    .iter()
-    .map(|p| {
-      Ok((
-        p.x.get_value().ok_or(SynthesisError::AssignmentMissing)?,
-        p.y.get_value().ok_or(SynthesisError::AssignmentMissing)?,
-      ))
-    })
-    .collect::<Result<Vec<_>, SynthesisError>>()?;
+  // Only need pk coords (2 values) + per-card ct/r values (5 each)
+  let pk_val = (
+    pk.x.get_value().ok_or(SynthesisError::AssignmentMissing)?,
+    pk.y.get_value().ok_or(SynthesisError::AssignmentMissing)?,
+  );
 
   struct CardInputs<F: PrimeField> {
     ct_c1_x: F,
@@ -546,10 +522,9 @@ fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, con
     })
     .collect::<Result<Vec<_>, SynthesisError>>()?;
 
-  let num_bits = E::Base::NUM_BITS as usize;
-
   // === Phase 2: Parallel witness synthesis ===
   // Each card returns (gadget_aux_values, [c1x_off, c1y_off, c2x_off, c2y_off])
+  // gen_powers_native is shared by & reference — no re-allocation needed.
   let card_results: Vec<(Vec<E::Base>, [usize; 4])> = card_inputs
     .par_iter()
     .enumerate()
@@ -565,24 +540,14 @@ fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, con
       let r_var = AllocatedNum::alloc(mini_cs.namespace(|| "r"), || Ok(inputs.randomization))
         .expect("alloc r");
 
-      // Allocate pk_powers in mini_cs (these are "inputs" — skipped when copying)
-      let mut mini_pk_powers = Vec::with_capacity(num_bits);
-      for (j, &(px, py)) in pk_power_vals.iter().enumerate() {
-        let p = AllocatedPointNonInfinity::<E>::alloc(
-          mini_cs.namespace(|| format!("pk_pow_{}", j)),
-          Some((px, py)),
-        )
-        .expect("alloc pk_power");
-        mini_pk_powers.push(p);
-      }
-
-      let gen_var = AllocatedPointNonInfinity::<E>::alloc(
-        mini_cs.namespace(|| "gen"),
-        Some((gen_x_val, gen_y_val)),
+      // Allocate pk in mini_cs (2 aux vars — skipped when copying)
+      let mini_pk = AllocatedPointNonInfinity::<E>::alloc(
+        mini_cs.namespace(|| "pk"),
+        Some(pk_val),
       )
-      .expect("alloc gen");
+      .expect("alloc pk");
 
-      // Record how many aux vars were allocated for inputs (ct + r + pk_powers + gen).
+      // Record how many aux vars were allocated for inputs (ct + r + pk).
       // These already exist on the main CS — we must skip them when copying.
       let input_aux_count = mini_cs.aux_assignment.len();
 
@@ -590,9 +555,8 @@ fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, con
         mini_cs.namespace(|| format!("reencrypt_{}", i)),
         &ct_var,
         &r_var,
-        &mini_pk_powers,
-        &gen_var,
-        gen_powers,
+        &mini_pk,
+        gen_powers_native,
       )
       .expect("rerandomize failed");
 
@@ -704,9 +668,6 @@ mod tests {
     let gen_coords = find_point_on_curve(a, b);
     let num_bits = Base::NUM_BITS as usize;
 
-    // Precompute generator power table (constants)
-    let gen_powers = precompute_fixed_base_powers(gen_coords, a, num_bits);
-
     let ct_native = make_random_ciphertext();
     let ct_var =
       ElGamalCiphertextVar::<E>::alloc(cs.namespace(|| "ct"), &ct_native).expect("alloc ct");
@@ -721,29 +682,15 @@ mod tests {
     )
     .expect("alloc pk");
 
-    // Precompute PK power table in-circuit
-    let mut pk_powers = Vec::with_capacity(num_bits);
-    pk_powers.push(pk_var.clone());
-    for i in 1..num_bits {
-      let next = pk_powers[i - 1]
-        .double_incomplete(cs.namespace(|| format!("pk_power_{}", i)))
-        .expect("double pk");
-      pk_powers.push(next);
-    }
-
-    let gen_var = AllocatedPointNonInfinity::<E>::alloc(
-      cs.namespace(|| "gen"),
-      Some(gen_coords),
-    )
-    .expect("alloc gen");
+    // Precompute generator powers natively
+    let gen_powers_native = precompute_native_powers::<E>(gen_coords, num_bits);
 
     let result = rerandomize_ciphertext_bp::<E, _>(
       cs.namespace(|| "reencrypt"),
       &ct_var,
       &r_var,
-      &pk_powers,
-      &gen_var,
-      &gen_powers,
+      &pk_var,
+      &gen_powers_native,
     );
 
     assert!(result.is_ok(), "Gadget failed: {:?}", result.err());
@@ -875,8 +822,6 @@ mod tests {
   fn test_parallel_witness_synthesis() {
     let (a, b, _, _) = <E as Engine>::GE::group_params();
     let gen_coords = find_point_on_curve(a, b);
-    let num_bits = Base::NUM_BITS as usize;
-    let gen_powers = precompute_fixed_base_powers(gen_coords, a, num_bits);
 
     // Use a different point for PK to avoid P=Q edge cases in gadget
     let mut pk_x = gen_coords.0 + Base::from(10u64);
@@ -926,15 +871,13 @@ mod tests {
       Some((pk_coords.0, pk_coords.1)),
     )
     .unwrap();
-    let gen_serial = AllocatedPointNonInfinity::<E>::alloc(
-      cs_serial.namespace(|| "gen"),
-      Some(gen_coords),
-    )
-    .unwrap();
 
     let input_deck_arr: [ElGamalCiphertextVar<E>; N] =
       input_deck_serial.try_into().ok().unwrap();
     let rand_arr: [AllocatedNum<Base>; N] = rand_vars_serial.try_into().ok().unwrap();
+
+    let num_bits = Base::NUM_BITS as usize;
+    let gen_powers_native = precompute_native_powers::<E>(gen_coords, num_bits);
 
     let serial_result = reencrypt_deck_bp::<E, _, N>(
       &mut cs_serial,
@@ -942,8 +885,7 @@ mod tests {
       &rand_arr,
       &pk_serial,
       &native_data,
-      &gen_serial,
-      &gen_powers,
+      &gen_powers_native,
     );
 
     assert!(serial_result.is_ok(), "Serial gadget failed: {:?}", serial_result.err());
@@ -981,11 +923,6 @@ mod tests {
       Some((pk_coords.0, pk_coords.1)),
     )
     .unwrap();
-    let gen_par = AllocatedPointNonInfinity::<E>::alloc(
-      cs_parallel.namespace(|| "gen"),
-      Some(gen_coords),
-    )
-    .unwrap();
 
     let input_deck_arr_par: [ElGamalCiphertextVar<E>; N] =
       input_deck_par.try_into().ok().unwrap();
@@ -997,8 +934,7 @@ mod tests {
       &rand_arr_par,
       &pk_par,
       &native_data,
-      &gen_par,
-      &gen_powers,
+      &gen_powers_native,
     );
 
     assert!(par_result.is_ok(), "Parallel gadget failed: {:?}", par_result.err());
@@ -1011,9 +947,6 @@ mod tests {
   fn test_parallel_witness_satisfies_constraints() {
     let (a, b, _, _) = <E as Engine>::GE::group_params();
     let gen_coords = find_point_on_curve(a, b);
-    let num_bits = Base::NUM_BITS as usize;
-    let gen_powers = precompute_fixed_base_powers(gen_coords, a, num_bits);
-
     let mut pk_x = gen_coords.0 + Base::from(10u64);
     let pk_coords = loop {
       let rhs = pk_x.cube() + a * pk_x + b;
@@ -1024,6 +957,9 @@ mod tests {
     };
 
     const N: usize = 4;
+    let num_bits = Base::NUM_BITS as usize;
+    let gen_powers_native = precompute_native_powers::<E>(gen_coords, num_bits);
+
     let mut ct_natives = Vec::with_capacity(N);
     let mut r_natives = Vec::with_capacity(N);
 
@@ -1060,11 +996,6 @@ mod tests {
       Some(pk_coords),
     )
     .unwrap();
-    let gen_var = AllocatedPointNonInfinity::<E>::alloc(
-      cs_serial.namespace(|| "gen"),
-      Some(gen_coords),
-    )
-    .unwrap();
 
     let deck_arr: [ElGamalCiphertextVar<E>; N] = input_deck.try_into().ok().unwrap();
     let rand_arr: [AllocatedNum<Base>; N] = rand_vars.try_into().ok().unwrap();
@@ -1075,8 +1006,7 @@ mod tests {
       &rand_arr,
       &pk_var,
       &native_data,
-      &gen_var,
-      &gen_powers,
+      &gen_powers_native,
     )
     .expect("serial gadget failed");
 
@@ -1112,11 +1042,6 @@ mod tests {
       Some(pk_coords),
     )
     .unwrap();
-    let gen_par = AllocatedPointNonInfinity::<E>::alloc(
-      cs_parallel.namespace(|| "gen"),
-      Some(gen_coords),
-    )
-    .unwrap();
 
     let deck_arr_par: [ElGamalCiphertextVar<E>; N] =
       input_deck_par.try_into().ok().unwrap();
@@ -1128,8 +1053,7 @@ mod tests {
       &rand_arr_par,
       &pk_par,
       &native_data,
-      &gen_par,
-      &gen_powers,
+      &gen_powers_native,
     )
     .expect("parallel gadget failed");
 
@@ -1198,11 +1122,8 @@ mod tests {
       }
     }
 
-    let (curve_a, _, _, _) = <ECEngine as Engine>::GE::group_params();
     let gen_coords = find_vesta_point(Scalar::ONE);
     let pk_coords = find_vesta_point(Scalar::from(100u64));
-    let num_bits = Scalar::NUM_BITS as usize;
-    let gen_powers = precompute_fixed_base_powers(gen_coords, curve_a, num_bits);
 
     let mut input_cts = Vec::with_capacity(N);
     for i in 0..N {
@@ -1221,15 +1142,17 @@ mod tests {
     let native_data =
       native_reencrypt_parallel::<ECEngine, N>(&ct_arr, &rand_arr, pk_coords, gen_coords);
 
+    let num_bits = Scalar::NUM_BITS as usize;
+    let gen_powers_native = precompute_native_powers::<ECEngine>(gen_coords, num_bits);
+
     /// Minimal circuit that only does re-encryption (no permutation checks)
     #[derive(Clone)]
     struct ReencryptCircuit {
       input_cts: [ElGamalCiphertext<ECEngine>; N],
       randomizations: [Scalar; N],
       pk_coords: (Scalar, Scalar),
-      gen_coords: (Scalar, Scalar),
+      gen_powers_native: Vec<(Scalar, Scalar)>,
       native_data: NativeReencryptionData<ECEngine, N>,
-      gen_powers: Vec<(Scalar, Scalar)>,
     }
 
     impl SpartanCircuit<SpartanE> for ReencryptCircuit {
@@ -1287,10 +1210,6 @@ mod tests {
           cs.namespace(|| "pk"),
           Some(self.pk_coords),
         )?;
-        let gen_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
-          cs.namespace(|| "gen"),
-          Some(self.gen_coords),
-        )?;
 
         let deck_arr: [ElGamalCiphertextVar<ECEngine>; N] =
           deck_vars.try_into().ok().unwrap();
@@ -1302,8 +1221,7 @@ mod tests {
           &rand_arr,
           &pk_var,
           &self.native_data,
-          &gen_var,
-          &self.gen_powers,
+          &self.gen_powers_native,
         )
       }
     }
@@ -1312,9 +1230,8 @@ mod tests {
       input_cts: ct_arr,
       randomizations: rand_arr,
       pk_coords,
-      gen_coords,
+      gen_powers_native,
       native_data,
-      gen_powers,
     };
 
     // Setup (ShapeCS → serial path)
@@ -1336,7 +1253,6 @@ mod tests {
     let (a, b, _, _) = <E as Engine>::GE::group_params();
     let gen_coords = find_point_on_curve(a, b);
     let num_bits = Base::NUM_BITS as usize;
-    let gen_powers = precompute_fixed_base_powers(gen_coords, a, num_bits);
 
     let mut pk_x = gen_coords.0 + Base::from(10u64);
     let pk_coords = loop {
@@ -1348,6 +1264,8 @@ mod tests {
     };
 
     const N: usize = 52;
+    let gen_powers_native = precompute_native_powers::<E>(gen_coords, num_bits);
+
     let mut ct_natives = Vec::with_capacity(N);
     let mut r_natives = Vec::with_capacity(N);
 
@@ -1362,7 +1280,7 @@ mod tests {
     let native_data =
       native_reencrypt_parallel::<E, N>(&ct_arr, &r_arr, pk_coords, gen_coords);
 
-    // Serial witness timing — use reencrypt_deck_bp which now includes pk_powers precomputation
+    // Serial witness timing — each card runs rerandomize_ciphertext_bp sequentially
     let serial_start = Instant::now();
     {
       let mut cs = WitnessCS::<Base>::new();
@@ -1382,24 +1300,9 @@ mod tests {
         Some((pk_coords.0, pk_coords.1)),
       )
       .unwrap();
-      let gen_pt = AllocatedPointNonInfinity::<E>::alloc(
-        cs.namespace(|| "gen"),
-        Some(gen_coords),
-      )
-      .unwrap();
 
       let deck_arr: [ElGamalCiphertextVar<E>; N] = deck.try_into().ok().unwrap();
       let rand_arr: [AllocatedNum<Base>; N] = rands.try_into().ok().unwrap();
-
-      // Precompute pk_powers for serial test
-      let mut pk_power_vars = Vec::with_capacity(num_bits);
-      pk_power_vars.push(pk.clone());
-      for i in 1..num_bits {
-        let next = pk_power_vars[i - 1]
-          .double_incomplete(cs.namespace(|| format!("pk_power_{}", i)))
-          .unwrap();
-        pk_power_vars.push(next);
-      }
 
       // Serial: run each card's gadget sequentially on the main CS
       for i in 0..N {
@@ -1407,9 +1310,8 @@ mod tests {
           cs.namespace(|| format!("serial_reencrypt_{}", i)),
           &deck_arr[i],
           &rand_arr[i],
-          &pk_power_vars,
-          &gen_pt,
-          &gen_powers,
+          &pk,
+          &gen_powers_native,
         )
         .unwrap();
       }
@@ -1436,11 +1338,6 @@ mod tests {
         Some((pk_coords.0, pk_coords.1)),
       )
       .unwrap();
-      let gen_pt = AllocatedPointNonInfinity::<E>::alloc(
-        cs.namespace(|| "gen"),
-        Some(gen_coords),
-      )
-      .unwrap();
 
       let deck_arr: [ElGamalCiphertextVar<E>; N] = deck.try_into().ok().unwrap();
       let rand_arr: [AllocatedNum<Base>; N] = rands.try_into().ok().unwrap();
@@ -1451,8 +1348,7 @@ mod tests {
         &rand_arr,
         &pk,
         &native_data,
-        &gen_pt,
-        &gen_powers,
+        &gen_powers_native,
       )
       .unwrap();
     }

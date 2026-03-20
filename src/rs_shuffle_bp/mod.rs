@@ -42,8 +42,8 @@ pub use data_structures::{
 };
 
 pub use encryption::{
-  native_reencrypt_parallel, reencrypt_deck_bp, rerandomize_ciphertext_bp,
-  NativeReencryptionData,
+  native_reencrypt_parallel, precompute_native_powers, reencrypt_deck_bp,
+  rerandomize_ciphertext_bp, NativeReencryptionData,
 };
 pub use native::{prepare_rs_witness_trace, run_rs_shuffle_permutation, RSShuffleTrace};
 pub use permutation::IndexedCiphertext;

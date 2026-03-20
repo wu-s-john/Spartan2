@@ -1246,4 +1246,48 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
       &Boolean::from(scalar_bits[0].clone()),
     )
   }
+
+  /// Scalar multiplication with inline doublings (variable base).
+  ///
+  /// Unlike `scalar_mul_fixed_base` (which uses natively precomputed constant powers)
+  /// or `scalar_mul_with_powers` (which uses shared in-circuit power tables), this
+  /// method computes all doublings inline. This makes each call fully self-contained
+  /// — no shared state required — at the cost of more constraints per call.
+  ///
+  /// Cost: 4 + (num_bits-1) × 9 + 5 = **9·num_bits** constraints per call.
+  pub fn scalar_mul_variable_base<CS: ConstraintSystem<E::Base>>(
+    &self,
+    mut cs: CS,
+    scalar_bits: &[AllocatedBit],
+  ) -> Result<Self, SynthesisError> {
+    // Assume bit[0] = 1: acc = self
+    let mut acc = self.clone();
+    // power = 2·self (first doubling)
+    let mut power = self.double_incomplete(cs.namespace(|| "double_0"))?;
+
+    for i in 1..scalar_bits.len() {
+      // acc = acc + power if bit[i] = 1, else acc unchanged
+      let temp = acc.add_incomplete(cs.namespace(|| format!("add {i}")), &power)?;
+      acc = AllocatedPointNonInfinity::conditionally_select(
+        cs.namespace(|| format!("acc_iteration_{i}")),
+        &temp,
+        &acc,
+        &Boolean::from(scalar_bits[i].clone()),
+      )?;
+      // power = 2·power (except on last iteration, where it's wasted)
+      if i < scalar_bits.len() - 1 {
+        power = power.double_incomplete(cs.namespace(|| format!("double_{i}")))?;
+      }
+    }
+
+    // Remove initial slack (assumption that bit[0]=1):
+    // subtract base point if bit[0]=0
+    let acc_adj = acc.sub_incomplete(cs.namespace(|| "sub_base"), self)?;
+    AllocatedPointNonInfinity::conditionally_select(
+      cs.namespace(|| "remove slack if necessary"),
+      &acc,
+      &acc_adj,
+      &Boolean::from(scalar_bits[0].clone()),
+    )
+  }
 }
