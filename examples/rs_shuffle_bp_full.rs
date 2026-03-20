@@ -219,8 +219,8 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
     }
     let rand_arr: [AllocatedNum<Scalar>; N] = rand_vars.try_into().ok().unwrap();
 
-    // Re-encrypt the deck
-    let output_deck = reencrypt_deck_bp::<ECEngine, _, N>(
+    // Re-encrypt the deck (includes inputize for output coords)
+    reencrypt_deck_bp::<ECEngine, _, N>(
       cs,
       &shuffled_deck,
       &rand_arr,
@@ -229,14 +229,6 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       &gen_var,
       &self.gen_powers,
     )?;
-
-    // Inputize output ciphertexts — public inputs
-    for i in 0..N {
-      output_deck[i].c1.x.inputize(cs.namespace(|| format!("output_ct_{}_c1x", i)))?;
-      output_deck[i].c1.y.inputize(cs.namespace(|| format!("output_ct_{}_c1y", i)))?;
-      output_deck[i].c2.x.inputize(cs.namespace(|| format!("output_ct_{}_c2x", i)))?;
-      output_deck[i].c2.y.inputize(cs.namespace(|| format!("output_ct_{}_c2y", i)))?;
-    }
 
     // =========================================================================
     // Allocate challenges as public inputs (must come after all inputize calls)

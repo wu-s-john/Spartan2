@@ -429,10 +429,10 @@ pub fn reencrypt_deck_bp<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
   input_deck: &[ElGamalCiphertextVar<E>; N],
   randomizations: &[AllocatedNum<E::Base>; N],
   pk: &AllocatedPointNonInfinity<E>,
-  _native_data: &NativeReencryptionData<E, N>,
+  native_data: &NativeReencryptionData<E, N>,
   generator: &AllocatedPointNonInfinity<E>,
   gen_powers: &[(E::Base, E::Base)],
-) -> Result<[ElGamalCiphertextVar<E>; N], SynthesisError> {
+) -> Result<(), SynthesisError> {
   let num_bits = E::Base::NUM_BITS as usize;
 
   // Precompute PK power table in-circuit: pk_powers[i] = 2^i · PK
@@ -444,17 +444,30 @@ pub fn reencrypt_deck_bp<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
     pk_powers.push(next);
   }
 
-  reencrypt_deck_serial::<E, CS, N>(
-    cs,
-    input_deck,
-    randomizations,
-    &pk_powers,
-    generator,
-    gen_powers,
-  )
+  if cs.is_witness_generator() {
+    reencrypt_deck_parallel_witness::<E, CS, N>(
+      cs,
+      input_deck,
+      randomizations,
+      &pk_powers,
+      generator,
+      gen_powers,
+      native_data,
+    )
+  } else {
+    reencrypt_deck_serial::<E, CS, N>(
+      cs,
+      input_deck,
+      randomizations,
+      &pk_powers,
+      generator,
+      gen_powers,
+    )
+  }
 }
 
-/// Serial re-encryption — used during shape (setup) phase
+/// Serial re-encryption — used during shape (setup) phase.
+/// Runs `rerandomize_ciphertext_bp` per card and inputizes the 4 output coords.
 fn reencrypt_deck_serial<E: Engine, CS: ConstraintSystem<E::Base>, const N: usize>(
   cs: &mut CS,
   input_deck: &[ElGamalCiphertextVar<E>; N],
@@ -462,8 +475,7 @@ fn reencrypt_deck_serial<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
   pk_powers: &[AllocatedPointNonInfinity<E>],
   generator: &AllocatedPointNonInfinity<E>,
   gen_powers: &[(E::Base, E::Base)],
-) -> Result<[ElGamalCiphertextVar<E>; N], SynthesisError> {
-  let mut results = Vec::with_capacity(N);
+) -> Result<(), SynthesisError> {
   for i in 0..N {
     let ct = rerandomize_ciphertext_bp::<E, _>(
       cs.namespace(|| format!("reencrypt_{}", i)),
@@ -473,12 +485,12 @@ fn reencrypt_deck_serial<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
       generator,
       gen_powers,
     )?;
-    results.push(ct);
+    ct.c1.x.inputize(cs.namespace(|| format!("output_ct_{}_c1x", i)))?;
+    ct.c1.y.inputize(cs.namespace(|| format!("output_ct_{}_c1y", i)))?;
+    ct.c2.x.inputize(cs.namespace(|| format!("output_ct_{}_c2x", i)))?;
+    ct.c2.y.inputize(cs.namespace(|| format!("output_ct_{}_c2y", i)))?;
   }
-
-  results
-    .try_into()
-    .map_err(|_| SynthesisError::Unsatisfiable)
+  Ok(())
 }
 
 /// Parallel witness generation for re-encryption.
@@ -486,7 +498,11 @@ fn reencrypt_deck_serial<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
 /// Runs each card's gadget on a separate `WitnessCS` (where `enforce()` is a no-op),
 /// then fills pre-allocated aux slots via `allocate_empty`. This produces exactly
 /// the same aux variable count as the serial path — no extra allocations.
-#[allow(dead_code)]
+///
+/// Phase 1: Extract native values from main CS handles (serial, cheap)
+/// Phase 2: par_iter over N cards, each on its own WitnessCS (parallel, expensive)
+/// Phase 3: Pre-allocate + copy aux values into main CS (serial, cheap)
+/// Phase 4: Inputize output coords using aux variable references (serial, cheap)
 fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, const N: usize>(
   cs: &mut CS,
   input_deck: &[ElGamalCiphertextVar<E>; N],
@@ -494,11 +510,12 @@ fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, con
   pk_powers: &[AllocatedPointNonInfinity<E>],
   generator: &AllocatedPointNonInfinity<E>,
   gen_powers: &[(E::Base, E::Base)],
+  native_data: &NativeReencryptionData<E, N>,
 ) -> Result<(), SynthesisError> {
+  // === Phase 1: Extract native values (serial, cheap) ===
   let gen_x_val = generator.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
   let gen_y_val = generator.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
 
-  // Extract native values for pk_powers
   let pk_power_vals: Vec<(E::Base, E::Base)> = pk_powers
     .iter()
     .map(|p| {
@@ -531,8 +548,9 @@ fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, con
 
   let num_bits = E::Base::NUM_BITS as usize;
 
-  // Run all N gadgets in parallel on separate WitnessCS instances
-  let mini_witnesses: Vec<Vec<E::Base>> = card_inputs
+  // === Phase 2: Parallel witness synthesis ===
+  // Each card returns (gadget_aux_values, [c1x_off, c1y_off, c2x_off, c2y_off])
+  let card_results: Vec<(Vec<E::Base>, [usize; 4])> = card_inputs
     .par_iter()
     .enumerate()
     .map(|(i, inputs)| {
@@ -568,7 +586,7 @@ fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, con
       // These already exist on the main CS — we must skip them when copying.
       let input_aux_count = mini_cs.aux_assignment.len();
 
-      let _result = rerandomize_ciphertext_bp::<E, _>(
+      let result = rerandomize_ciphertext_bp::<E, _>(
         mini_cs.namespace(|| format!("reencrypt_{}", i)),
         &ct_var,
         &r_var,
@@ -578,21 +596,64 @@ fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, con
       )
       .expect("rerandomize failed");
 
+      // Capture output coord offsets relative to gadget's own aux vars
+      let extract_aux_offset = |var: Variable| -> usize {
+        let Variable(Index::Aux(j)) = var else {
+          panic!("expected aux variable");
+        };
+        j - input_aux_count
+      };
+      let offsets = [
+        extract_aux_offset(result.c1.x.get_variable()),
+        extract_aux_offset(result.c1.y.get_variable()),
+        extract_aux_offset(result.c2.x.get_variable()),
+        extract_aux_offset(result.c2.y.get_variable()),
+      ];
+
       // Only return the gadget's own variables, not the re-allocated inputs
-      mini_cs.aux_assignment[input_aux_count..].to_vec()
+      (mini_cs.aux_assignment[input_aux_count..].to_vec(), offsets)
     })
     .collect();
 
-  // Pre-allocate exactly the right number of aux slots, then fill them.
-  // This matches the serial path's variable count: each card produces K aux vars,
-  // serial allocates them one-by-one, we pre-allocate N*K and copy in bulk.
-  let total_aux: usize = mini_witnesses.iter().map(|w| w.len()).sum();
+  // === Phase 3: Pre-allocate and fill aux slots ===
+  let vars_per_card = card_results[0].0.len();
+  let base_aux_idx = cs.aux_slice().len();
+  let total_aux = N * vars_per_card;
   let (aux_slice, _) = cs.allocate_empty(total_aux, 0);
 
   let mut offset = 0;
-  for mini_w in &mini_witnesses {
-    aux_slice[offset..offset + mini_w.len()].copy_from_slice(mini_w);
-    offset += mini_w.len();
+  for (aux_vals, _) in &card_results {
+    aux_slice[offset..offset + aux_vals.len()].copy_from_slice(aux_vals);
+    offset += aux_vals.len();
+  }
+
+  // === Phase 4: Inputize output coords ===
+  // Use offsets from first card (deterministic gadget → same structure for all cards)
+  let output_offsets = card_results[0].1;
+  let coord_names = ["c1x", "c1y", "c2x", "c2y"];
+
+  for i in 0..N {
+    let ct = &native_data.output_ciphertexts[i];
+    let coord_values = [ct.c1_x, ct.c1_y, ct.c2_x, ct.c2_y];
+
+    for (k, &off) in output_offsets.iter().enumerate() {
+      let aux_idx = base_aux_idx + i * vars_per_card + off;
+      let aux_var = Variable(Index::Aux(aux_idx));
+      let value = coord_values[k];
+
+      let input_var = cs.alloc_input(
+        || format!("output_ct_{}_{}", i, coord_names[k]),
+        || Ok(value),
+      )?;
+      // enforce input_var * 1 = aux_var (no-op on SatisfyingAssignment,
+      // but the constraint exists from setup's serial path)
+      cs.enforce(
+        || format!("inputize_output_ct_{}_{}", i, coord_names[k]),
+        |lc| lc + input_var,
+        |lc| lc + CS::one(),
+        |lc| lc + aux_var,
+      );
+    }
   }
 
   Ok(())
@@ -944,6 +1005,330 @@ mod tests {
 
     let par_aux_len = cs_parallel.aux_assignment.len();
     println!("Parallel witness synthesis: {} aux values", par_aux_len);
+  }
+
+  #[test]
+  fn test_parallel_witness_satisfies_constraints() {
+    let (a, b, _, _) = <E as Engine>::GE::group_params();
+    let gen_coords = find_point_on_curve(a, b);
+    let num_bits = Base::NUM_BITS as usize;
+    let gen_powers = precompute_fixed_base_powers(gen_coords, a, num_bits);
+
+    let mut pk_x = gen_coords.0 + Base::from(10u64);
+    let pk_coords = loop {
+      let rhs = pk_x.cube() + a * pk_x + b;
+      if let Some(y) = Option::from(rhs.sqrt()) {
+        break (pk_x, y);
+      }
+      pk_x += Base::ONE;
+    };
+
+    const N: usize = 4;
+    let mut ct_natives = Vec::with_capacity(N);
+    let mut r_natives = Vec::with_capacity(N);
+
+    for i in 0..N {
+      ct_natives.push(make_random_ciphertext());
+      r_natives.push(Base::from((i + 10) as u64));
+    }
+
+    let ct_arr: [ElGamalCiphertext<E>; N] = ct_natives.clone().try_into().ok().unwrap();
+    let r_arr: [Base; N] = r_natives.clone().try_into().ok().unwrap();
+
+    let native_data =
+      native_reencrypt_parallel::<E, N>(&ct_arr, &r_arr, pk_coords, gen_coords);
+
+    // 1. Serial path on TestConstraintSystem: records constraints + witness
+    let mut cs_serial = TestConstraintSystem::<Base>::new();
+
+    let mut input_deck = Vec::with_capacity(N);
+    let mut rand_vars = Vec::with_capacity(N);
+    for i in 0..N {
+      input_deck.push(
+        ElGamalCiphertextVar::<E>::alloc(
+          cs_serial.namespace(|| format!("ct_{}", i)),
+          &ct_arr[i],
+        )
+        .unwrap(),
+      );
+      rand_vars.push(
+        AllocatedNum::alloc(cs_serial.namespace(|| format!("r_{}", i)), || Ok(r_arr[i])).unwrap(),
+      );
+    }
+    let pk_var = AllocatedPointNonInfinity::<E>::alloc(
+      cs_serial.namespace(|| "pk"),
+      Some(pk_coords),
+    )
+    .unwrap();
+    let gen_var = AllocatedPointNonInfinity::<E>::alloc(
+      cs_serial.namespace(|| "gen"),
+      Some(gen_coords),
+    )
+    .unwrap();
+
+    let deck_arr: [ElGamalCiphertextVar<E>; N] = input_deck.try_into().ok().unwrap();
+    let rand_arr: [AllocatedNum<Base>; N] = rand_vars.try_into().ok().unwrap();
+
+    reencrypt_deck_bp::<E, _, N>(
+      &mut cs_serial,
+      &deck_arr,
+      &rand_arr,
+      &pk_var,
+      &native_data,
+      &gen_var,
+      &gen_powers,
+    )
+    .expect("serial gadget failed");
+
+    assert!(
+      cs_serial.is_satisfied(),
+      "Serial constraints not satisfied! {:?}",
+      cs_serial.which_is_unsatisfied()
+    );
+
+    let serial_aux = cs_serial.scalar_aux();
+    let serial_inputs = cs_serial.scalar_inputs();
+
+    // 2. Parallel path on WitnessCS
+    let mut cs_parallel = WitnessCS::<Base>::new();
+
+    let mut input_deck_par = Vec::with_capacity(N);
+    let mut rand_vars_par = Vec::with_capacity(N);
+    for i in 0..N {
+      input_deck_par.push(
+        ElGamalCiphertextVar::<E>::alloc(
+          cs_parallel.namespace(|| format!("ct_{}", i)),
+          &ct_arr[i],
+        )
+        .unwrap(),
+      );
+      rand_vars_par.push(
+        AllocatedNum::alloc(cs_parallel.namespace(|| format!("r_{}", i)), || Ok(r_arr[i]))
+          .unwrap(),
+      );
+    }
+    let pk_par = AllocatedPointNonInfinity::<E>::alloc(
+      cs_parallel.namespace(|| "pk"),
+      Some(pk_coords),
+    )
+    .unwrap();
+    let gen_par = AllocatedPointNonInfinity::<E>::alloc(
+      cs_parallel.namespace(|| "gen"),
+      Some(gen_coords),
+    )
+    .unwrap();
+
+    let deck_arr_par: [ElGamalCiphertextVar<E>; N] =
+      input_deck_par.try_into().ok().unwrap();
+    let rand_arr_par: [AllocatedNum<Base>; N] = rand_vars_par.try_into().ok().unwrap();
+
+    reencrypt_deck_bp::<E, _, N>(
+      &mut cs_parallel,
+      &deck_arr_par,
+      &rand_arr_par,
+      &pk_par,
+      &native_data,
+      &gen_par,
+      &gen_powers,
+    )
+    .expect("parallel gadget failed");
+
+    let par_aux = &cs_parallel.aux_assignment;
+    let par_inputs = &cs_parallel.input_assignment;
+
+    // 3. Assert counts match
+    assert_eq!(
+      serial_aux.len(),
+      par_aux.len(),
+      "aux count mismatch: serial={}, parallel={}",
+      serial_aux.len(),
+      par_aux.len()
+    );
+    assert_eq!(
+      serial_inputs.len(),
+      par_inputs.len(),
+      "input count mismatch: serial={}, parallel={}",
+      serial_inputs.len(),
+      par_inputs.len()
+    );
+
+    // 4. Assert values are identical (deterministic gadget → same witness)
+    for (i, (s, p)) in serial_aux.iter().zip(par_aux.iter()).enumerate() {
+      assert_eq!(s, p, "aux[{}] mismatch", i);
+    }
+    for (i, (s, p)) in serial_inputs.iter().zip(par_inputs.iter()).enumerate() {
+      assert_eq!(s, p, "input[{}] mismatch", i);
+    }
+
+    // Since serial satisfies constraints and parallel produces identical values,
+    // the parallel witness necessarily satisfies all constraints too.
+    println!(
+      "Parallel witness matches serial: {} aux, {} inputs",
+      par_aux.len(),
+      par_inputs.len()
+    );
+  }
+
+  #[test]
+  fn test_parallel_witness_end_to_end_proof() {
+    use crate::provider::pasta::pallas;
+    use crate::provider::VestaHyraxEngine;
+    use crate::spartan::SpartanSNARK;
+    use crate::traits::circuit::SpartanCircuit;
+    use crate::traits::snark::R1CSSNARKTrait;
+
+    // Spartan engine: PallasHyraxEngine
+    // Circuit field: pallas::Scalar = vesta::Base
+    // EC engine for in-circuit ops: VestaHyraxEngine
+    type SpartanE = PallasHyraxEngine;
+    type ECEngine = VestaHyraxEngine;
+    type Scalar = pallas::Scalar;
+
+    const N: usize = 4;
+
+    fn find_vesta_point(start: Scalar) -> (Scalar, Scalar) {
+      let (a, b, _, _) = <VestaHyraxEngine as Engine>::GE::group_params();
+      let mut x = start;
+      loop {
+        let rhs = x.cube() + a * x + b;
+        if let Some(y) = Option::from(rhs.sqrt()) {
+          return (x, y);
+        }
+        x += Scalar::ONE;
+      }
+    }
+
+    let (curve_a, _, _, _) = <ECEngine as Engine>::GE::group_params();
+    let gen_coords = find_vesta_point(Scalar::ONE);
+    let pk_coords = find_vesta_point(Scalar::from(100u64));
+    let num_bits = Scalar::NUM_BITS as usize;
+    let gen_powers = precompute_fixed_base_powers(gen_coords, curve_a, num_bits);
+
+    let mut input_cts = Vec::with_capacity(N);
+    for i in 0..N {
+      let (c1_x, c1_y) = find_vesta_point(Scalar::from((i * 2 + 1) as u64));
+      let (c2_x, c2_y) = find_vesta_point(Scalar::from((i * 2 + 200) as u64));
+      input_cts.push(ElGamalCiphertext::<ECEngine>::new(c1_x, c1_y, c2_x, c2_y));
+    }
+    let ct_arr: [ElGamalCiphertext<ECEngine>; N] = input_cts.try_into().ok().unwrap();
+
+    let mut randomizations = Vec::with_capacity(N);
+    for i in 0..N {
+      randomizations.push(Scalar::from((i + 10) as u64));
+    }
+    let rand_arr: [Scalar; N] = randomizations.try_into().ok().unwrap();
+
+    let native_data =
+      native_reencrypt_parallel::<ECEngine, N>(&ct_arr, &rand_arr, pk_coords, gen_coords);
+
+    /// Minimal circuit that only does re-encryption (no permutation checks)
+    #[derive(Clone)]
+    struct ReencryptCircuit {
+      input_cts: [ElGamalCiphertext<ECEngine>; N],
+      randomizations: [Scalar; N],
+      pk_coords: (Scalar, Scalar),
+      gen_coords: (Scalar, Scalar),
+      native_data: NativeReencryptionData<ECEngine, N>,
+      gen_powers: Vec<(Scalar, Scalar)>,
+    }
+
+    impl SpartanCircuit<SpartanE> for ReencryptCircuit {
+      fn public_values(&self) -> Result<Vec<Scalar>, SynthesisError> {
+        let mut vals = Vec::with_capacity(4 * N);
+        for ct in &self.native_data.output_ciphertexts {
+          vals.push(ct.c1_x);
+          vals.push(ct.c1_y);
+          vals.push(ct.c2_x);
+          vals.push(ct.c2_y);
+        }
+        Ok(vals)
+      }
+
+      fn shared<CS: ConstraintSystem<Scalar>>(
+        &self,
+        _cs: &mut CS,
+      ) -> Result<Vec<AllocatedNum<Scalar>>, SynthesisError> {
+        Ok(vec![])
+      }
+
+      fn precommitted<CS: ConstraintSystem<Scalar>>(
+        &self,
+        _cs: &mut CS,
+        _shared: &[AllocatedNum<Scalar>],
+      ) -> Result<Vec<AllocatedNum<Scalar>>, SynthesisError> {
+        Ok(vec![])
+      }
+
+      fn num_challenges(&self) -> usize {
+        0
+      }
+
+      fn synthesize<CS: ConstraintSystem<Scalar>>(
+        &self,
+        cs: &mut CS,
+        _shared: &[AllocatedNum<Scalar>],
+        _precommitted: &[AllocatedNum<Scalar>],
+        _challenges: Option<&[Scalar]>,
+      ) -> Result<(), SynthesisError> {
+        let mut deck_vars = Vec::with_capacity(N);
+        let mut rand_vars = Vec::with_capacity(N);
+        for i in 0..N {
+          deck_vars.push(ElGamalCiphertextVar::<ECEngine>::alloc(
+            cs.namespace(|| format!("ct_{}", i)),
+            &self.input_cts[i],
+          )?);
+          rand_vars.push(AllocatedNum::alloc(
+            cs.namespace(|| format!("r_{}", i)),
+            || Ok(self.randomizations[i]),
+          )?);
+        }
+
+        let pk_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
+          cs.namespace(|| "pk"),
+          Some(self.pk_coords),
+        )?;
+        let gen_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
+          cs.namespace(|| "gen"),
+          Some(self.gen_coords),
+        )?;
+
+        let deck_arr: [ElGamalCiphertextVar<ECEngine>; N] =
+          deck_vars.try_into().ok().unwrap();
+        let rand_arr: [AllocatedNum<Scalar>; N] = rand_vars.try_into().ok().unwrap();
+
+        reencrypt_deck_bp::<ECEngine, _, N>(
+          cs,
+          &deck_arr,
+          &rand_arr,
+          &pk_var,
+          &self.native_data,
+          &gen_var,
+          &self.gen_powers,
+        )
+      }
+    }
+
+    let circuit = ReencryptCircuit {
+      input_cts: ct_arr,
+      randomizations: rand_arr,
+      pk_coords,
+      gen_coords,
+      native_data,
+      gen_powers,
+    };
+
+    // Setup (ShapeCS → serial path)
+    let (pk, vk) =
+      SpartanSNARK::<SpartanE>::setup(circuit.clone()).expect("Setup failed");
+
+    // Prep prove + prove (SatisfyingAssignment → parallel path)
+    let prep = SpartanSNARK::<SpartanE>::prep_prove(&pk, circuit.clone(), false)
+      .expect("Prep prove failed");
+    let proof = SpartanSNARK::<SpartanE>::prove(&pk, circuit, &prep, false)
+      .expect("Prove failed");
+
+    // Verify — if this passes, parallel witness is cryptographically valid
+    proof.verify(&vk).expect("Verification failed — parallel witness produced invalid proof");
   }
 
   #[test]
