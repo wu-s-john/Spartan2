@@ -31,6 +31,11 @@ impl<C: CurveAffine> Bucket<C> {
     }
   }
 
+  fn sub_assign(&mut self, other: &C) {
+    let neg = -*other;
+    self.add_assign(&neg);
+  }
+
   fn add(self, other: C::Curve) -> C::Curve {
     match self {
       Bucket::None => other,
@@ -41,12 +46,19 @@ impl<C: CurveAffine> Bucket<C> {
 }
 
 fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+  // Optimization 2: Optimal window size — compare cost at c and c+1
   let c = if bases.len() < 4 {
     1
   } else if bases.len() < 32 {
     3
   } else {
-    (f64::from(bases.len() as u32)).ln().ceil() as usize
+    let c_base = (f64::from(bases.len() as u32)).ln().ceil() as usize;
+    let cost = |c: usize| ((256 + c - 1) / c) * (bases.len() + (1 << c) - 1);
+    if cost(c_base + 1) < cost(c_base) {
+      c_base + 1
+    } else {
+      c_base
+    }
   };
 
   fn get_at<F: PrimeField>(segment: usize, c: usize, bytes: &F::Repr) -> usize {
@@ -70,14 +82,15 @@ fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve
   }
 
   // Boolean scalars: accumulated and separated from non-Boolean scalars
+  // Optimization 1: Pre-compute scalar byte representations (to_repr() once, not per window)
   let mut boolean_sum = C::Curve::identity();
-  let mut non_boolean = Vec::new();
+  let mut non_boolean: Vec<(<C::Scalar as PrimeField>::Repr, C)> = Vec::new();
 
   for (s, b) in coeffs.iter().zip(bases) {
     if *s == C::Scalar::ONE {
       boolean_sum += b;
     } else if *s != C::Scalar::ZERO {
-      non_boolean.push((*s, *b));
+      non_boolean.push((s.to_repr(), *b));
     }
   }
 
@@ -85,19 +98,49 @@ fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve
     return boolean_sum;
   }
 
+  // Optimization 3: Signed digit representation — halves bucket count per window
+  let half = 1usize << (c - 1); // 2^(c-1)
+  let num_windows = (256 + c - 1) / c + 1; // +1 for potential carry overflow
+
+  // Pre-compute signed digits for all scalars with carry propagation
+  let signed_digits: Vec<Vec<i32>> = non_boolean
+    .iter()
+    .map(|(repr, _)| {
+      let mut digits = Vec::with_capacity(num_windows);
+      let mut carry = 0u32;
+      for seg in 0..num_windows {
+        let raw = get_at::<C::Scalar>(seg, c, repr) as u32 + carry;
+        if raw == 0 {
+          digits.push(0i32);
+          carry = 0;
+        } else if (raw as usize) <= half {
+          digits.push(raw as i32);
+          carry = 0;
+        } else {
+          // d > half: use negative digit, carry 1 to next window
+          digits.push(raw as i32 - (1i32 << c));
+          carry = 1;
+        }
+      }
+      digits
+    })
+    .collect();
+
   let non_boolean_sum = {
-    let segments = (256 / c) + 1;
-    (0..segments)
+    let num_buckets = half; // 2^(c-1) buckets for |digit| in [1, 2^(c-1)]
+    (0..num_windows)
       .rev()
       .fold(C::Curve::identity(), |mut acc, segment| {
         (0..c).for_each(|_| acc = acc.double());
 
-        let mut buckets = vec![Bucket::None; (1 << c) - 1];
+        let mut buckets = vec![Bucket::None; num_buckets];
 
-        for (coeff, base) in non_boolean.iter() {
-          let coeff = get_at::<C::Scalar>(segment, c, &coeff.to_repr());
-          if coeff != 0 {
-            buckets[coeff - 1].add_assign(base);
+        for (i, (_, base)) in non_boolean.iter().enumerate() {
+          let d = signed_digits[i][segment];
+          if d > 0 {
+            buckets[(d as usize) - 1].add_assign(base);
+          } else if d < 0 {
+            buckets[(-d as usize) - 1].sub_assign(base);
           }
         }
 
