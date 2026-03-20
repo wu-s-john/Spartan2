@@ -53,7 +53,7 @@ fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve
     3
   } else {
     let c_base = (f64::from(bases.len() as u32)).ln().ceil() as usize;
-    let cost = |c: usize| ((256 + c - 1) / c) * (bases.len() + (1 << c) - 1);
+    let cost = |c: usize| ((256 + c - 1) / c) * (bases.len() + (1 << (c - 1)));
     if cost(c_base + 1) < cost(c_base) {
       c_base + 1
     } else {
@@ -99,32 +99,25 @@ fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve
   }
 
   // Optimization 3: Signed digit representation — halves bucket count per window
+  debug_assert!(c < 31, "window size c={c} would overflow 1i32 << c");
   let half = 1usize << (c - 1); // 2^(c-1)
   let num_windows = (256 + c - 1) / c + 1; // +1 for potential carry overflow
 
-  // Pre-compute signed digits for all scalars with carry propagation
-  let signed_digits: Vec<Vec<i32>> = non_boolean
-    .iter()
-    .map(|(repr, _)| {
-      let mut digits = Vec::with_capacity(num_windows);
-      let mut carry = 0u32;
-      for seg in 0..num_windows {
-        let raw = get_at::<C::Scalar>(seg, c, repr) as u32 + carry;
-        if raw == 0 {
-          digits.push(0i32);
-          carry = 0;
-        } else if (raw as usize) <= half {
-          digits.push(raw as i32);
-          carry = 0;
-        } else {
-          // d > half: use negative digit, carry 1 to next window
-          digits.push(raw as i32 - (1i32 << c));
-          carry = 1;
-        }
-      }
-      digits
-    })
-    .collect();
+  // Pre-compute signed digits for all scalars with carry propagation (flat layout)
+  let mut signed_digits = vec![0i32; non_boolean.len() * num_windows];
+  for (i, (repr, _)) in non_boolean.iter().enumerate() {
+    let mut carry = 0u32;
+    for seg in 0..num_windows {
+      let raw = get_at::<C::Scalar>(seg, c, repr) as u32 + carry;
+      let (digit, new_carry) = if (raw as usize) <= half {
+        (raw as i32, 0)
+      } else {
+        (raw as i32 - (1i32 << c), 1)
+      };
+      signed_digits[i * num_windows + seg] = digit;
+      carry = new_carry;
+    }
+  }
 
   let non_boolean_sum = {
     let num_buckets = half; // 2^(c-1) buckets for |digit| in [1, 2^(c-1)]
@@ -136,7 +129,7 @@ fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve
         let mut buckets = vec![Bucket::None; num_buckets];
 
         for (i, (_, base)) in non_boolean.iter().enumerate() {
-          let d = signed_digits[i][segment];
+          let d = signed_digits[i * num_windows + segment];
           if d > 0 {
             buckets[(d as usize) - 1].add_assign(base);
           } else if d < 0 {
@@ -621,8 +614,7 @@ mod tests {
   use halo2curves::{CurveAffine, group::Group};
   use rand_core::OsRng;
 
-  fn test_general_msm_with<F: Field, A: CurveAffine<ScalarExt = F>>() {
-    let n = 8;
+  fn test_general_msm_with<F: Field, A: CurveAffine<ScalarExt = F>>(n: usize) {
     let coeffs = (0..n).map(|_| F::random(OsRng)).collect::<Vec<_>>();
     let bases = (0..n)
       .map(|_| A::from(A::generator() * F::random(OsRng)))
@@ -642,8 +634,15 @@ mod tests {
 
   #[test]
   fn test_general_msm() {
-    test_general_msm_with::<pallas::Scalar, pallas::Affine>();
-    test_general_msm_with::<vesta::Scalar, vesta::Affine>();
+    test_general_msm_with::<pallas::Scalar, pallas::Affine>(8);
+    test_general_msm_with::<vesta::Scalar, vesta::Affine>(8);
+  }
+
+  #[test]
+  fn test_general_msm_128() {
+    // n=128 exercises signed-digit code path with larger window sizes
+    test_general_msm_with::<pallas::Scalar, pallas::Affine>(128);
+    test_general_msm_with::<vesta::Scalar, vesta::Affine>(128);
   }
 
   fn test_msm_ux_with<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
