@@ -746,7 +746,7 @@ impl<E: Engine> SpartanSNARK<E> {
       + Sub<Output = <W as WitnessValue>::Extended>
       + Send
       + Sync,
-    Coeff: SmallCoeff,
+    Coeff: SmallCoeff + crate::r1cs::CscCoeff<E::Scalar>,
     C: SmallSpartanCircuit<E, Coeff> + SmallSpartanCircuit<E, W>,
     E::Scalar: SmallValueField<Coeff>
       + DelayedReduction<Coeff>

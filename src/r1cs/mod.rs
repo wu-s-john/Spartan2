@@ -81,6 +81,153 @@ fn mul_field_fast<F: ff::PrimeField>(x: F, v: &F) -> F {
   }
 }
 
+/// Column chunk size for cache-blocked CSC iteration in `bind_row_vars_combined`.
+const CSC_COL_CHUNK: usize = 7000;
+
+/// Trait for CSC coefficient types used in column accumulation.
+/// Abstracts over field elements (`E::Scalar`) and small integer coefficients (`i8`, `i32`).
+pub trait CscCoeff<F: ff::PrimeField>: Copy + Send + Sync {
+  /// Whether this coefficient is a positive unit (used for add-only fast path).
+  fn is_positive_unit(&self) -> bool;
+  /// Multiply a field value by this coefficient.
+  fn mul_field_val(&self, x: &F) -> F;
+  /// Fast-path for single-entry columns: multiply rx_val by this coefficient,
+  /// exploiting ±1 special cases.
+  fn single_entry_mul(&self, rx_val: F) -> F;
+}
+
+// Field-element coefficients (V = E::Scalar): the coefficient and accumulator share a type.
+impl<F: ff::PrimeField> CscCoeff<F> for F {
+  #[inline(always)]
+  fn is_positive_unit(&self) -> bool {
+    *self == F::ONE
+  }
+  #[inline(always)]
+  fn mul_field_val(&self, x: &F) -> F {
+    *x * self
+  }
+  #[inline(always)]
+  fn single_entry_mul(&self, rx_val: F) -> F {
+    if *self == F::ONE {
+      rx_val
+    } else if *self == -F::ONE {
+      -rx_val
+    } else {
+      rx_val * self
+    }
+  }
+}
+
+// Small integer coefficients (i8).
+impl<F: ff::PrimeField + MontgomeryLimbs> CscCoeff<F> for i8 {
+  #[inline(always)]
+  fn is_positive_unit(&self) -> bool {
+    *self > 0
+  }
+  #[inline(always)]
+  fn mul_field_val(&self, x: &F) -> F {
+    SmallCoeff::mul_field(*self, x)
+  }
+  #[inline(always)]
+  fn single_entry_mul(&self, rx_val: F) -> F {
+    if *self > 0 { rx_val } else { -rx_val }
+  }
+}
+
+// Small integer coefficients (i32).
+impl<F: ff::PrimeField + MontgomeryLimbs> CscCoeff<F> for i32 {
+  #[inline(always)]
+  fn is_positive_unit(&self) -> bool {
+    *self > 0
+  }
+  #[inline(always)]
+  fn mul_field_val(&self, x: &F) -> F {
+    SmallCoeff::mul_field(*self, x)
+  }
+  #[inline(always)]
+  fn single_entry_mul(&self, rx_val: F) -> F {
+    if *self > 0 { rx_val } else { -rx_val }
+  }
+}
+
+/// Accumulate CSC entries for one column of a matrix.
+/// Handles single-entry fast path, ±1 partition, and general coefficients.
+#[inline(always)]
+fn accumulate_column<F: ff::PrimeField, V: CscCoeff<F>>(
+  rx_vals: &[F],
+  col_ptr: &[usize],
+  row_indices: &[u32],
+  values: &[V],
+  unit_ends: &[usize],
+  c: usize,
+) -> F {
+  let start = col_ptr[c];
+  let end = col_ptr[c + 1];
+
+  // Single entry — skip loop overhead
+  if start + 1 == end {
+    let rx_val = rx_vals[row_indices[start] as usize];
+    return values[start].single_entry_mul(rx_val);
+  }
+
+  let unit_end = unit_ends[c];
+  let mut acc = F::ZERO;
+  // ±1 entries: add/sub only
+  for j in start..unit_end {
+    let row = row_indices[j] as usize;
+    if values[j].is_positive_unit() {
+      acc += rx_vals[row];
+    } else {
+      acc -= rx_vals[row];
+    }
+  }
+  // Non-±1 entries
+  for j in unit_end..end {
+    acc += values[j].mul_field_val(&rx_vals[row_indices[j] as usize]);
+  }
+  acc
+}
+
+/// Dispatch ABC column accumulation for a chunk of columns.
+/// Shared between the field-element and small-coeff paths.
+#[inline(always)]
+fn dispatch_abc_columns<F: ff::PrimeField, V: CscCoeff<F>>(
+  chunk: &mut [F],
+  col_start: usize,
+  col_presence: &[u8],
+  r: F,
+  r_sq: F,
+  rx: &[F],
+  a: (&[usize], &[u32], &[V], &[usize]),
+  b: (&[usize], &[u32], &[V], &[usize]),
+  c: (&[usize], &[u32], &[V], &[usize]),
+) {
+  for (i, slot) in chunk.iter_mut().enumerate() {
+    let col = col_start + i;
+
+    macro_rules! acc_a {
+      () => { accumulate_column(rx, a.0, a.1, a.2, a.3, col) };
+    }
+    macro_rules! acc_b {
+      () => { accumulate_column(rx, b.0, b.1, b.2, b.3, col) };
+    }
+    macro_rules! acc_c {
+      () => { accumulate_column(rx, c.0, c.1, c.2, c.3, col) };
+    }
+
+    *slot = match col_presence[col] {
+      0 => F::ZERO,
+      1 => acc_a!(),
+      2 => r * acc_b!(),
+      3 => acc_a!() + r * acc_b!(),
+      4 => r_sq * acc_c!(),
+      5 => acc_a!() + r_sq * acc_c!(),
+      6 => r * acc_b!() + r_sq * acc_c!(),
+      _ => acc_a!() + r * acc_b!() + r_sq * acc_c!(),
+    };
+  }
+}
+
 /// Build CSC (column-sorted) representation from a CSR matrix with pre-remapped dense columns.
 ///
 /// Entries are partitioned within each column: `is_unit` entries first, then non-unit.
@@ -1325,78 +1472,17 @@ impl<E: Engine> SplitR1CSShape<E> {
       });
     }
 
-    /// Accumulate CSC entries for one column of a field-element matrix.
-    #[inline(always)]
-    fn accumulate_column_field<F: ff::PrimeField>(
-      rx_vals: &[F],
-      col_ptr: &[usize],
-      row_indices: &[u32],
-      values: &[F],
-      unit_ends: &[usize],
-      c: usize,
-    ) -> F {
-      let start = col_ptr[c];
-      let end = col_ptr[c + 1];
-
-      // Single entry — skip loop overhead
-      if start + 1 == end {
-        let rx_val = rx_vals[row_indices[start] as usize];
-        return if values[start] == F::ONE {
-          rx_val
-        } else if values[start] == -F::ONE {
-          -rx_val
-        } else {
-          rx_val * values[start]
-        };
-      }
-
-      let unit_end = unit_ends[c];
-      let mut acc = F::ZERO;
-      // ±1 entries: add/sub only
-      for j in start..unit_end {
-        let row = row_indices[j] as usize;
-        if values[j] == F::ONE {
-          acc += rx_vals[row];
-        } else {
-          acc -= rx_vals[row];
-        }
-      }
-      // Non-±1 entries
-      for j in unit_end..end {
-        acc += rx_vals[row_indices[j] as usize] * values[j];
-      }
-      acc
-    }
-
-    let col_chunk = std::cmp::min(7000, num_dense);
+    let col_chunk = std::cmp::min(CSC_COL_CHUNK, num_dense);
     let mut compact = vec![E::Scalar::ZERO; num_dense];
 
     compact.par_chunks_mut(col_chunk).enumerate().for_each(|(tid, chunk)| {
       let col_start = tid * col_chunk;
-      for (i, slot) in chunk.iter_mut().enumerate() {
-        let c = col_start + i;
-
-        macro_rules! acc_a {
-          () => { accumulate_column_field::<E::Scalar>(rx, &self.A_csc_col_ptr, &self.A_csc_row, &self.A_csc_data, &self.A_csc_unit_end, c) };
-        }
-        macro_rules! acc_b {
-          () => { accumulate_column_field::<E::Scalar>(rx, &self.B_csc_col_ptr, &self.B_csc_row, &self.B_csc_data, &self.B_csc_unit_end, c) };
-        }
-        macro_rules! acc_c {
-          () => { accumulate_column_field::<E::Scalar>(rx, &self.C_csc_col_ptr, &self.C_csc_row, &self.C_csc_data, &self.C_csc_unit_end, c) };
-        }
-
-        *slot = match self.col_presence[c] {
-          0 => E::Scalar::ZERO,
-          1 => acc_a!(),
-          2 => r * acc_b!(),
-          3 => acc_a!() + r * acc_b!(),
-          4 => r_sq * acc_c!(),
-          5 => acc_a!() + r_sq * acc_c!(),
-          6 => r * acc_b!() + r_sq * acc_c!(),
-          _ => acc_a!() + r * acc_b!() + r_sq * acc_c!(),
-        };
-      }
+      dispatch_abc_columns(
+        chunk, col_start, &self.col_presence, r, r_sq, rx,
+        (&self.A_csc_col_ptr, &self.A_csc_row, &self.A_csc_data, &self.A_csc_unit_end),
+        (&self.B_csc_col_ptr, &self.B_csc_row, &self.B_csc_data, &self.B_csc_unit_end),
+        (&self.C_csc_col_ptr, &self.C_csc_row, &self.C_csc_data, &self.C_csc_unit_end),
+      );
     });
 
     // Expand compact buffer → full-size output
@@ -1604,6 +1690,7 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
   ) -> Vec<E::Scalar>
   where
     E::Scalar: MontgomeryLimbs,
+    Coeff: CscCoeff<E::Scalar>,
   {
     assert_eq!(rx.len(), self.num_cons);
 
@@ -1618,81 +1705,20 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
       return self.bind_row_vars_combined_small_no_remap(rx, r);
     }
 
-    // CSC (column-sorted) iteration. Column-major access makes buffer writes sequential
-    // (L1 hits), with random rx reads hitting L2.
-    /// Accumulate CSC entries for one matrix into a register accumulator.
-    #[inline(always)]
-    fn accumulate_column<F: ff::PrimeField + MontgomeryLimbs, CC: SmallCoeff>(
-      rx_vals: &[F],
-      col_ptr: &[usize],
-      row_indices: &[u32],
-      values: &[CC],
-      unit_ends: &[usize],
-      c: usize,
-    ) -> F {
-      let start = col_ptr[c];
-      let end = col_ptr[c + 1];
-
-      // Depth-1: single entry — skip loop overhead entirely
-      if start + 1 == end {
-        return if values[start].is_positive() {
-          rx_vals[row_indices[start] as usize]
-        } else {
-          -rx_vals[row_indices[start] as usize]
-        };
-      }
-
-      let unit_end = unit_ends[c];
-      let mut acc = F::ZERO;
-      // ±1 entries: add/sub only
-      for j in start..unit_end {
-        let row = row_indices[j] as usize;
-        if values[j].is_positive() {
-          acc += rx_vals[row];
-        } else {
-          acc -= rx_vals[row];
-        }
-      }
-      // Non-±1 entries
-      for j in unit_end..end {
-        let row = row_indices[j] as usize;
-        acc += SmallCoeff::mul_field(values[j], &rx_vals[row]);
-      }
-      acc
-    }
-
     // Cache-blocked column partitioning. Process all 3 matrices per column inline:
     // result[c] = A_sum + r * B_sum + r² * C_sum. No separate buffers or combine pass.
     // Dispatches on col_presence to skip Montgomery muls for empty matrix columns.
-    let col_chunk = std::cmp::min(7000, num_dense);
+    let col_chunk = std::cmp::min(CSC_COL_CHUNK, num_dense);
     let mut compact = vec![E::Scalar::ZERO; num_dense];
 
     compact.par_chunks_mut(col_chunk).enumerate().for_each(|(tid, chunk)| {
       let col_start = tid * col_chunk;
-      for (i, slot) in chunk.iter_mut().enumerate() {
-        let c = col_start + i;
-
-        macro_rules! acc_a {
-          () => { accumulate_column::<E::Scalar, Coeff>(rx, &self.A_csc_col_ptr, &self.A_csc_row, &self.A_csc_data, &self.A_csc_unit_end, c) };
-        }
-        macro_rules! acc_b {
-          () => { accumulate_column::<E::Scalar, Coeff>(rx, &self.B_csc_col_ptr, &self.B_csc_row, &self.B_csc_data, &self.B_csc_unit_end, c) };
-        }
-        macro_rules! acc_c {
-          () => { accumulate_column::<E::Scalar, Coeff>(rx, &self.C_csc_col_ptr, &self.C_csc_row, &self.C_csc_data, &self.C_csc_unit_end, c) };
-        }
-
-        *slot = match self.col_presence[c] {
-          0 => E::Scalar::ZERO,
-          1 => acc_a!(),
-          2 => r * acc_b!(),
-          3 => acc_a!() + r * acc_b!(),
-          4 => r_sq * acc_c!(),
-          5 => acc_a!() + r_sq * acc_c!(),
-          6 => r * acc_b!() + r_sq * acc_c!(),
-          _ => acc_a!() + r * acc_b!() + r_sq * acc_c!(),
-        };
-      }
+      dispatch_abc_columns(
+        chunk, col_start, &self.col_presence, r, r_sq, rx,
+        (&self.A_csc_col_ptr, &self.A_csc_row, &self.A_csc_data, &self.A_csc_unit_end),
+        (&self.B_csc_col_ptr, &self.B_csc_row, &self.B_csc_data, &self.B_csc_unit_end),
+        (&self.C_csc_col_ptr, &self.C_csc_row, &self.C_csc_data, &self.C_csc_unit_end),
+      );
     });
 
     // Expand compact buffer → full-size output
