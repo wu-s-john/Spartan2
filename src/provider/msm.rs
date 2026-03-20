@@ -38,8 +38,8 @@ use tracing::info;
 /// Mixed addition (affine + XYZZ) costs 7M + 2S vs ~11M + 5S for standard projective+affine.
 /// Formula source: <https://www.hyperelliptic.org/EFD/g1p/auto-shortw-xyzz.html>
 ///
-/// **Assumes `a = 0`** in the curve equation `y² = x³ + ax + b`, which holds for
-/// all curves used in Spartan2 (Pallas, Vesta).
+/// The doubling formula handles both `a = 0` (Pallas, Vesta) and `a ≠ 0` (T256)
+/// via the `curve_a` parameter passed to `double_in_place`.
 #[derive(Copy, Clone)]
 struct BucketXYZZ<F: Field> {
   x: F,
@@ -66,9 +66,9 @@ impl<F: Field> BucketXYZZ<F> {
     self.zz == F::ZERO
   }
 
-  /// Double in place (dbl-2008-s-1, assumes a=0).
-  /// Cost: 2M + 5S + 7add
-  fn double_in_place(&mut self) {
+  /// Double in place (dbl-2008-s-1, general formula with curve parameter `a`).
+  /// Cost: 2M + 5S + 7add (a=0) or 3M + 5S + 8add (a≠0)
+  fn double_in_place(&mut self, curve_a: F) {
     if self.is_zero() {
       return;
     }
@@ -80,9 +80,13 @@ impl<F: Field> BucketXYZZ<F> {
     let w = u * v;
     // S = X1*V
     let s = self.x * v;
-    // M = 3*X1^2 (a=0, so no a*ZZ^2 term)
+    // M = 3*X1^2 + a*ZZ^2
     let x_sq = self.x.square();
-    let m = x_sq.double() + x_sq;
+    let m = if curve_a == F::ZERO {
+      x_sq.double() + x_sq
+    } else {
+      x_sq.double() + x_sq + curve_a * self.zz.square()
+    };
     // X3 = M^2 - 2*S
     self.x = m.square() - s.double();
     // Y3 = M*(S - X3) - W*Y1
@@ -94,7 +98,7 @@ impl<F: Field> BucketXYZZ<F> {
   }
 
   /// XYZZ += XYZZ (full addition, add-2008-s).
-  fn add_assign_bucket(&mut self, other: &Self) {
+  fn add_assign_bucket(&mut self, other: &Self, curve_a: F) {
     if other.is_zero() {
       return;
     }
@@ -102,16 +106,14 @@ impl<F: Field> BucketXYZZ<F> {
       *self = *other;
       return;
     }
-    // U1 = X1*ZZ2, U2 = X2*ZZ1
     let u1 = self.x * other.zz;
     let u2 = other.x * self.zz;
-    // S1 = Y1*ZZZ2, S2 = Y2*ZZZ1
     let s1 = self.y * other.zzz;
     let s2 = other.y * self.zzz;
 
     if u1 == u2 {
       if s1 == s2 {
-        self.double_in_place();
+        self.double_in_place(curve_a);
       } else {
         *self = Self::zero();
       }
@@ -129,10 +131,26 @@ impl<F: Field> BucketXYZZ<F> {
   }
 }
 
+/// Compute curve parameter `a` from the generator and its double.
+/// For `y² = x³ + ax + b`: a = (dy² - dx³ - gy² + gx³) / (dx - gx)
+#[inline]
+fn compute_curve_a<C: CurveAffine>() -> C::Base {
+  use halo2curves::group::Curve;
+  let g = C::generator();
+  let g2 = (g + g).to_affine();
+  let gc = g.coordinates().unwrap();
+  let g2c = g2.coordinates().unwrap();
+  let (gx, gy) = (*gc.x(), *gc.y());
+  let (dx, dy) = (*g2c.x(), *g2c.y());
+  let num = dy.square() - dx.square() * dx - gy.square() + gx.square() * gx;
+  let den = dx - gx;
+  num * den.invert().unwrap()
+}
+
 /// Mixed addition: BucketXYZZ += CurveAffine point (madd-2008-s).
 /// Cost: 7M + 2S
 #[inline]
-fn bucket_add_affine<C: CurveAffine>(bucket: &mut BucketXYZZ<C::Base>, p: &C) {
+fn bucket_add_affine<C: CurveAffine>(bucket: &mut BucketXYZZ<C::Base>, p: &C, curve_a: C::Base) {
   if bool::from(p.is_identity()) {
     return;
   }
@@ -153,7 +171,41 @@ fn bucket_add_affine<C: CurveAffine>(bucket: &mut BucketXYZZ<C::Base>, p: &C) {
 
   if bucket.x == u2 {
     if bucket.y == s2 {
-      bucket.double_in_place();
+      bucket.double_in_place(curve_a);
+    } else {
+      *bucket = BucketXYZZ::zero();
+    }
+    return;
+  }
+  let p_val = u2 - bucket.x;
+  let r = s2 - bucket.y;
+  let pp = p_val.square();
+  let ppp = p_val * pp;
+  let q = bucket.x * pp;
+  bucket.x = r.square() - ppp - q.double();
+  bucket.y = r * (q - bucket.x) - bucket.y * ppp;
+  bucket.zz *= pp;
+  bucket.zzz *= ppp;
+}
+
+/// Mixed addition using raw (x, y) coordinates (madd-2008-s).
+/// Avoids CurveAffine::coordinates() overhead since caller pre-extracts them.
+/// Cost: 7M + 2S
+#[inline]
+fn bucket_add_affine_xy<C: CurveAffine>(bucket: &mut BucketXYZZ<C::Base>, px: C::Base, py: C::Base, curve_a: C::Base) {
+  if bucket.is_zero() {
+    bucket.x = px;
+    bucket.y = py;
+    bucket.zz = C::Base::ONE;
+    bucket.zzz = C::Base::ONE;
+    return;
+  }
+  let u2 = px * bucket.zz;
+  let s2 = py * bucket.zzz;
+
+  if bucket.x == u2 {
+    if bucket.y == s2 {
+      bucket.double_in_place(curve_a);
     } else {
       *bucket = BucketXYZZ::zero();
     }
@@ -220,6 +272,156 @@ fn repr_low_u64<F: PrimeField>(s: &F) -> u64 {
 // Main MSM with signed decomposition + bit-width partitioning
 // ==================================================================================
 
+/// Serial windowed Pippenger MSM with XYZZ bucket coordinates.
+///
+/// Uses Booth encoding (signed digits) with XYZZ buckets for ~42% fewer field ops
+/// per bucket addition compared to standard projective. Designed to run without
+/// spawning rayon tasks, making it ideal when the caller already parallelizes.
+fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+  let curve_a = compute_curve_a::<C>();
+  let c = if bases.len() < 4 {
+    1
+  } else if bases.len() < 32 {
+    3
+  } else {
+    let c_base = (f64::from(bases.len() as u32)).ln().ceil() as usize;
+    let cost = |c: usize| ((256 + c - 1) / c) * (bases.len() + (1 << (c - 1)));
+    if cost(c_base + 1) < cost(c_base) {
+      c_base + 1
+    } else {
+      c_base
+    }
+  };
+
+  fn get_at<F: PrimeField>(segment: usize, c: usize, bytes: &F::Repr) -> usize {
+    let skip_bits = segment * c;
+    let skip_bytes = skip_bits / 8;
+
+    if skip_bytes >= 32 {
+      return 0;
+    }
+
+    let mut v = [0; 8];
+    for (v, o) in v.iter_mut().zip(bytes.as_ref()[skip_bytes..].iter()) {
+      *v = *o;
+    }
+
+    let mut tmp = u64::from_le_bytes(v);
+    tmp >>= skip_bits - (skip_bytes * 8);
+    tmp %= 1 << c;
+
+    tmp as usize
+  }
+
+  // Pre-compute scalar byte representations, filter zeros, separate booleans.
+  // Also extract affine (x, y) coordinates to avoid repeated CurveAffine lookups.
+  let mut boolean_sum = C::Curve::identity();
+  let mut reprs: Vec<<C::Scalar as PrimeField>::Repr> = Vec::new();
+  let mut pts_x: Vec<C::Base> = Vec::new();
+  let mut pts_y: Vec<C::Base> = Vec::new();
+
+  // Compute actual max byte size (OR all reprs to find highest nonzero byte)
+  let field_byte_size = <C::Scalar as PrimeField>::Repr::default().as_ref().len();
+  let mut acc_or = [0u8; 32]; // enough for any field
+
+  for (s, b) in coeffs.iter().zip(bases) {
+    if *s == C::Scalar::ZERO || bool::from(b.is_identity()) {
+      // skip zero scalars and identity bases
+    } else if *s == C::Scalar::ONE {
+      boolean_sum += b;
+    } else {
+      let repr = s.to_repr();
+      for (a, &byte) in acc_or[..field_byte_size].iter_mut().zip(repr.as_ref().iter()) {
+        *a |= byte;
+      }
+      let coords = b.coordinates().unwrap();
+      reprs.push(repr);
+      pts_x.push(*coords.x());
+      pts_y.push(*coords.y());
+    }
+  }
+
+  if reprs.is_empty() {
+    return boolean_sum;
+  }
+
+  let max_byte_size = field_byte_size
+    - acc_or[..field_byte_size]
+      .iter()
+      .rev()
+      .position(|v| *v != 0)
+      .unwrap_or(field_byte_size);
+  if max_byte_size == 0 {
+    return boolean_sum;
+  }
+  let max_num_bits = max_byte_size * 8;
+
+  // Signed digit representation — halves bucket count per window
+  debug_assert!(c < 31, "window size c={c} would overflow 1i32 << c");
+  let half = 1usize << (c - 1);
+  let num_windows = max_num_bits / c + 1;
+  let n_scalars = reprs.len();
+
+  // Pre-compute signed digits for all scalars with carry propagation (flat layout)
+  let mut signed_digits = vec![0i32; n_scalars * num_windows];
+  for (i, repr) in reprs.iter().enumerate() {
+    let mut carry = 0u32;
+    for seg in 0..num_windows {
+      let raw = get_at::<C::Scalar>(seg, c, repr) as u32 + carry;
+      let (digit, new_carry) = if (raw as usize) <= half {
+        (raw as i32, 0)
+      } else {
+        (raw as i32 - (1i32 << c), 1)
+      };
+      signed_digits[i * num_windows + seg] = digit;
+      carry = new_carry;
+    }
+  }
+
+  let non_boolean_sum = {
+    let num_buckets = half;
+    (0..num_windows)
+      .rev()
+      .fold(C::Curve::identity(), |mut acc, segment| {
+        (0..c).for_each(|_| acc = acc.double());
+
+        let mut buckets: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); num_buckets];
+
+        for i in 0..n_scalars {
+          let d = signed_digits[i * num_windows + segment];
+          if d > 0 {
+            bucket_add_affine_xy::<C>(
+              &mut buckets[(d as usize) - 1],
+              pts_x[i],
+              pts_y[i],
+              curve_a,
+            );
+          } else if d < 0 {
+            // Negate the y-coordinate for subtraction
+            bucket_add_affine_xy::<C>(
+              &mut buckets[(-d as usize) - 1],
+              pts_x[i],
+              -pts_y[i],
+              curve_a,
+            );
+          }
+        }
+
+        // Summation by parts: stay in XYZZ, convert only once per window
+        let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+        let mut window_acc: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+        for b in buckets.into_iter().rev() {
+          running_sum.add_assign_bucket(&b, curve_a);
+          window_acc.add_assign_bucket(&running_sum, curve_a);
+        }
+        acc += bucket_to_curve::<C>(&window_acc);
+        acc
+      })
+  };
+
+  boolean_sum + non_boolean_sum
+}
+
 /// Simple MSM fallback for very small inputs.
 fn msm_simple<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
   coeffs
@@ -284,6 +486,18 @@ pub fn msm<C: CurveAffine>(
   // For very small inputs, use the simple fallback
   if n <= 16 {
     return Ok(msm_simple(coeffs, bases));
+  }
+
+  // For moderate inputs, the signed-decomposition + classification overhead
+  // is not worth it. Use serial Pippenger with XYZZ buckets — this avoids
+  // nested rayon parallelism when the caller already parallelizes externally
+  // (e.g. Hyrax commit runs 38 row MSMs in parallel).
+  if n <= 8192 {
+    let result = cpu_msm_serial(coeffs, bases);
+    if msm_t.elapsed().as_millis() > 10 {
+      info!(elapsed_ms = %msm_t.elapsed().as_millis(), size = coeffs.len(), "msm");
+    }
+    return Ok(result);
   }
 
   // Group indices: 0=unit_pos, 1=unit_neg, 2=pos≤8, 3=neg≤8,
@@ -641,6 +855,7 @@ fn msm_10<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
     bases: &[C],
     max_num_bits: usize,
   ) -> C::Curve {
+    let curve_a = compute_curve_a::<C>();
     let num_buckets: usize = 1 << max_num_bits;
     let mut buckets: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); num_buckets];
 
@@ -650,14 +865,14 @@ fn msm_10<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
       .filter(|(scalar, _base)| !scalar.is_zero())
       .for_each(|(scalar, base)| {
         let bucket_index: u64 = (*scalar).into();
-        bucket_add_affine::<C>(&mut buckets[bucket_index as usize], base);
+        bucket_add_affine::<C>(&mut buckets[bucket_index as usize], base, curve_a);
       });
 
     let mut result: BucketXYZZ<C::Base> = BucketXYZZ::zero();
     let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
     for b in buckets.into_iter().skip(1).rev() {
-      running_sum.add_assign_bucket(&b);
-      result.add_assign_bucket(&running_sum);
+      running_sum.add_assign_bucket(&b, curve_a);
+      result.add_assign_bucket(&running_sum, curve_a);
     }
     bucket_to_curve::<C>(&result)
   }
@@ -686,6 +901,7 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
     bases: &[C],
     max_num_bits: usize,
   ) -> C::Curve {
+    let curve_a = compute_curve_a::<C>();
     let mut c = if bases.len() < 32 {
       3
     } else {
@@ -715,7 +931,7 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
           if scalar == 1 {
             // We only process unit scalars once in the first window.
             if w_start == 0 {
-              bucket_add_affine::<C>(&mut res, base);
+              bucket_add_affine::<C>(&mut res, base, curve_a);
             }
           } else {
             let mut scalar = scalar;
@@ -731,7 +947,7 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
             // bucket.
             // (Recall that `buckets` doesn't have a zero bucket.)
             if scalar != 0 {
-              bucket_add_affine::<C>(&mut buckets[(scalar - 1) as usize], base);
+              bucket_add_affine::<C>(&mut buckets[(scalar - 1) as usize], base, curve_a);
             }
           }
         });
@@ -739,8 +955,8 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
         // Prefix sum using XYZZ coordinates
         let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
         for b in buckets.into_iter().rev() {
-          running_sum.add_assign_bucket(&b);
-          res.add_assign_bucket(&running_sum);
+          running_sum.add_assign_bucket(&b, curve_a);
+          res.add_assign_bucket(&running_sum, curve_a);
         }
         bucket_to_curve::<C>(&res)
       })
@@ -817,6 +1033,7 @@ pub fn msm_signed_small<C: CurveAffine>(
 }
 
 fn msm_signed_small_serial<C: CurveAffine>(scalars: &[i8], bases: &[C]) -> C::Curve {
+  let curve_a = compute_curve_a::<C>();
   let mut max_pos: i8 = 0;
   let mut max_neg: i8 = 0;
   for &s in scalars {
@@ -839,9 +1056,9 @@ fn msm_signed_small_serial<C: CurveAffine>(scalars: &[i8], bases: &[C]) -> C::Cu
 
   for (&scalar, base) in scalars.iter().zip(bases.iter()) {
     if scalar > 0 {
-      bucket_add_affine::<C>(&mut pos_buckets[(scalar - 1) as usize], base);
+      bucket_add_affine::<C>(&mut pos_buckets[(scalar - 1) as usize], base, curve_a);
     } else if scalar < 0 {
-      bucket_add_affine::<C>(&mut neg_buckets[(-scalar - 1) as usize], base);
+      bucket_add_affine::<C>(&mut neg_buckets[(-scalar - 1) as usize], base, curve_a);
     }
   }
 
@@ -849,16 +1066,16 @@ fn msm_signed_small_serial<C: CurveAffine>(scalars: &[i8], bases: &[C]) -> C::Cu
   let mut pos_result: BucketXYZZ<C::Base> = BucketXYZZ::zero();
   let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
   for bucket in pos_buckets.into_iter().rev() {
-    running_sum.add_assign_bucket(&bucket);
-    pos_result.add_assign_bucket(&running_sum);
+    running_sum.add_assign_bucket(&bucket, curve_a);
+    pos_result.add_assign_bucket(&running_sum, curve_a);
   }
 
   // Summation-by-parts for negative buckets
   let mut neg_result: BucketXYZZ<C::Base> = BucketXYZZ::zero();
   running_sum = BucketXYZZ::zero();
   for bucket in neg_buckets.into_iter().rev() {
-    running_sum.add_assign_bucket(&bucket);
-    neg_result.add_assign_bucket(&running_sum);
+    running_sum.add_assign_bucket(&bucket, curve_a);
+    neg_result.add_assign_bucket(&running_sum, curve_a);
   }
 
   bucket_to_curve::<C>(&pos_result) - bucket_to_curve::<C>(&neg_result)
