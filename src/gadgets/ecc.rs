@@ -1178,65 +1178,11 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
     Ok(())
   }
 
-  /// Scalar multiplication optimized for known non-infinity points.
-  ///
-  /// Compared to `AllocatedPoint::scalar_mul`, this method:
-  /// - Uses incomplete addition for ALL bits (no complete tail)
-  /// - Skips infinity handling (no default point / conditional select at end)
-  /// - Uses incomplete addition for slack removal
-  ///
-  /// These are safe when the base point is known to never be infinity
-  /// and the scalar is a random field element (as in re-encryption).
-  pub fn scalar_mul_non_infinity<CS: ConstraintSystem<E::Base>>(
-    &self,
-    mut cs: CS,
-    scalar_bits: &[AllocatedBit],
-  ) -> Result<Self, SynthesisError> {
-    // Use ALL bits with incomplete addition (no complete tail split)
-    let mut p = self.clone();
-
-    // Assume first bit is 1: initialize acc = self, then double p
-    let mut acc = p.clone();
-    p = acc.double_incomplete(cs.namespace(|| "double"))?;
-
-    // Double-and-add loop with incomplete addition for all bits
-    // Skip the last double since the doubled value is never used after the final iteration
-    let last_idx = scalar_bits.len() - 1;
-    for (i, bit) in scalar_bits.iter().enumerate().skip(1) {
-      let temp = acc.add_incomplete(cs.namespace(|| format!("add {i}")), &p)?;
-      acc = AllocatedPointNonInfinity::conditionally_select(
-        cs.namespace(|| format!("acc_iteration_{i}")),
-        &temp,
-        &acc,
-        &Boolean::from(bit.clone()),
-      )?;
-
-      if i < last_idx {
-        p = p.double_incomplete(cs.namespace(|| format!("double {i}")))?;
-      }
-    }
-
-    // Remove the initial slack (assumption that bit[0]=1) using sub_incomplete
-    // acc_minus_initial = acc - self (3 constraints, no neg_y allocation needed)
-    let acc_minus_initial = acc.sub_incomplete(
-      cs.namespace(|| "remove slack incomplete"),
-      self,
-    )?;
-
-    // Select based on bit[0]: if bit[0]=1, keep acc; else use acc_minus_initial
-    AllocatedPointNonInfinity::conditionally_select(
-      cs.namespace(|| "remove slack if necessary"),
-      &acc,
-      &acc_minus_initial,
-      &Boolean::from(scalar_bits[0].clone()),
-    )
-  }
-
   /// Scalar multiplication with a fixed (compile-time constant) base point.
   ///
   /// All doublings are precomputed natively: `powers[i] = 2^i · base`.
   /// Only additions against constants and conditional selects are done in-circuit.
-  /// Cost: num_bits × 5 + 5 variables/constraints (vs ~2,291 for scalar_mul_non_infinity).
+  /// Cost: num_bits × 5 + 5 variables/constraints.
   pub fn scalar_mul_fixed_base<CS: ConstraintSystem<E::Base>>(
     &self,
     mut cs: CS,
