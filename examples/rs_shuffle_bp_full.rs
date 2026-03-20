@@ -91,7 +91,33 @@ struct RSShuffleReencryptCircuit {
 
 impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
   fn public_values(&self) -> Result<Vec<Scalar>, SynthesisError> {
-    Ok(vec![])
+    let mut vals = Vec::with_capacity(4 + 4 * N * 2);
+
+    // Generator coords
+    vals.push(self.gen_coords.0);
+    vals.push(self.gen_coords.1);
+
+    // Public key coords
+    vals.push(self.pk_coords.0);
+    vals.push(self.pk_coords.1);
+
+    // Input ciphertexts (original order)
+    for ct in &self.input_ciphertexts {
+      vals.push(ct.c1_x);
+      vals.push(ct.c1_y);
+      vals.push(ct.c2_x);
+      vals.push(ct.c2_y);
+    }
+
+    // Output ciphertexts (re-encrypted)
+    for ct in &self._native_reencrypt_data.output_ciphertexts {
+      vals.push(ct.c1_x);
+      vals.push(ct.c1_y);
+      vals.push(ct.c2_x);
+      vals.push(ct.c2_y);
+    }
+
+    Ok(vals)
   }
 
   fn shared<CS: ConstraintSystem<Scalar>>(
@@ -129,9 +155,92 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       None => [Scalar::from(0u64); 7],
     };
 
-    // Allocate all 7 challenges as public inputs
-    // First 2: permutation grand product (alpha, beta)
-    // Last 5: indexed ciphertext grand product
+    // Re-allocate witness trace for synthesis ("rest" variables)
+    let witness_var = PermutationWitnessTraceVar::<Scalar, N, LEVELS>::alloc(
+      cs.namespace(|| "witness_synth"),
+      &self.witness_trace,
+    )?;
+
+    // =========================================================================
+    // Allocate variables and register public inputs (inputize before challenges)
+    // Order must match public_values(): gen, pk, input deck, output deck
+    // =========================================================================
+
+    // Allocate generator (shared across all cards) — public input
+    let gen_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
+      cs.namespace(|| "generator"),
+      Some(self.gen_coords),
+    )?;
+    gen_var.x.inputize(cs.namespace(|| "gen_x_pub"))?;
+    gen_var.y.inputize(cs.namespace(|| "gen_y_pub"))?;
+
+    // Allocate public key (non-infinity) — public input
+    let pk_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
+      cs.namespace(|| "pk"),
+      Some((self.pk_coords.0, self.pk_coords.1)),
+    )?;
+    pk_var.x.inputize(cs.namespace(|| "pk_x_pub"))?;
+    pk_var.y.inputize(cs.namespace(|| "pk_y_pub"))?;
+
+    // Allocate input ciphertexts (original order, before shuffle) — public inputs
+    let mut input_deck_vars = Vec::with_capacity(N);
+    for i in 0..N {
+      let ct_var = ElGamalCiphertextVar::<ECEngine>::alloc(
+        cs.namespace(|| format!("input_ct_{}", i)),
+        &self.input_ciphertexts[i],
+      )?;
+      ct_var.c1.x.inputize(cs.namespace(|| format!("input_ct_{}_c1x", i)))?;
+      ct_var.c1.y.inputize(cs.namespace(|| format!("input_ct_{}_c1y", i)))?;
+      ct_var.c2.x.inputize(cs.namespace(|| format!("input_ct_{}_c2x", i)))?;
+      ct_var.c2.y.inputize(cs.namespace(|| format!("input_ct_{}_c2y", i)))?;
+      input_deck_vars.push(ct_var);
+    }
+
+    // Allocate shuffled ciphertexts (permuted order)
+    let mut shuffled_deck_vars = Vec::with_capacity(N);
+    for i in 0..N {
+      let src = self.permutation[i];
+      let ct_var = ElGamalCiphertextVar::<ECEngine>::alloc(
+        cs.namespace(|| format!("shuffled_ct_{}", i)),
+        &self.input_ciphertexts[src],
+      )?;
+      shuffled_deck_vars.push(ct_var);
+    }
+    let shuffled_deck: [ElGamalCiphertextVar<ECEngine>; N] =
+      shuffled_deck_vars.try_into().ok().unwrap();
+
+    // Allocate randomization scalars
+    let mut rand_vars = Vec::with_capacity(N);
+    for i in 0..N {
+      let r_var = AllocatedNum::alloc(cs.namespace(|| format!("rand_{}", i)), || {
+        Ok(self.randomizations[i])
+      })?;
+      rand_vars.push(r_var);
+    }
+    let rand_arr: [AllocatedNum<Scalar>; N] = rand_vars.try_into().ok().unwrap();
+
+    // Re-encrypt the deck
+    let output_deck = reencrypt_deck_bp::<ECEngine, _, N>(
+      cs,
+      &shuffled_deck,
+      &rand_arr,
+      &pk_var,
+      &self._native_reencrypt_data,
+      &gen_var,
+      &self.gen_powers,
+    )?;
+
+    // Inputize output ciphertexts — public inputs
+    for i in 0..N {
+      output_deck[i].c1.x.inputize(cs.namespace(|| format!("output_ct_{}_c1x", i)))?;
+      output_deck[i].c1.y.inputize(cs.namespace(|| format!("output_ct_{}_c1y", i)))?;
+      output_deck[i].c2.x.inputize(cs.namespace(|| format!("output_ct_{}_c2x", i)))?;
+      output_deck[i].c2.y.inputize(cs.namespace(|| format!("output_ct_{}_c2y", i)))?;
+    }
+
+    // =========================================================================
+    // Allocate challenges as public inputs (must come after all inputize calls)
+    // =========================================================================
     let alpha_var =
       AllocatedNum::alloc_input(cs.namespace(|| "challenge_alpha"), || Ok(challenge_vals[0]))?;
     let beta_var =
@@ -145,12 +254,6 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       ict_challenges.push(c);
     }
     let ict_challenges_arr: [AllocatedNum<Scalar>; 5] = ict_challenges.try_into().unwrap();
-
-    // Re-allocate witness trace for synthesis ("rest" variables)
-    let witness_var = PermutationWitnessTraceVar::<Scalar, N, LEVELS>::alloc(
-      cs.namespace(|| "witness_synth"),
-      &self.witness_trace,
-    )?;
 
     // =========================================================================
     // Part 1: Permutation checks (grand product for each level)
@@ -182,73 +285,11 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
     }
 
     // =========================================================================
-    // Part 2: Re-encryption
+    // Part 2: Indexed ciphertext grand product
     // =========================================================================
-
-    // Allocate input ciphertexts (original order, before shuffle)
-    let mut input_deck_vars = Vec::with_capacity(N);
-    for i in 0..N {
-      let ct_var = ElGamalCiphertextVar::<ECEngine>::alloc(
-        cs.namespace(|| format!("input_ct_{}", i)),
-        &self.input_ciphertexts[i],
-      )?;
-      input_deck_vars.push(ct_var);
-    }
-
-    // Allocate input ciphertexts (shuffled order)
-    let mut shuffled_deck_vars = Vec::with_capacity(N);
-    for i in 0..N {
-      // Apply permutation: shuffled_deck[i] = input_ciphertexts[permutation[i]]
-      let src = self.permutation[i];
-      let ct_var = ElGamalCiphertextVar::<ECEngine>::alloc(
-        cs.namespace(|| format!("shuffled_ct_{}", i)),
-        &self.input_ciphertexts[src],
-      )?;
-      shuffled_deck_vars.push(ct_var);
-    }
-    let shuffled_deck: [ElGamalCiphertextVar<ECEngine>; N] =
-      shuffled_deck_vars.try_into().ok().unwrap();
-
-    // Allocate randomization scalars
-    let mut rand_vars = Vec::with_capacity(N);
-    for i in 0..N {
-      let r_var = AllocatedNum::alloc(cs.namespace(|| format!("rand_{}", i)), || {
-        Ok(self.randomizations[i])
-      })?;
-      rand_vars.push(r_var);
-    }
-    let rand_arr: [AllocatedNum<Scalar>; N] = rand_vars.try_into().ok().unwrap();
-
-    // Allocate public key (non-infinity)
-    let pk_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
-      cs.namespace(|| "pk"),
-      Some((self.pk_coords.0, self.pk_coords.1)),
-    )?;
-
-    // Allocate generator (shared across all cards)
-    let gen_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
-      cs.namespace(|| "generator"),
-      Some(self.gen_coords),
-    )?;
-
-    // Re-encrypt the deck
-    let _output_deck = reencrypt_deck_bp::<ECEngine, _, N>(
-      cs,
-      &shuffled_deck,
-      &rand_arr,
-      &pk_var,
-      &self._native_reencrypt_data,
-      &gen_var,
-      &self.gen_powers,
-    )?;
-
-    // =========================================================================
-    // Part 3: Indexed ciphertext grand product
-    // =========================================================================
-    // Proves that (i, input_ct[i]) multiset-equals (σ(i), output_ct[i])
+    // Proves that (i, input_ct[i]) multiset-equals (σ(i), shuffled_ct[i])
     // where σ is the permutation proved by Part 1.
 
-    // Left side: IndexedCiphertext(i, input_ct[i])
     let left: Vec<IndexedCiphertext<Scalar>> = (0..N)
       .map(|i| {
         let idx = AllocatedNum::alloc(cs.namespace(|| format!("ict_left_idx_{}", i)), || {
@@ -258,7 +299,6 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       })
       .collect::<Result<Vec<_>, SynthesisError>>()?;
 
-    // Right side: IndexedCiphertext(sorted_levels[LEVELS-1][i].idx, shuffled_ct[i])
     let right: Vec<IndexedCiphertext<Scalar>> = (0..N)
       .map(|i| {
         Ok(IndexedCiphertext::new::<ECEngine>(
