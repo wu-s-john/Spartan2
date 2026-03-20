@@ -25,6 +25,7 @@ use rayon::prelude::*;
 /// Unlike `SatisfyingAssignment<E>` which implements `ConstraintSystem<E::Scalar>`,
 /// this type implements `ConstraintSystem<F>` for any `PrimeField F`, making it
 /// suitable for gadgets that operate on `E::Base`.
+#[allow(dead_code)]
 struct WitnessCS<F: PrimeField> {
   input_assignment: Vec<F>,
   aux_assignment: Vec<F>,
@@ -431,7 +432,7 @@ pub fn reencrypt_deck_bp<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
   _native_data: &NativeReencryptionData<E, N>,
   generator: &AllocatedPointNonInfinity<E>,
   gen_powers: &[(E::Base, E::Base)],
-) -> Result<(), SynthesisError> {
+) -> Result<[ElGamalCiphertextVar<E>; N], SynthesisError> {
   let num_bits = E::Base::NUM_BITS as usize;
 
   // Precompute PK power table in-circuit: pk_powers[i] = 2^i · PK
@@ -443,26 +444,14 @@ pub fn reencrypt_deck_bp<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
     pk_powers.push(next);
   }
 
-  if cs.is_witness_generator() {
-    reencrypt_deck_parallel_witness::<E, CS, N>(
-      cs,
-      input_deck,
-      randomizations,
-      &pk_powers,
-      generator,
-      gen_powers,
-    )
-  } else {
-    reencrypt_deck_serial::<E, CS, N>(
-      cs,
-      input_deck,
-      randomizations,
-      &pk_powers,
-      generator,
-      gen_powers,
-    )?;
-    Ok(())
-  }
+  reencrypt_deck_serial::<E, CS, N>(
+    cs,
+    input_deck,
+    randomizations,
+    &pk_powers,
+    generator,
+    gen_powers,
+  )
 }
 
 /// Serial re-encryption — used during shape (setup) phase
@@ -497,6 +486,7 @@ fn reencrypt_deck_serial<E: Engine, CS: ConstraintSystem<E::Base>, const N: usiz
 /// Runs each card's gadget on a separate `WitnessCS` (where `enforce()` is a no-op),
 /// then fills pre-allocated aux slots via `allocate_empty`. This produces exactly
 /// the same aux variable count as the serial path — no extra allocations.
+#[allow(dead_code)]
 fn reencrypt_deck_parallel_witness<E: Engine, CS: ConstraintSystem<E::Base>, const N: usize>(
   cs: &mut CS,
   input_deck: &[ElGamalCiphertextVar<E>; N],

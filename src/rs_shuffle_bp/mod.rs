@@ -46,3 +46,4 @@ pub use encryption::{
   NativeReencryptionData,
 };
 pub use native::{prepare_rs_witness_trace, run_rs_shuffle_permutation, RSShuffleTrace};
+pub use permutation::IndexedCiphertext;

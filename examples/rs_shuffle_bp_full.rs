@@ -27,7 +27,7 @@ use spartan2::{
       NativeReencryptionData,
     },
     native::run_rs_shuffle_permutation,
-    permutation::{check_grand_product, IndexPositionPair},
+    permutation::{check_grand_product, IndexPositionPair, IndexedCiphertext},
   },
   spartan::SpartanSNARK,
   traits::{
@@ -114,7 +114,7 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
 
   fn num_challenges(&self) -> usize {
     // 2 for permutation grand product + 5 for indexed ciphertext grand product
-    2
+    7
   }
 
   fn synthesize<CS: ConstraintSystem<Scalar>>(
@@ -124,16 +124,27 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
     _precommitted: &[AllocatedNum<Scalar>],
     challenges: Option<&[Scalar]>,
   ) -> Result<(), SynthesisError> {
-    let (alpha_val, beta_val) = match challenges {
-      Some(c) => (c[0], c[1]),
-      None => (Scalar::from(0u64), Scalar::from(0u64)),
+    let challenge_vals: [Scalar; 7] = match challenges {
+      Some(c) => std::array::from_fn(|i| c[i]),
+      None => [Scalar::from(0u64); 7],
     };
 
-    // Allocate challenges as public inputs
+    // Allocate all 7 challenges as public inputs
+    // First 2: permutation grand product (alpha, beta)
+    // Last 5: indexed ciphertext grand product
     let alpha_var =
-      AllocatedNum::alloc_input(cs.namespace(|| "challenge_alpha"), || Ok(alpha_val))?;
+      AllocatedNum::alloc_input(cs.namespace(|| "challenge_alpha"), || Ok(challenge_vals[0]))?;
     let beta_var =
-      AllocatedNum::alloc_input(cs.namespace(|| "challenge_beta"), || Ok(beta_val))?;
+      AllocatedNum::alloc_input(cs.namespace(|| "challenge_beta"), || Ok(challenge_vals[1]))?;
+    let mut ict_challenges = Vec::with_capacity(5);
+    for i in 0..5 {
+      let c = AllocatedNum::alloc_input(
+        cs.namespace(|| format!("challenge_ict_{}", i)),
+        || Ok(challenge_vals[2 + i]),
+      )?;
+      ict_challenges.push(c);
+    }
+    let ict_challenges_arr: [AllocatedNum<Scalar>; 5] = ict_challenges.try_into().unwrap();
 
     // Re-allocate witness trace for synthesis ("rest" variables)
     let witness_var = PermutationWitnessTraceVar::<Scalar, N, LEVELS>::alloc(
@@ -173,6 +184,16 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
     // =========================================================================
     // Part 2: Re-encryption
     // =========================================================================
+
+    // Allocate input ciphertexts (original order, before shuffle)
+    let mut input_deck_vars = Vec::with_capacity(N);
+    for i in 0..N {
+      let ct_var = ElGamalCiphertextVar::<ECEngine>::alloc(
+        cs.namespace(|| format!("input_ct_{}", i)),
+        &self.input_ciphertexts[i],
+      )?;
+      input_deck_vars.push(ct_var);
+    }
 
     // Allocate input ciphertexts (shuffled order)
     let mut shuffled_deck_vars = Vec::with_capacity(N);
@@ -219,6 +240,39 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       &self._native_reencrypt_data,
       &gen_var,
       &self.gen_powers,
+    )?;
+
+    // =========================================================================
+    // Part 3: Indexed ciphertext grand product
+    // =========================================================================
+    // Proves that (i, input_ct[i]) multiset-equals (σ(i), output_ct[i])
+    // where σ is the permutation proved by Part 1.
+
+    // Left side: IndexedCiphertext(i, input_ct[i])
+    let left: Vec<IndexedCiphertext<Scalar>> = (0..N)
+      .map(|i| {
+        let idx = AllocatedNum::alloc(cs.namespace(|| format!("ict_left_idx_{}", i)), || {
+          Ok(Scalar::from(i as u64))
+        })?;
+        Ok(IndexedCiphertext::new::<ECEngine>(idx, &input_deck_vars[i]))
+      })
+      .collect::<Result<Vec<_>, SynthesisError>>()?;
+
+    // Right side: IndexedCiphertext(sorted_levels[LEVELS-1][i].idx, shuffled_ct[i])
+    let right: Vec<IndexedCiphertext<Scalar>> = (0..N)
+      .map(|i| {
+        Ok(IndexedCiphertext::new::<ECEngine>(
+          witness_var.sorted_levels[LEVELS - 1][i].idx.clone(),
+          &shuffled_deck[i],
+        ))
+      })
+      .collect::<Result<Vec<_>, SynthesisError>>()?;
+
+    check_grand_product::<_, _, _, 5>(
+      cs.namespace(|| "ict_grand_product"),
+      &left,
+      &right,
+      &ict_challenges_arr,
     )?;
 
     Ok(())
