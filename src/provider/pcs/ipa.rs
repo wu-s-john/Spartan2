@@ -145,7 +145,7 @@ where
     let r_delta = E::Scalar::random(&mut OsRng);
     let r_beta = E::Scalar::random(&mut OsRng);
 
-    let delta = E::GE::vartime_multiscalar_mul(&d_vec, &ck[0..d_vec.len()], true)? + *h * r_delta;
+    let delta = E::GE::vartime_multiscalar_mul(&d_vec, &ck[0..d_vec.len()])? + *h * r_delta;
     let beta = E::GE::group(ck_c) * inner_product(&U.b_vec, &d_vec) + *h_c * r_beta;
 
     transcript.absorb(b"delta", &delta);
@@ -202,7 +202,7 @@ where
     }
 
     if U.comm_a_vec * r + self.delta
-      != E::GE::vartime_multiscalar_mul(&self.z_vec, &ck[0..self.z_vec.len()], true)?
+      != E::GE::vartime_multiscalar_mul(&self.z_vec, &ck[0..self.z_vec.len()])?
         + *h * self.z_delta
     {
       return Err(SpartanError::InvalidPCS {

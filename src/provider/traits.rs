@@ -109,7 +109,6 @@ pub trait DlogGroupExt: DlogGroup {
   fn vartime_multiscalar_mul(
     scalars: &[Self::Scalar],
     bases: &[Self::AffineGroupElement],
-    use_parallelism_internally: bool,
   ) -> Result<Self, SpartanError>;
 
   /// A method to compute a batch of multiexponentations
@@ -119,7 +118,7 @@ pub trait DlogGroupExt: DlogGroup {
   ) -> Result<Vec<Self>, SpartanError> {
     scalars
       .par_iter()
-      .map(|scalar| Self::vartime_multiscalar_mul(scalar, &bases[..scalar.len()], false))
+      .map(|scalar| Self::vartime_multiscalar_mul(scalar, &bases[..scalar.len()]))
       .collect::<Result<Vec<_>, _>>()
   }
 
@@ -127,7 +126,6 @@ pub trait DlogGroupExt: DlogGroup {
   fn vartime_multiscalar_mul_small<T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
     scalars: &[T],
     bases: &[Self::AffineGroupElement],
-    use_parallelism_internally: bool,
   ) -> Result<Self, SpartanError>;
 
   /// A method to compute a batch of multiexponentations with small scalars
@@ -137,7 +135,7 @@ pub trait DlogGroupExt: DlogGroup {
   ) -> Result<Vec<Self>, SpartanError> {
     scalars
       .par_iter()
-      .map(|scalar| Self::vartime_multiscalar_mul_small(scalar, &bases[..scalar.len()], false))
+      .map(|scalar| Self::vartime_multiscalar_mul_small(scalar, &bases[..scalar.len()]))
       .collect::<Result<Vec<_>, _>>()
   }
 
@@ -145,14 +143,12 @@ pub trait DlogGroupExt: DlogGroup {
   fn vartime_multiscalar_mul_signed_small(
     scalars: &[i8],
     bases: &[Self::AffineGroupElement],
-    use_parallelism_internally: bool,
   ) -> Result<Self, SpartanError>;
 
   /// A method to compute a multiexponentation with boolean scalars
   fn vartime_multiscalar_mul_bool(
     bits: &[bool],
     bases: &[Self::AffineGroupElement],
-    use_parallelism_internally: bool,
   ) -> Result<Self, SpartanError>;
 }
 
@@ -313,33 +309,29 @@ macro_rules! impl_traits {
       fn vartime_multiscalar_mul(
         scalars: &[Self::Scalar],
         bases: &[Self::AffineGroupElement],
-        use_parallelism_internally: bool,
       ) -> Result<Self, $crate::errors::SpartanError> {
-        msm(scalars, bases, use_parallelism_internally)
+        msm(scalars, bases)
       }
 
       fn vartime_multiscalar_mul_small<T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
         scalars: &[T],
         bases: &[Self::AffineGroupElement],
-        use_parallelism_internally: bool,
       ) -> Result<Self, $crate::errors::SpartanError> {
-        msm_small(scalars, bases, use_parallelism_internally)
+        msm_small(scalars, bases)
       }
 
       fn vartime_multiscalar_mul_signed_small(
         scalars: &[i8],
         bases: &[Self::AffineGroupElement],
-        use_parallelism_internally: bool,
       ) -> Result<Self, $crate::errors::SpartanError> {
-        msm_signed_small(scalars, bases, use_parallelism_internally)
+        msm_signed_small(scalars, bases)
       }
 
       fn vartime_multiscalar_mul_bool(
         bits: &[bool],
         bases: &[Self::AffineGroupElement],
-        use_parallelism_internally: bool,
       ) -> Result<Self, $crate::errors::SpartanError> {
-        msm_bool(bits, bases, use_parallelism_internally)
+        msm_bool(bits, bases)
       }
     }
   };

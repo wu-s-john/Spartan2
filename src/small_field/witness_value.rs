@@ -36,7 +36,6 @@ pub trait WitnessValue: Copy + Default + PartialEq + Send + Sync + 'static {
   fn msm<G: DlogGroupExt>(
     values: &[Self],
     bases: &[G::AffineGroupElement],
-    use_parallelism_internally: bool,
   ) -> Result<G, SpartanError>;
 
   /// Compute `a_bound * (2·hi - lo)` for the degree-2 sumcheck evaluation point.
@@ -75,9 +74,8 @@ impl WitnessValue for bool {
   fn msm<G: DlogGroupExt>(
     values: &[Self],
     bases: &[G::AffineGroupElement],
-    use_parallelism_internally: bool,
   ) -> Result<G, SpartanError> {
-    G::vartime_multiscalar_mul_bool(values, bases, use_parallelism_internally)
+    G::vartime_multiscalar_mul_bool(values, bases)
   }
 
   /// Fast path: `z_bound = 2·hi - lo` for bool ∈ {0,1} has only 4 cases,
@@ -126,8 +124,7 @@ impl WitnessValue for i8 {
   fn msm<G: DlogGroupExt>(
     values: &[Self],
     bases: &[G::AffineGroupElement],
-    use_parallelism_internally: bool,
   ) -> Result<G, SpartanError> {
-    G::vartime_multiscalar_mul_signed_small(values, bases, use_parallelism_internally)
+    G::vartime_multiscalar_mul_signed_small(values, bases)
   }
 }

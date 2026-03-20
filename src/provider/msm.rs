@@ -4,9 +4,20 @@
 // See the LICENSE file in the project root for full license information.
 // Source repository: https://github.com/Microsoft/Spartan2
 
-//! This module provides a multi-scalar multiplication routine
-//! The generic implementation is adapted from halo2; we add an optimization to commit to bits more efficiently
-//! The specialized implementations are adapted from jolt, with additional optimizations and parallelization.
+//! This module provides a multi-scalar multiplication routine.
+//!
+//! For full-field-element MSM, we use a signed-decomposition + bit-width-partitioning strategy:
+//!
+//! 1. **Signed scalar decomposition**: For each scalar `s`, we compare `num_bits(s)` vs
+//!    `num_bits(p - s)` and use whichever representation is smaller, negating the base point
+//!    if we use `p - s`. This halves the effective scalar range.
+//! 2. **Bit-width partitioning**: Scalars are routed to the optimal algorithm based on their
+//!    actual bit-width after signed reduction: binary accumulation for 0/1, single-window
+//!    bucket sort for ≤10 bits, multi-window Pippenger for ≤32 bits, and halo2curves for the rest.
+//! 3. **XYZZ bucket coordinates**: Extended Jacobian `(X, Y, ZZ, ZZZ)` provides cheaper
+//!    mixed addition (7M + 2S) compared to standard Jacobian (~11M + 5S for proj+affine).
+//!
+//! The MSM implementations are adapted from Nova/halo2/jolt.
 use crate::{errors::SpartanError, start_span};
 use ff::{Field, PrimeField};
 use halo2curves::{CurveAffine, group::Group};
@@ -15,155 +26,247 @@ use num_traits::{ToPrimitive, Zero};
 use rayon::{current_num_threads, prelude::*};
 use tracing::info;
 
-#[derive(Clone, Copy)]
-enum Bucket<C: CurveAffine> {
-  None,
-  Affine(C),
-  Projective(C::Curve),
-}
+// ==================================================================================
+// XYZZ (Extended Jacobian) Bucket coordinates
+// ==================================================================================
 
-impl<C: CurveAffine> Bucket<C> {
-  fn add_assign(&mut self, other: &C) {
-    *self = match *self {
-      Bucket::None => Bucket::Affine(*other),
-      Bucket::Affine(a) => Bucket::Projective(a + *other),
-      Bucket::Projective(a) => Bucket::Projective(a + other),
-    }
-  }
-
-  fn sub_assign(&mut self, other: &C) {
-    let neg = -*other;
-    self.add_assign(&neg);
-  }
-
-  fn add(self, other: C::Curve) -> C::Curve {
-    match self {
-      Bucket::None => other,
-      Bucket::Affine(a) => other + a,
-      Bucket::Projective(a) => other + a,
-    }
-  }
-}
-
-fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
-  // Optimization 2: Optimal window size — compare cost at c and c+1
-  let c = if bases.len() < 4 {
-    1
-  } else if bases.len() < 32 {
-    3
-  } else {
-    let c_base = (f64::from(bases.len() as u32)).ln().ceil() as usize;
-    let cost = |c: usize| ((256 + c - 1) / c) * (bases.len() + (1 << (c - 1)));
-    if cost(c_base + 1) < cost(c_base) {
-      c_base + 1
-    } else {
-      c_base
-    }
-  };
-
-  fn get_at<F: PrimeField>(segment: usize, c: usize, bytes: &F::Repr) -> usize {
-    let skip_bits = segment * c;
-    let skip_bytes = skip_bits / 8;
-
-    if skip_bytes >= 32 {
-      return 0;
-    }
-
-    let mut v = [0; 8];
-    for (v, o) in v.iter_mut().zip(bytes.as_ref()[skip_bytes..].iter()) {
-      *v = *o;
-    }
-
-    let mut tmp = u64::from_le_bytes(v);
-    tmp >>= skip_bits - (skip_bytes * 8);
-    tmp %= 1 << c;
-
-    tmp as usize
-  }
-
-  // Boolean scalars: accumulated and separated from non-Boolean scalars
-  // Optimization 1: Pre-compute scalar byte representations (to_repr() once, not per window)
-  let mut boolean_sum = C::Curve::identity();
-  let mut non_boolean: Vec<(<C::Scalar as PrimeField>::Repr, C)> = Vec::new();
-
-  for (s, b) in coeffs.iter().zip(bases) {
-    if *s == C::Scalar::ONE {
-      boolean_sum += b;
-    } else if *s != C::Scalar::ZERO {
-      non_boolean.push((s.to_repr(), *b));
-    }
-  }
-
-  if non_boolean.is_empty() {
-    return boolean_sum;
-  }
-
-  // Optimization 3: Signed digit representation — halves bucket count per window
-  debug_assert!(c < 31, "window size c={c} would overflow 1i32 << c");
-  let half = 1usize << (c - 1); // 2^(c-1)
-  let num_windows = (256 + c - 1) / c + 1; // +1 for potential carry overflow
-
-  // Pre-compute signed digits for all scalars with carry propagation (flat layout)
-  let mut signed_digits = vec![0i32; non_boolean.len() * num_windows];
-  for (i, (repr, _)) in non_boolean.iter().enumerate() {
-    let mut carry = 0u32;
-    for seg in 0..num_windows {
-      let raw = get_at::<C::Scalar>(seg, c, repr) as u32 + carry;
-      let (digit, new_carry) = if (raw as usize) <= half {
-        (raw as i32, 0)
-      } else {
-        (raw as i32 - (1i32 << c), 1)
-      };
-      signed_digits[i * num_windows + seg] = digit;
-      carry = new_carry;
-    }
-  }
-
-  let non_boolean_sum = {
-    let num_buckets = half; // 2^(c-1) buckets for |digit| in [1, 2^(c-1)]
-    (0..num_windows)
-      .rev()
-      .fold(C::Curve::identity(), |mut acc, segment| {
-        (0..c).for_each(|_| acc = acc.double());
-
-        let mut buckets = vec![Bucket::None; num_buckets];
-
-        for (i, (_, base)) in non_boolean.iter().enumerate() {
-          let d = signed_digits[i * num_windows + segment];
-          if d > 0 {
-            buckets[(d as usize) - 1].add_assign(base);
-          } else if d < 0 {
-            buckets[(-d as usize) - 1].sub_assign(base);
-          }
-        }
-
-        // Summation by parts
-        // e.g. 3a + 2b + 1c = a +
-        //                    (a) + b +
-        //                    ((a) + b) + c
-        let mut running_sum = C::Curve::identity();
-        for exp in buckets.into_iter().rev() {
-          running_sum = exp.add(running_sum);
-          acc += &running_sum;
-        }
-        acc
-      })
-  };
-
-  boolean_sum + non_boolean_sum
-}
-
-/// Performs a multi-scalar-multiplication operation without GPU acceleration.
+/// Extended Jacobian (XYZZ) coordinates for efficient MSM bucket accumulation.
 ///
-/// This will use multithreading if beneficial.
-/// Adapted from zcash/halo2
+/// Stores `(X, Y, ZZ, ZZZ)` where `ZZ = Z²` and `ZZZ = Z³` for a Jacobian point
+/// with coordinates `(X/ZZ, Y/ZZZ)` in affine.
+///
+/// Mixed addition (affine + XYZZ) costs 7M + 2S vs ~11M + 5S for standard projective+affine.
+/// Formula source: <https://www.hyperelliptic.org/EFD/g1p/auto-shortw-xyzz.html>
+///
+/// **Assumes `a = 0`** in the curve equation `y² = x³ + ax + b`, which holds for
+/// all curves used in Spartan2 (Pallas, Vesta).
+#[derive(Copy, Clone)]
+struct BucketXYZZ<F: Field> {
+  x: F,
+  y: F,
+  zz: F,
+  zzz: F,
+}
+
+impl<F: Field> BucketXYZZ<F> {
+  /// The point at infinity (identity).
+  #[inline]
+  fn zero() -> Self {
+    Self {
+      x: F::ONE,
+      y: F::ONE,
+      zz: F::ZERO,
+      zzz: F::ZERO,
+    }
+  }
+
+  /// Check if this is the identity.
+  #[inline]
+  fn is_zero(&self) -> bool {
+    self.zz == F::ZERO
+  }
+
+  /// Double in place (dbl-2008-s-1, assumes a=0).
+  /// Cost: 2M + 5S + 7add
+  fn double_in_place(&mut self) {
+    if self.is_zero() {
+      return;
+    }
+    // U = 2*Y1
+    let u = self.y.double();
+    // V = U^2
+    let v = u.square();
+    // W = U*V
+    let w = u * v;
+    // S = X1*V
+    let s = self.x * v;
+    // M = 3*X1^2 (a=0, so no a*ZZ^2 term)
+    let x_sq = self.x.square();
+    let m = x_sq.double() + x_sq;
+    // X3 = M^2 - 2*S
+    self.x = m.square() - s.double();
+    // Y3 = M*(S - X3) - W*Y1
+    self.y = m * (s - self.x) - w * self.y;
+    // ZZ3 = V*ZZ1
+    self.zz *= v;
+    // ZZZ3 = W*ZZZ1
+    self.zzz *= w;
+  }
+
+  /// XYZZ += XYZZ (full addition, add-2008-s).
+  fn add_assign_bucket(&mut self, other: &Self) {
+    if other.is_zero() {
+      return;
+    }
+    if self.is_zero() {
+      *self = *other;
+      return;
+    }
+    // U1 = X1*ZZ2, U2 = X2*ZZ1
+    let u1 = self.x * other.zz;
+    let u2 = other.x * self.zz;
+    // S1 = Y1*ZZZ2, S2 = Y2*ZZZ1
+    let s1 = self.y * other.zzz;
+    let s2 = other.y * self.zzz;
+
+    if u1 == u2 {
+      if s1 == s2 {
+        self.double_in_place();
+      } else {
+        *self = Self::zero();
+      }
+      return;
+    }
+    let p = u2 - u1;
+    let r = s2 - s1;
+    let pp = p.square();
+    let ppp = p * pp;
+    let q = u1 * pp;
+    self.x = r.square() - ppp - q.double();
+    self.y = r * (q - self.x) - s1 * ppp;
+    self.zz = self.zz * other.zz * pp;
+    self.zzz = self.zzz * other.zzz * ppp;
+  }
+}
+
+/// Mixed addition: BucketXYZZ += CurveAffine point (madd-2008-s).
+/// Cost: 7M + 2S
+#[inline]
+fn bucket_add_affine<C: CurveAffine>(bucket: &mut BucketXYZZ<C::Base>, p: &C) {
+  if bool::from(p.is_identity()) {
+    return;
+  }
+  let coords = p.coordinates().unwrap();
+  let px = *coords.x();
+  let py = *coords.y();
+
+  if bucket.is_zero() {
+    bucket.x = px;
+    bucket.y = py;
+    bucket.zz = C::Base::ONE;
+    bucket.zzz = C::Base::ONE;
+    return;
+  }
+  // U2 = X2*ZZ1, S2 = Y2*ZZZ1
+  let u2 = px * bucket.zz;
+  let s2 = py * bucket.zzz;
+
+  if bucket.x == u2 {
+    if bucket.y == s2 {
+      bucket.double_in_place();
+    } else {
+      *bucket = BucketXYZZ::zero();
+    }
+    return;
+  }
+  let p_val = u2 - bucket.x;
+  let r = s2 - bucket.y;
+  let pp = p_val.square();
+  let ppp = p_val * pp;
+  let q = bucket.x * pp;
+  bucket.x = r.square() - ppp - q.double();
+  bucket.y = r * (q - bucket.x) - bucket.y * ppp;
+  bucket.zz *= pp;
+  bucket.zzz *= ppp;
+}
+
+/// Convert XYZZ bucket to projective curve point.
+///
+/// Computes affine coordinates `(X/ZZ, Y/ZZZ)` then converts to projective.
+/// Only called O(windows) times per thread, so the field inversion cost is negligible.
+#[inline]
+fn bucket_to_curve<C: CurveAffine>(bucket: &BucketXYZZ<C::Base>) -> C::CurveExt {
+  if bucket.is_zero() {
+    return C::CurveExt::identity();
+  }
+  let zz_inv = bucket.zz.invert().unwrap();
+  let zzz_inv = bucket.zzz.invert().unwrap();
+  let x = bucket.x * zz_inv;
+  let y = bucket.y * zzz_inv;
+  let ct: Option<C> = C::from_xy(x, y).into();
+  ct.expect("XYZZ bucket should produce a valid curve point")
+    .into()
+}
+
+// ==================================================================================
+// Scalar utilities
+// ==================================================================================
+
+/// Count significant bits in a field element (from its little-endian repr).
+#[inline]
+fn scalar_num_bits<F: PrimeField>(s: &F) -> u32 {
+  let repr = s.to_repr();
+  let bytes = repr.as_ref();
+  for i in (0..bytes.len()).rev() {
+    if bytes[i] != 0 {
+      return i as u32 * 8 + (8 - bytes[i].leading_zeros());
+    }
+  }
+  0
+}
+
+/// Extract the low 64 bits from a field element's little-endian representation.
+#[inline]
+fn repr_low_u64<F: PrimeField>(s: &F) -> u64 {
+  let repr = s.to_repr();
+  let bytes = repr.as_ref();
+  let mut buf = [0u8; 8];
+  let len = bytes.len().min(8);
+  buf[..len].copy_from_slice(&bytes[..len]);
+  u64::from_le_bytes(buf)
+}
+
+// ==================================================================================
+// Main MSM with signed decomposition + bit-width partitioning
+// ==================================================================================
+
+/// Simple MSM fallback for very small inputs.
+fn msm_simple<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+  coeffs
+    .iter()
+    .zip(bases.iter())
+    .fold(C::Curve::identity(), |acc, (coeff, base)| {
+      acc + *base * coeff
+    })
+}
+
+/// Accumulate bases (sum of affine points, for binary MSM).
+fn accumulate_bases<C: CurveAffine>(bases: &[C]) -> C::Curve {
+  let num_threads = current_num_threads();
+  if bases.is_empty() {
+    return C::Curve::identity();
+  }
+  if bases.len() > num_threads {
+    let chunk = bases.len().div_ceil(num_threads);
+    bases
+      .par_chunks(chunk)
+      .map(|chunk| {
+        chunk.iter().fold(C::Curve::identity(), |mut acc, b| {
+          acc += *b;
+          acc
+        })
+      })
+      .reduce(C::Curve::identity, |a, b| a + b)
+  } else {
+    bases.iter().fold(C::Curve::identity(), |mut acc, b| {
+      acc += *b;
+      acc
+    })
+  }
+}
+
+/// Performs an optimized multi-scalar multiplication for full field element scalars.
+///
+/// Uses signed scalar decomposition to halve the effective scalar range,
+/// then partitions scalars by bit-width to route each group to the optimal MSM algorithm.
+/// Small scalars (≤64 bits) use bucket-sort MSMs with XYZZ coordinates;
+/// large scalars delegate to halo2curves' `msm_best`.
 ///
 /// # Errors
 /// Returns `SpartanError::InvalidInputLength` if coeffs and bases have different lengths.
 pub fn msm<C: CurveAffine>(
   coeffs: &[C::Scalar],
   bases: &[C],
-  use_parallelism_internally: bool,
 ) -> Result<C::Curve, SpartanError> {
   let (_msm_span, msm_t) = start_span!("msm", size = coeffs.len());
 
@@ -173,24 +276,191 @@ pub fn msm<C: CurveAffine>(
     });
   }
 
-  let num_threads = if coeffs.len() >= 1024 && use_parallelism_internally {
-    // Large input: use parallelism
-    current_num_threads()
-  } else {
-    // Small input or parallelism disabled: single thread
-    1
+  let n = coeffs.len();
+  if n == 0 {
+    return Ok(C::Curve::identity());
+  }
+
+  // For very small inputs, use the simple fallback
+  if n <= 16 {
+    return Ok(msm_simple(coeffs, bases));
+  }
+
+  // Group indices: 0=unit_pos, 1=unit_neg, 2=pos≤8, 3=neg≤8,
+  // 4=pos≤16, 5=neg≤16, 6=pos≤32, 7=neg≤32, 8=pos≤64, 9=neg≤64, 10=large
+  const NUM_GROUPS: usize = 11;
+
+  // Phase 1: Classify each scalar in parallel
+  // Encode as u64: top 4 bits = group, bottom 60 bits = original index
+  let classified: Vec<u64> = coeffs
+    .par_iter()
+    .enumerate()
+    .filter_map(|(i, s)| {
+      if bool::from(s.is_zero()) || bool::from(bases[i].is_identity()) {
+        return None;
+      }
+      let neg_s = -(*s);
+      let bits_s = scalar_num_bits(s);
+      let bits_neg = scalar_num_bits(&neg_s);
+
+      let group = if bits_s <= 1 {
+        0u8 // unit positive
+      } else if bits_neg <= 1 {
+        1u8 // unit negative
+      } else if bits_s <= 8 {
+        2u8
+      } else if bits_neg <= 8 {
+        3u8
+      } else if bits_s <= 16 {
+        4u8
+      } else if bits_neg <= 16 {
+        5u8
+      } else if bits_s <= 32 {
+        6u8
+      } else if bits_neg <= 32 {
+        7u8
+      } else if bits_s <= 64 {
+        8u8
+      } else if bits_neg <= 64 {
+        9u8
+      } else {
+        10u8 // large
+      };
+      Some(((i as u64) & 0x0FFF_FFFF_FFFF_FFFF) | ((group as u64) << 60))
+    })
+    .collect();
+
+  if classified.is_empty() {
+    return Ok(C::Curve::identity());
+  }
+
+  // Phase 2: Sort by group for efficient partitioning
+  let mut classified = classified;
+  classified.par_sort_unstable_by_key(|v| (v >> 60) as u8);
+
+  let extract_group = |v: u64| (v >> 60) as u8;
+  let extract_index = |v: u64| (v & 0x0FFF_FFFF_FFFF_FFFF) as usize;
+
+  // Find partition boundaries
+  let mut boundaries = [0usize; NUM_GROUPS + 1];
+  {
+    let mut pos = 0;
+    for g in 0..NUM_GROUPS as u8 {
+      boundaries[g as usize] = pos;
+      pos += classified[pos..].partition_point(|v| extract_group(*v) <= g);
+    }
+    boundaries[NUM_GROUPS] = classified.len();
+  }
+
+  // Helper to extract (bases, u64_scalars) for a group range
+  let extract_u64_group = |start: usize, end: usize, negate: bool| -> (Vec<C>, Vec<u64>) {
+    classified[start..end]
+      .iter()
+      .map(|&v| {
+        let idx = extract_index(v);
+        let b = bases[idx];
+        let s = if negate { -coeffs[idx] } else { coeffs[idx] };
+        (b, repr_low_u64(&s))
+      })
+      .unzip()
   };
 
-  let result = if coeffs.len() > num_threads {
-    let chunk = coeffs.len() / num_threads;
-    coeffs
-      .par_chunks(chunk)
-      .zip(bases.par_chunks(chunk))
-      .map(|(coeffs, bases)| cpu_msm_serial(coeffs, bases))
-      .reduce(C::Curve::identity, |sum, evl| sum + evl)
-  } else {
-    cpu_msm_serial(coeffs, bases)
+  // Helper to extract bases for unit groups
+  let extract_binary_group = |start: usize, end: usize| -> Vec<C> {
+    classified[start..end]
+      .iter()
+      .map(|&v| bases[extract_index(v)])
+      .collect()
   };
+
+  // Phase 3: Compute MSM for each group in parallel
+  let (g0_start, g0_end) = (boundaries[0], boundaries[1]);
+  let (g1_start, g1_end) = (boundaries[1], boundaries[2]);
+  let (g2_start, g2_end) = (boundaries[2], boundaries[3]);
+  let (g3_start, g3_end) = (boundaries[3], boundaries[4]);
+  let (g4_start, g4_end) = (boundaries[4], boundaries[5]);
+  let (g5_start, g5_end) = (boundaries[5], boundaries[6]);
+  let (g6_start, g6_end) = (boundaries[6], boundaries[7]);
+  let (g7_start, g7_end) = (boundaries[7], boundaries[8]);
+  let (g8_start, g8_end) = (boundaries[8], boundaries[9]);
+  let (g9_start, g9_end) = (boundaries[9], boundaries[10]);
+  let (g10_start, g10_end) = (boundaries[10], boundaries[11]);
+
+  // Execute all groups in parallel using nested rayon joins
+  let (binary_result, small_and_large_result) = rayon::join(
+    || {
+      let (pos, neg) = rayon::join(
+        || {
+          let bases_pos = extract_binary_group(g0_start, g0_end);
+          accumulate_bases::<C>(&bases_pos)
+        },
+        || {
+          let bases_neg = extract_binary_group(g1_start, g1_end);
+          accumulate_bases::<C>(&bases_neg)
+        },
+      );
+      pos - neg
+    },
+    || {
+      let (small_result, large_result) = rayon::join(
+        || {
+          let ((r8, r16), (r32, r64)) = rayon::join(
+            || {
+              rayon::join(
+                || {
+                  let (pos_b, pos_s) = extract_u64_group(g2_start, g2_end, false);
+                  let (neg_b, neg_s) = extract_u64_group(g3_start, g3_end, true);
+                  msm_small_with_max_num_bits(&pos_s, &pos_b, 8)
+                    - msm_small_with_max_num_bits(&neg_s, &neg_b, 8)
+                },
+                || {
+                  let (pos_b, pos_s) = extract_u64_group(g4_start, g4_end, false);
+                  let (neg_b, neg_s) = extract_u64_group(g5_start, g5_end, true);
+                  msm_small_with_max_num_bits(&pos_s, &pos_b, 16)
+                    - msm_small_with_max_num_bits(&neg_s, &neg_b, 16)
+                },
+              )
+            },
+            || {
+              rayon::join(
+                || {
+                  let (pos_b, pos_s) = extract_u64_group(g6_start, g6_end, false);
+                  let (neg_b, neg_s) = extract_u64_group(g7_start, g7_end, true);
+                  msm_small_with_max_num_bits(&pos_s, &pos_b, 32)
+                    - msm_small_with_max_num_bits(&neg_s, &neg_b, 32)
+                },
+                || {
+                  let (pos_b, pos_s) = extract_u64_group(g8_start, g8_end, false);
+                  let (neg_b, neg_s) = extract_u64_group(g9_start, g9_end, true);
+                  msm_small_with_max_num_bits(&pos_s, &pos_b, 64)
+                    - msm_small_with_max_num_bits(&neg_s, &neg_b, 64)
+                },
+              )
+            },
+          );
+          r8 + r16 + r32 + r64
+        },
+        || {
+          // Large scalars: delegate to halo2curves' optimized MSM
+          if g10_start >= g10_end {
+            return C::Curve::identity();
+          }
+          let (large_bases, large_coeffs): (Vec<C>, Vec<C::Scalar>) = classified
+            [g10_start..g10_end]
+            .iter()
+            .map(|&v| {
+              let idx = extract_index(v);
+              (bases[idx], coeffs[idx])
+            })
+            .unzip();
+          halo2curves::msm::msm_best(&large_coeffs, &large_bases)
+        },
+      );
+      small_result + large_result
+    },
+  );
+
+  let result = binary_result + small_and_large_result;
 
   if msm_t.elapsed().as_millis() > 10 {
     info!(elapsed_ms = %msm_t.elapsed().as_millis(), size = coeffs.len(), "msm");
@@ -202,6 +472,38 @@ fn num_bits(n: usize) -> usize {
   if n == 0 { 0 } else { (n.ilog2() + 1) as usize }
 }
 
+// ==================================================================================
+// Small-scalar MSM with XYZZ buckets
+// ==================================================================================
+
+/// Internal helper: MSM for small scalars with a known max bit-width.
+fn msm_small_with_max_num_bits<C: CurveAffine, T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
+  scalars: &[T],
+  bases: &[C],
+  max_num_bits: usize,
+) -> C::Curve {
+  if scalars.is_empty() {
+    return C::Curve::identity();
+  }
+  assert_eq!(bases.len(), scalars.len());
+
+  match max_num_bits {
+    0 => C::identity().into(),
+    1 => msm_binary(scalars, bases),
+    2..=10 => msm_10(scalars, bases, max_num_bits),
+    11..=32 => msm_small_rest(scalars, bases, max_num_bits),
+    _ => {
+      // For >32-bit scalars, halo2curves' msm_best is faster than our
+      // bucket-sort Pippenger (e.g., 192ms vs 244ms at u64, 2^20 points).
+      let field_scalars: Vec<C::ScalarExt> = scalars
+        .iter()
+        .map(|s| C::ScalarExt::from((*s).into()))
+        .collect();
+      halo2curves::msm::msm_best(&field_scalars, bases)
+    }
+  }
+}
+
 /// Multi-scalar multiplication using the best algorithm for the given scalars.
 ///
 /// # Errors
@@ -210,7 +512,6 @@ fn num_bits(n: usize) -> usize {
 pub fn msm_small<C: CurveAffine, T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
   scalars: &[T],
   bases: &[C],
-  use_parallelism_internally: bool,
 ) -> Result<C::Curve, SpartanError> {
   let (_msm_small_span, msm_small_t) = start_span!("msm_small", size = scalars.len());
 
@@ -231,7 +532,7 @@ pub fn msm_small<C: CurveAffine, T: Integer + Into<u64> + Copy + Sync + ToPrimit
     0 => C::identity().into(),
     1 => {
       let (_binary_span, binary_t) = start_span!("msm_binary");
-      let result = msm_binary(scalars, bases, use_parallelism_internally);
+      let result = msm_binary(scalars, bases);
       if binary_t.elapsed().as_millis() != 0 {
         info!(elapsed_ms = %binary_t.elapsed().as_millis(), size = scalars.len(), "msm_binary");
       }
@@ -239,13 +540,13 @@ pub fn msm_small<C: CurveAffine, T: Integer + Into<u64> + Copy + Sync + ToPrimit
     }
     2..=10 => {
       let (_msm_10_span, msm_10_t) = start_span!("msm_10", max_bits = max_num_bits);
-      let result = msm_10(scalars, bases, max_num_bits, use_parallelism_internally);
+      let result = msm_10(scalars, bases, max_num_bits);
       info!(elapsed_ms = %msm_10_t.elapsed().as_millis(), max_bits = max_num_bits, "msm_10");
       result
     }
     _ => {
       let (_msm_rest_span, msm_rest_t) = start_span!("msm_small_rest", max_bits = max_num_bits);
-      let result = msm_small_rest(scalars, bases, max_num_bits, use_parallelism_internally);
+      let result = msm_small_rest(scalars, bases, max_num_bits);
       info!(elapsed_ms = %msm_rest_t.elapsed().as_millis(), max_bits = max_num_bits, "msm_small_rest");
       result
     }
@@ -258,17 +559,9 @@ pub fn msm_small<C: CurveAffine, T: Integer + Into<u64> + Copy + Sync + ToPrimit
 }
 
 #[inline(always)]
-fn msm_binary<C: CurveAffine, T: Integer + Sync>(
-  scalars: &[T],
-  bases: &[C],
-  use_parallelism_internally: bool,
-) -> C::Curve {
+fn msm_binary<C: CurveAffine, T: Integer + Sync>(scalars: &[T], bases: &[C]) -> C::Curve {
   assert_eq!(scalars.len(), bases.len());
-  let num_threads = if use_parallelism_internally {
-    current_num_threads()
-  } else {
-    1
-  };
+  let num_threads = current_num_threads();
   let process_chunk = |scalars: &[T], bases: &[C]| {
     let mut acc = C::Curve::identity();
     scalars
@@ -300,7 +593,6 @@ fn msm_binary<C: CurveAffine, T: Integer + Sync>(
 pub fn msm_bool<C: CurveAffine>(
   bits: &[bool],
   bases: &[C],
-  use_parallelism_internally: bool,
 ) -> Result<C::Curve, SpartanError> {
   if bits.len() != bases.len() {
     return Err(SpartanError::InvalidInputLength {
@@ -308,7 +600,7 @@ pub fn msm_bool<C: CurveAffine>(
     });
   }
 
-  let num_threads = if bits.len() > 1024 && use_parallelism_internally {
+  let num_threads = if bits.len() > 1024 {
     current_num_threads()
   } else {
     1
@@ -337,13 +629,12 @@ pub fn msm_bool<C: CurveAffine>(
   Ok(result)
 }
 
-/// MSM optimized for up to 10-bit scalars
+/// MSM optimized for up to 10-bit scalars, using XYZZ bucket coordinates.
 #[inline(always)]
 fn msm_10<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
   scalars: &[T],
   bases: &[C],
   max_num_bits: usize,
-  use_parallelism_internally: bool,
 ) -> C::Curve {
   fn msm_10_serial<C: CurveAffine, T: Into<u64> + Zero + Copy>(
     scalars: &[T],
@@ -351,7 +642,7 @@ fn msm_10<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
     max_num_bits: usize,
   ) -> C::Curve {
     let num_buckets: usize = 1 << max_num_bits;
-    let mut buckets = vec![Bucket::None; num_buckets];
+    let mut buckets: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); num_buckets];
 
     scalars
       .iter()
@@ -359,23 +650,19 @@ fn msm_10<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
       .filter(|(scalar, _base)| !scalar.is_zero())
       .for_each(|(scalar, base)| {
         let bucket_index: u64 = (*scalar).into();
-        buckets[bucket_index as usize].add_assign(base);
+        bucket_add_affine::<C>(&mut buckets[bucket_index as usize], base);
       });
 
-    let mut result = C::Curve::identity();
-    let mut running_sum = C::Curve::identity();
-    buckets.iter().skip(1).rev().for_each(|exp| {
-      running_sum = exp.add(running_sum);
-      result += &running_sum;
-    });
-    result
+    let mut result: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+    let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+    for b in buckets.into_iter().skip(1).rev() {
+      running_sum.add_assign_bucket(&b);
+      result.add_assign_bucket(&running_sum);
+    }
+    bucket_to_curve::<C>(&result)
   }
 
-  let num_threads = if use_parallelism_internally {
-    current_num_threads()
-  } else {
-    1
-  };
+  let num_threads = current_num_threads();
   if scalars.len() > num_threads {
     let chunk_size = scalars.len() / num_threads;
     scalars
@@ -393,32 +680,34 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
   scalars: &[T],
   bases: &[C],
   max_num_bits: usize,
-  use_parallelism_internally: bool,
 ) -> C::Curve {
   fn msm_small_rest_serial<C: CurveAffine, T: Into<u64> + Zero + Copy>(
     scalars: &[T],
     bases: &[C],
     max_num_bits: usize,
   ) -> C::Curve {
-    let c = if bases.len() < 32 {
+    let mut c = if bases.len() < 32 {
       3
     } else {
       compute_ln(bases.len()) + 2
     };
 
-    let zero = C::Curve::identity();
+    if max_num_bits == 32 || max_num_bits == 64 {
+      c = 8;
+    }
 
     let scalars_and_bases_iter = scalars.iter().zip(bases).filter(|(s, _base)| !s.is_zero());
-    let window_starts = (0..max_num_bits).step_by(c);
+    let window_starts: Vec<usize> = (0..max_num_bits).step_by(c).collect();
 
     // Each window is of size `c`.
     // We divide up the bits 0..num_bits into windows of size `c`, and
-    // in parallel process each such window.
-    let window_sums: Vec<_> = window_starts
-      .map(|w_start| {
-        let mut res = zero;
+    // process each such window.
+    let window_sums: Vec<C::CurveExt> = window_starts
+      .iter()
+      .map(|&w_start| {
+        let mut res: BucketXYZZ<C::Base> = BucketXYZZ::zero();
         // We don't need the "zero" bucket, so we only have 2^c - 1 buckets.
-        let mut buckets = vec![zero; (1 << c) - 1];
+        let mut buckets: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); (1 << c) - 1];
         // This clone is cheap, because the iterator contains just a
         // pointer and an index into the original vectors.
         scalars_and_bases_iter.clone().for_each(|(&scalar, base)| {
@@ -426,7 +715,7 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
           if scalar == 1 {
             // We only process unit scalars once in the first window.
             if w_start == 0 {
-              res += base;
+              bucket_add_affine::<C>(&mut res, base);
             }
           } else {
             let mut scalar = scalar;
@@ -442,43 +731,30 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
             // bucket.
             // (Recall that `buckets` doesn't have a zero bucket.)
             if scalar != 0 {
-              buckets[(scalar - 1) as usize] += base;
+              bucket_add_affine::<C>(&mut buckets[(scalar - 1) as usize], base);
             }
           }
         });
 
-        // Compute sum_{i in 0..num_buckets} (sum_{j in i..num_buckets} bucket[j])
-        // This is computed below for b buckets, using 2b curve additions.
-        //
-        // We could first normalize `buckets` and then use mixed-addition
-        // here, but that's slower for the kinds of groups we care about
-        // (Short Weierstrass curves and Twisted Edwards curves).
-        // In the case of Short Weierstrass curves,
-        // mixed addition saves ~4 field multiplications per addition.
-        // However normalization (with the inversion batched) takes ~6
-        // field multiplications per element,
-        // hence batch normalization is a slowdown.
-
-        // `running_sum` = sum_{j in i..num_buckets} bucket[j],
-        // where we iterate backward from i = num_buckets to 0.
-        let mut running_sum = C::Curve::identity();
-        buckets.into_iter().rev().for_each(|b| {
-          running_sum += &b;
-          res += &running_sum;
-        });
-        res
+        // Prefix sum using XYZZ coordinates
+        let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+        for b in buckets.into_iter().rev() {
+          running_sum.add_assign_bucket(&b);
+          res.add_assign_bucket(&running_sum);
+        }
+        bucket_to_curve::<C>(&res)
       })
       .collect();
 
     // We store the sum for the lowest window.
-    let lowest = window_sums.first().copied().unwrap_or(zero);
+    let lowest = *window_sums.first().unwrap();
 
     // We're traversing windows from high to low.
     lowest
       + window_sums[1..]
         .iter()
         .rev()
-        .fold(zero, |mut total, sum_i| {
+        .fold(C::CurveExt::identity(), |mut total, sum_i| {
           total += sum_i;
           for _ in 0..c {
             total = total.double();
@@ -487,11 +763,7 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
         })
   }
 
-  let num_threads = if use_parallelism_internally {
-    current_num_threads()
-  } else {
-    1
-  };
+  let num_threads = current_num_threads();
   if scalars.len() > num_threads {
     let chunk_size = scalars.len() / num_threads;
     scalars
@@ -508,7 +780,8 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
 
 /// Multi-scalar multiplication for signed small scalars (e.g. {-1, 0, 1, 2}).
 ///
-/// Uses separate positive/negative bucket accumulators with summation-by-parts.
+/// Uses separate positive/negative bucket accumulators with summation-by-parts
+/// and XYZZ bucket coordinates.
 /// For witnesses in {-1, 0, 1, 2}, this uses only 3 buckets total.
 ///
 /// # Errors
@@ -516,7 +789,6 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
 pub fn msm_signed_small<C: CurveAffine>(
   scalars: &[i8],
   bases: &[C],
-  use_parallelism_internally: bool,
 ) -> Result<C::Curve, SpartanError> {
   if bases.len() != scalars.len() {
     return Err(SpartanError::InvalidInputLength {
@@ -528,11 +800,7 @@ pub fn msm_signed_small<C: CurveAffine>(
     return Ok(C::Curve::identity());
   }
 
-  let num_threads = if use_parallelism_internally {
-    current_num_threads()
-  } else {
-    1
-  };
+  let num_threads = current_num_threads();
 
   if scalars.len() > num_threads {
     let chunk_size = scalars.len() / num_threads;
@@ -566,34 +834,34 @@ fn msm_signed_small_serial<C: CurveAffine>(scalars: &[i8], bases: &[C]) -> C::Cu
   let num_pos_buckets = max_pos as usize;
   let num_neg_buckets = (-max_neg) as usize;
 
-  let mut pos_buckets = vec![Bucket::<C>::None; num_pos_buckets];
-  let mut neg_buckets = vec![Bucket::<C>::None; num_neg_buckets];
+  let mut pos_buckets: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); num_pos_buckets];
+  let mut neg_buckets: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); num_neg_buckets];
 
   for (&scalar, base) in scalars.iter().zip(bases.iter()) {
     if scalar > 0 {
-      pos_buckets[(scalar - 1) as usize].add_assign(base);
+      bucket_add_affine::<C>(&mut pos_buckets[(scalar - 1) as usize], base);
     } else if scalar < 0 {
-      neg_buckets[(-scalar - 1) as usize].add_assign(base);
+      bucket_add_affine::<C>(&mut neg_buckets[(-scalar - 1) as usize], base);
     }
   }
 
   // Summation-by-parts for positive buckets
-  let mut pos_sum = C::Curve::identity();
-  let mut running_sum = C::Curve::identity();
+  let mut pos_result: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+  let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
   for bucket in pos_buckets.into_iter().rev() {
-    running_sum = bucket.add(running_sum);
-    pos_sum += &running_sum;
+    running_sum.add_assign_bucket(&bucket);
+    pos_result.add_assign_bucket(&running_sum);
   }
 
   // Summation-by-parts for negative buckets
-  let mut neg_sum = C::Curve::identity();
-  running_sum = C::Curve::identity();
+  let mut neg_result: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+  running_sum = BucketXYZZ::zero();
   for bucket in neg_buckets.into_iter().rev() {
-    running_sum = bucket.add(running_sum);
-    neg_sum += &running_sum;
+    running_sum.add_assign_bucket(&bucket);
+    neg_result.add_assign_bucket(&running_sum);
   }
 
-  pos_sum - neg_sum
+  bucket_to_curve::<C>(&pos_result) - bucket_to_curve::<C>(&neg_result)
 }
 
 #[inline(always)]
@@ -627,7 +895,7 @@ mod tests {
       .fold(A::CurveExt::identity(), |acc, (coeff, base)| {
         acc + *base * coeff
       });
-    let msm = msm(&coeffs, &bases, true);
+    let msm = msm(&coeffs, &bases);
 
     assert_eq!(naive, msm.unwrap())
   }
@@ -654,19 +922,17 @@ mod tests {
     for bit_width in [1, 4, 8, 10, 16, 20, 32, 40, 64] {
       println!("bit_width: {bit_width}");
       assert!(bit_width <= 64); // Ensure we don't overflow F::from
-      let _bound = 1u128 << bit_width;
+      let mask = if bit_width == 64 {
+        u64::MAX
+      } else {
+        (1u64 << bit_width) - 1
+      };
       let coeffs: Vec<u64> = (0..n)
-        .map(|_| {
-          if bit_width == 64 {
-            rand::random::<u64>()
-          } else {
-            rand::random::<u64>() % (1 << bit_width)
-          }
-        })
+        .map(|_| rand::random::<u64>() & mask)
         .collect::<Vec<_>>();
       let coeffs_scalar: Vec<F> = coeffs.iter().map(|b| F::from(*b)).collect::<Vec<_>>();
-      let general = msm(&coeffs_scalar, &bases, true);
-      let integer = msm_small(&coeffs, &bases, true);
+      let general = msm(&coeffs_scalar, &bases);
+      let integer = msm_small(&coeffs, &bases);
 
       assert_eq!(general.unwrap(), integer.unwrap());
     }
@@ -700,17 +966,13 @@ mod tests {
         }
       });
 
-    let result = msm_signed_small(&scalars, &bases, false).unwrap();
+    let result = msm_signed_small(&scalars, &bases).unwrap();
     assert_eq!(naive, result);
-
-    // Also test with parallelism
-    let result_par = msm_signed_small(&scalars, &bases, true).unwrap();
-    assert_eq!(naive, result_par);
 
     // Test all zeros
     let zeros = vec![0i8; n];
     assert_eq!(
-      msm_signed_small(&zeros, &bases, false).unwrap(),
+      msm_signed_small(&zeros, &bases).unwrap(),
       A::CurveExt::identity()
     );
 
@@ -719,16 +981,48 @@ mod tests {
     let naive_pos = bases
       .iter()
       .fold(A::CurveExt::identity(), |acc, base| acc + base);
-    assert_eq!(msm_signed_small(&pos, &bases, false).unwrap(), naive_pos);
+    assert_eq!(msm_signed_small(&pos, &bases).unwrap(), naive_pos);
 
     // Test all negative
     let neg = vec![-1i8; n];
-    assert_eq!(msm_signed_small(&neg, &bases, false).unwrap(), -naive_pos);
+    assert_eq!(msm_signed_small(&neg, &bases).unwrap(), -naive_pos);
   }
 
   #[test]
   fn test_msm_signed_small() {
     test_msm_signed_small_with::<pallas::Scalar, pallas::Affine>();
     test_msm_signed_small_with::<vesta::Scalar, vesta::Affine>();
+  }
+
+  /// Regression test: MSM must handle identity bases without panicking.
+  fn test_msm_identity_bases_with<F: Field, A: CurveAffine<ScalarExt = F>>() {
+    let n = 32; // Must be >16 to exercise the signed-decomposition path
+    let mut coeffs = (0..n).map(|_| F::random(OsRng)).collect::<Vec<_>>();
+    let mut bases = (0..n)
+      .map(|_| A::from(A::generator() * F::random(OsRng)))
+      .collect::<Vec<_>>();
+
+    // Replace a few bases with identity and give them non-zero scalars
+    bases[0] = A::identity();
+    bases[3] = A::identity();
+    bases[n - 1] = A::identity();
+    coeffs[0] = F::ONE;
+    coeffs[3] = F::random(OsRng);
+
+    let naive = coeffs
+      .iter()
+      .zip(bases.iter())
+      .fold(A::CurveExt::identity(), |acc, (coeff, base)| {
+        acc + *base * coeff
+      });
+    let result = msm(&coeffs, &bases);
+
+    assert_eq!(naive, result.unwrap());
+  }
+
+  #[test]
+  fn test_msm_identity_bases() {
+    test_msm_identity_bases_with::<pallas::Scalar, pallas::Affine>();
+    test_msm_identity_bases_with::<vesta::Scalar, vesta::Affine>();
   }
 }

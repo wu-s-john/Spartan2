@@ -156,7 +156,7 @@ where
         }
 
         let msm_result = if !is_small {
-          E::GE::vartime_multiscalar_mul(scalars, &ck.ck[..scalars.len()], false)?
+          E::GE::vartime_multiscalar_mul(scalars, &ck.ck[..scalars.len()])?
         } else {
           let scalars_small = scalars
             .par_iter()
@@ -169,7 +169,6 @@ where
           E::GE::vartime_multiscalar_mul_small(
             &scalars_small,
             &ck.ck[..scalars_small.len()],
-            false,
           )?
         };
         Ok(msm_result + ck.h * r.blind[i])
@@ -204,7 +203,7 @@ where
           return Ok(ck.h * r.blind[i]);
         }
 
-        let msm_result = W::msm::<E::GE>(scalars, &ck.ck[..scalars.len()], false)?;
+        let msm_result = W::msm::<E::GE>(scalars, &ck.ck[..scalars.len()])?;
         Ok(msm_result + ck.h * r.blind[i])
       })
       .collect::<Result<Vec<_>, _>>()?;
@@ -331,7 +330,7 @@ where
         .into_par_iter()
         .map(|i| L[i] * blind.blind[i])
         .reduce(|| E::Scalar::ZERO, |acc, x| acc + x);
-      let comm_LZ = E::GE::vartime_multiscalar_mul(&LZ, &ck.ck[..LZ.len()], true)? + ck.h * r_LZ;
+      let comm_LZ = E::GE::vartime_multiscalar_mul(&LZ, &ck.ck[..LZ.len()])? + ck.h * r_LZ;
 
       info!(elapsed_ms = %commit_t.elapsed().as_millis(), "hyrax_prove_commit");
 
@@ -414,7 +413,7 @@ where
         .into_par_iter()
         .map(|i| L[i] * blind.blind[i])
         .reduce(|| E::Scalar::ZERO, |acc, x| acc + x);
-      let comm_LZ = E::GE::vartime_multiscalar_mul(&LZ, &ck.ck[..LZ.len()], true)? + ck.h * r_LZ;
+      let comm_LZ = E::GE::vartime_multiscalar_mul(&LZ, &ck.ck[..LZ.len()])? + ck.h * r_LZ;
 
       info!(elapsed_ms = %commit_t.elapsed().as_millis(), "hyrax_prove_witness_commit");
 
@@ -470,7 +469,7 @@ where
       // compute a weighted sum of commitments and L
       // convert the commitments to affine form so we can do a multi-scalar multiplication
       let ck: Vec<_> = comm.comm.iter().map(|c| c.affine()).collect();
-      let comm_LZ = E::GE::vartime_multiscalar_mul(&L, &ck[..L.len()], true)?;
+      let comm_LZ = E::GE::vartime_multiscalar_mul(&L, &ck[..L.len()])?;
       info!(elapsed_ms = %lr_t.elapsed().as_millis(), "hyrax_compute_lr");
 
       (comm_LZ, R)
@@ -541,7 +540,7 @@ where
           .par_iter()
           .map(|c| c.comm[i].affine())
           .collect::<Vec<_>>();
-        E::GE::vartime_multiscalar_mul(weights, &bases, false)
+        E::GE::vartime_multiscalar_mul(weights, &bases)
       })
       .collect::<Result<Vec<_>, SpartanError>>()?;
 
