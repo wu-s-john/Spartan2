@@ -8,10 +8,12 @@
 //!
 //! Run with:
 //!   cargo run --release --example rs_shuffle_bp_full
+//!   cargo run --release --example rs_shuffle_bp_full -- --zk
 
 use bellpepper_core::{num::AllocatedNum, ConstraintSystem, SynthesisError};
+use clap::Parser;
 use ff::{Field, PrimeField};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing_subscriber::prelude::*;
 
 use spartan2::{
@@ -30,12 +32,22 @@ use spartan2::{
     permutation::{check_grand_product, IndexPositionPair, IndexedCiphertext},
   },
   spartan::SpartanSNARK,
+  spartan_zk::SpartanZkSNARK,
+  timing::{clear_timings, snapshot_timings, TimingData, TimingLayer, SPARTAN_PHASES, SPARTAN_ZK_PHASES},
   traits::{
     circuit::SpartanCircuit,
     snark::R1CSSNARKTrait,
     Engine, Group,
   },
 };
+
+#[derive(Parser)]
+#[command(name = "rs_shuffle_bp_full")]
+struct Cli {
+  /// Use ZK Spartan (zero-knowledge) instead of non-ZK
+  #[arg(long)]
+  zk: bool,
+}
 
 const N: usize = 52;
 const LEVELS: usize = 6;
@@ -331,12 +343,104 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
 }
 
 // ============================================================================
+// Generic Spartan runner (works for both SpartanSNARK and SpartanZkSNARK)
+// ============================================================================
+
+fn run_spartan<S: R1CSSNARKTrait<PallasHyraxEngine>>(
+  circuit: RSShuffleReencryptCircuit,
+  timing_data: &TimingData,
+  phases: &[(&str, &'static str)],
+  label: &str,
+  reencrypt_time: Duration,
+) {
+  // Setup
+  println!("\n--- {} Setup ---", label);
+  let setup_start = Instant::now();
+  let (pk, vk) = S::setup(circuit.clone()).expect("Setup failed");
+  let setup_time = setup_start.elapsed();
+  println!("  Setup time: {:?}", setup_time);
+
+  let sizes = S::pk_sizes(&pk);
+  println!("  Constraints (unpadded): {}", sizes[0]);
+  println!("  Constraints (padded):   {}", sizes[4]);
+  println!("  Variables (shared):     {} (unpadded: {})", sizes[5], sizes[1]);
+  println!("  Variables (precommit):  {} (unpadded: {})", sizes[6], sizes[2]);
+  println!("  Variables (rest):       {} (unpadded: {})", sizes[7], sizes[3]);
+
+  // Prep Prove
+  println!("\n--- Prep Prove ---");
+  clear_timings(timing_data);
+  let prep_start = Instant::now();
+  let prep = S::prep_prove(&pk, circuit.clone(), false).expect("Prep prove failed");
+  let prep_time = prep_start.elapsed();
+  let prep_timings = snapshot_timings(timing_data, phases);
+  println!("  Prep time: {:?}", prep_time);
+
+  // Prove
+  println!("\n--- Prove ---");
+  clear_timings(timing_data);
+  let prove_start = Instant::now();
+  let snark = S::prove(&pk, circuit, &prep, false).expect("Proof generation failed");
+  let prove_time = prove_start.elapsed();
+  let prove_timings = snapshot_timings(timing_data, phases);
+  println!("  Prove time: {:?}", prove_time);
+
+  // Verify
+  println!("\n--- Verify ---");
+  let verify_start = Instant::now();
+  let result = snark.verify(&vk);
+  let verify_time = verify_start.elapsed();
+
+  match result {
+    Ok(outputs) => {
+      println!("  Proof verified successfully!");
+      println!("  Verify time: {:?}", verify_time);
+      println!("  Public outputs: {} values", outputs.len());
+    }
+    Err(e) => {
+      println!("  Verification FAILED: {:?}", e);
+      std::process::exit(1);
+    }
+  }
+
+  // Timing Breakdown
+  println!("\n================================================================");
+  println!("           {} TIMING BREAKDOWN (N={}, LEVELS={})", label.to_uppercase(), N, LEVELS);
+  println!("================================================================");
+  println!("  SETUP (one-time):               {:>10.2?}", setup_time);
+  println!("  Constraints:                    {:>10}", sizes[0]);
+  println!("----------------------------------------------------------------");
+  println!("  PREP:                           {:>10.2?}", prep_time);
+  for (name, ms) in &prep_timings {
+    if *ms > 0 {
+      println!("    {:<32} {:>7}ms", name, ms);
+    }
+  }
+  println!("----------------------------------------------------------------");
+  println!("  PROVE:                          {:>10.2?}", prove_time);
+  for (name, ms) in &prove_timings {
+    if *ms > 0 {
+      println!("    {:<32} {:>7}ms", name, ms);
+    }
+  }
+  println!("----------------------------------------------------------------");
+  println!("  VERIFY:                         {:>10.2?}", verify_time);
+  println!("----------------------------------------------------------------");
+  println!("  TOTAL PROVE (prep+prove):       {:>10.2?}", prep_time + prove_time);
+  println!("  Native re-encrypt (parallel):   {:>10.2?}", reencrypt_time);
+  println!("================================================================");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 fn main() {
+  let cli = Cli::parse();
+  let mode_label = if cli.zk { "ZK Spartan" } else { "Spartan" };
+
   println!("================================================================");
-  println!("  RS Shuffle + Re-encryption (Bellpepper/Spartan)");
+  println!("  RS Shuffle + Re-encryption (Bellpepper/{})", mode_label);
   println!("  N = {} cards, LEVELS = {}", N, LEVELS);
   println!("  Curve: Pallas/Vesta cycle");
   println!("================================================================\n");
@@ -425,99 +529,16 @@ fn main() {
   // =========================================================================
   // Setup tracing for phase-level timing
   // =========================================================================
-  use spartan2::timing::{clear_timings, snapshot_timings, TimingLayer, SPARTAN_PHASES};
-
   let (timing_layer, timing_data, _constraints) = TimingLayer::new();
   let subscriber = tracing_subscriber::registry().with(timing_layer);
   let _guard = tracing::subscriber::set_default(subscriber);
 
   // =========================================================================
-  // Step 4: Spartan Setup
+  // Step 4: Run Spartan (ZK or non-ZK)
   // =========================================================================
-  println!("\n--- Spartan Setup ---");
-  let setup_start = Instant::now();
-  let (pk, vk) =
-    SpartanSNARK::<PallasHyraxEngine>::setup(circuit.clone()).expect("Setup failed");
-  let setup_time = setup_start.elapsed();
-  println!("  Setup time: {:?}", setup_time);
-
-  let sizes = pk.sizes();
-  println!("  Constraints (unpadded): {}", sizes[0]);
-  println!("  Constraints (padded):   {}", sizes[4]);
-  println!("  Variables (shared):     {} (unpadded: {})", sizes[5], sizes[1]);
-  println!("  Variables (precommit):  {} (unpadded: {})", sizes[6], sizes[2]);
-  println!("  Variables (rest):       {} (unpadded: {})", sizes[7], sizes[3]);
-
-  // =========================================================================
-  // Step 5: Prep Prove
-  // =========================================================================
-  println!("\n--- Prep Prove ---");
-  clear_timings(&timing_data);
-  let prep_start = Instant::now();
-  let prep = SpartanSNARK::<PallasHyraxEngine>::prep_prove(&pk, circuit.clone(), false)
-    .expect("Prep prove failed");
-  let prep_time = prep_start.elapsed();
-  let prep_timings = snapshot_timings(&timing_data, SPARTAN_PHASES);
-  println!("  Prep time: {:?}", prep_time);
-
-  // =========================================================================
-  // Step 6: Prove
-  // =========================================================================
-  println!("\n--- Prove ---");
-  clear_timings(&timing_data);
-  let prove_start = Instant::now();
-  let snark = SpartanSNARK::<PallasHyraxEngine>::prove(&pk, circuit, &prep, false)
-    .expect("Proof generation failed");
-  let prove_time = prove_start.elapsed();
-  let prove_timings = snapshot_timings(&timing_data, SPARTAN_PHASES);
-  println!("  Prove time: {:?}", prove_time);
-
-  // =========================================================================
-  // Step 7: Verify
-  // =========================================================================
-  println!("\n--- Verify ---");
-  let verify_start = Instant::now();
-  let result = snark.verify(&vk);
-  let verify_time = verify_start.elapsed();
-
-  match result {
-    Ok(outputs) => {
-      println!("  Proof verified successfully!");
-      println!("  Verify time: {:?}", verify_time);
-      println!("  Public outputs: {} values", outputs.len());
-    }
-    Err(e) => {
-      println!("  Verification FAILED: {:?}", e);
-      std::process::exit(1);
-    }
+  if cli.zk {
+    run_spartan::<SpartanZkSNARK<PallasHyraxEngine>>(circuit, &timing_data, SPARTAN_ZK_PHASES, "ZK Spartan", reencrypt_time);
+  } else {
+    run_spartan::<SpartanSNARK<PallasHyraxEngine>>(circuit, &timing_data, SPARTAN_PHASES, "Spartan", reencrypt_time);
   }
-
-  // =========================================================================
-  // Timing Breakdown
-  // =========================================================================
-  println!("\n================================================================");
-  println!("           TIMING BREAKDOWN (N={}, LEVELS={})", N, LEVELS);
-  println!("================================================================");
-  println!("  SETUP (one-time):               {:>10.2?}", setup_time);
-  println!("  Constraints:                    {:>10}", sizes[0]);
-  println!("----------------------------------------------------------------");
-  println!("  PREP:                           {:>10.2?}", prep_time);
-  for (name, ms) in &prep_timings {
-    if *ms > 0 {
-      println!("    {:<32} {:>7}ms", name, ms);
-    }
-  }
-  println!("----------------------------------------------------------------");
-  println!("  PROVE:                          {:>10.2?}", prove_time);
-  for (name, ms) in &prove_timings {
-    if *ms > 0 {
-      println!("    {:<32} {:>7}ms", name, ms);
-    }
-  }
-  println!("----------------------------------------------------------------");
-  println!("  VERIFY:                         {:>10.2?}", verify_time);
-  println!("----------------------------------------------------------------");
-  println!("  TOTAL PROVE (prep+prove):       {:>10.2?}", prep_time + prove_time);
-  println!("  Native re-encrypt (parallel):   {:>10.2?}", reencrypt_time);
-  println!("================================================================");
 }

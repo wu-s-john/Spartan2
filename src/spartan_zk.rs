@@ -423,6 +423,10 @@ where
     })
   }
 
+  fn pk_sizes(pk: &Self::ProverKey) -> [usize; 10] {
+    pk.sizes()
+  }
+
   /// verifies a proof of satisfiability of a `RelaxedR1CS` instance
   fn verify(&self, vk: &Self::VerifierKey) -> Result<Vec<E::Scalar>, SpartanError> {
     // Verify by checking the multi-round verifier instance via NIFS folding
