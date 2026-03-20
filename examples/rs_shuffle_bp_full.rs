@@ -10,7 +10,7 @@
 //!   cargo run --release --example rs_shuffle_bp_full
 
 use bellpepper_core::{num::AllocatedNum, ConstraintSystem, SynthesisError};
-use ff::{Field, PrimeField};
+use ff::Field;
 use std::time::Instant;
 use tracing_subscriber::prelude::*;
 
@@ -22,10 +22,7 @@ use spartan2::{
       ElGamalCiphertext, ElGamalCiphertextVar, PermutationWitnessTrace,
       PermutationWitnessTraceVar,
     },
-    encryption::{
-      native_reencrypt_parallel, precompute_fixed_base_powers, reencrypt_deck_bp,
-      NativeReencryptionData,
-    },
+    encryption::{native_reencrypt_parallel, reencrypt_deck_bp, NativeReencryptionData},
     native::run_rs_shuffle_permutation,
     permutation::{check_grand_product, IndexPositionPair, IndexedCiphertext},
   },
@@ -85,8 +82,6 @@ struct RSShuffleReencryptCircuit {
   /// Pre-computed native re-encryption data (for future parallel witness path)
   _native_reencrypt_data: NativeReencryptionData<ECEngine, N>,
 
-  /// Precomputed generator power table: gen_powers[i] = 2^i · G (compile-time constants)
-  gen_powers: Vec<(Scalar, Scalar)>,
 }
 
 impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
@@ -227,7 +222,6 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       &pk_var,
       &self._native_reencrypt_data,
       &gen_var,
-      &self.gen_powers,
     )?;
 
     // =========================================================================
@@ -387,11 +381,6 @@ fn main() {
   // =========================================================================
   println!("\n--- Circuit Construction ---");
 
-  // Precompute generator power table (compile-time constants for fixed-base scalar mul)
-  let (curve_a, _, _, _) = <ECEngine as Engine>::GE::group_params();
-  let num_bits = Scalar::NUM_BITS as usize;
-  let gen_powers = precompute_fixed_base_powers(gen_coords, curve_a, num_bits);
-
   let circuit = RSShuffleReencryptCircuit {
     witness_trace: trace.witness_trace.clone(),
     input_ciphertexts: input_ct_arr.clone(),
@@ -400,7 +389,6 @@ fn main() {
     pk_coords,
     gen_coords,
     _native_reencrypt_data: native_data,
-    gen_powers,
   };
 
   // =========================================================================
