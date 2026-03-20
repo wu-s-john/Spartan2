@@ -47,6 +47,43 @@ impl<Scalar: PrimeField> UniPoly<Scalar> {
   /// # Errors
   /// Returns `SpartanError` if the Gaussian elimination fails due to singular matrix
   /// or invalid input dimensions.
+  /// Degree-2 polynomial from p(0), leading coefficient, and claim = p(0)+p(1).
+  ///
+  /// p(X) = aX² + bX + c where c = p0, a = leading, b = claim - 2·p0 - leading.
+  pub fn from_evals_deg2(p0: Scalar, leading: Scalar, claim: Scalar) -> Self {
+    let c = p0;
+    let a = leading;
+    let b = claim - c - c - a;
+    Self {
+      coeffs: vec![c, b, a],
+    }
+  }
+
+  /// Degree-3 polynomial from p(0), leading coefficient, p(-1), and claim = p(0)+p(1).
+  ///
+  /// p(X) = aX³ + bX² + cX + d where d = p0, a = leading.
+  /// b = (claim + p_neg1 - 3·p0) / 2
+  /// c = (claim - 2·leading - p0 - p_neg1) / 2
+  pub fn from_evals_deg3(p0: Scalar, leading: Scalar, p_neg1: Scalar, claim: Scalar) -> Self {
+    let two_inv = Scalar::TWO_INV;
+    let d = p0;
+    let a = leading;
+    let b = (claim + p_neg1 - d - d - d) * two_inv;
+    let c = (claim - a - a - d - p_neg1) * two_inv;
+    Self {
+      coeffs: vec![d, c, b, a],
+    }
+  }
+
+  /// Creates a `UniPoly` from its evaluations.
+  ///
+  /// Given evaluation points at consecutive integers starting from 0,
+  /// this function interpolates the unique polynomial of degree `n-1`
+  /// using Gaussian elimination.
+  ///
+  /// # Errors
+  /// Returns `SpartanError` if the Gaussian elimination fails due to singular matrix
+  /// or invalid input dimensions.
   pub fn from_evals(evals: &[Scalar]) -> Result<Self, SpartanError> {
     let n = evals.len();
     let xs: Vec<Scalar> = (0..n).map(|x| Scalar::from(x as u64)).collect();
@@ -346,5 +383,43 @@ mod tests {
   #[test]
   fn test_from_evals_quartic() {
     test_from_evals_quartic_with::<pallas::Scalar>();
+  }
+
+  fn test_bddt_deg2_with<F: PrimeField>() {
+    // polynomial is 2x^2 + 3x + 1
+    let e0 = F::ONE;
+    let e1 = F::from(6);
+    let e2 = F::from(15);
+    let evals = vec![e0, e1, e2];
+    let poly_evals = UniPoly::from_evals(&evals).unwrap();
+
+    // BDDT: p0 = e0, leading = 2, claim = e0 + e1
+    let poly_bddt = UniPoly::from_evals_deg2(e0, F::from(2), e0 + e1);
+
+    assert_eq!(poly_evals.coeffs, poly_bddt.coeffs);
+  }
+
+  #[test]
+  fn test_bddt_deg2() {
+    test_bddt_deg2_with::<pallas::Scalar>();
+  }
+
+  fn test_bddt_deg3_with<F: PrimeField>() {
+    // polynomial is x^3 + 2x^2 + 3x + 1
+    let e0 = F::ONE;
+    let e1 = F::from(7);
+    let evals = vec![e0, e1, F::from(23), F::from(55)];
+    let poly_evals = UniPoly::from_evals(&evals).unwrap();
+
+    // p(-1) = -1 + 2 - 3 + 1 = -1
+    let p_neg1 = -F::ONE;
+    let poly_bddt = UniPoly::from_evals_deg3(e0, F::ONE, p_neg1, e0 + e1);
+
+    assert_eq!(poly_evals.coeffs, poly_bddt.coeffs);
+  }
+
+  #[test]
+  fn test_bddt_deg3() {
+    test_bddt_deg3_with::<pallas::Scalar>();
   }
 }

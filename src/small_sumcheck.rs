@@ -329,19 +329,13 @@ where
 
     let poly = {
       let (_eval_span, eval_t) = start_span!("compute_eval_points");
-      let (eval_point_0, eval_point_2, eval_point_3) = eq_instance
+      let (p0, leading, p_neg1) = eq_instance
         .evaluation_points_cubic_with_three_inputs_delayed(round, &poly_A, &poly_B, &poly_C);
       if eval_t.elapsed().as_millis() > 0 {
         info!(elapsed_ms = %eval_t.elapsed().as_millis(), "compute_eval_points");
       }
 
-      let evals = [
-        eval_point_0,
-        claim_per_round - eval_point_0,
-        eval_point_2,
-        eval_point_3,
-      ];
-      UniPoly::from_evals(&evals)?
+      UniPoly::from_evals_deg3(p0, leading, p_neg1, claim_per_round)
     };
 
     // Transcript interaction
@@ -368,10 +362,11 @@ where
   ))
 }
 
-/// Compute eval points for the quadratic sumcheck `poly_A × z` when z is a witness type.
+/// Compute BDDT eval points for the quadratic sumcheck `poly_A × z` when z is a witness type.
 ///
-/// For witness z, uses `DelayedReduction<W>` for eval_0 (field × witness accumulation)
-/// and field arithmetic for eval_2.
+/// Returns (p0, leading_coeff) where:
+/// - p0 uses `DelayedReduction<W>` (field × witness accumulation)
+/// - leading uses `W::leading_contribution` for efficient witness arithmetic
 fn compute_eval_points_quad_witness_z<E: Engine, W: WitnessValue>(
   poly_A: &MultilinearPolynomial<E::Scalar>,
   z: &[W],
@@ -384,7 +379,7 @@ where
 
   type Acc<F2, W2> = <F2 as DelayedReduction<W2>>::Accumulator;
 
-  let (acc_0, acc_2) = (0..len)
+  let (acc_0, acc_leading) = (0..len)
     .into_par_iter()
     .fold(
       || (Acc::<E::Scalar, W>::default(), E::Scalar::ZERO),
@@ -394,16 +389,16 @@ where
         let a_high = poly_A[len + i];
         let z_hi = z[len + i];
 
-        // eval 0: field × witness accumulation
+        // p(0): field × witness accumulation
         <E::Scalar as DelayedReduction<W>>::unreduced_multiply_accumulate(
           &mut acc.0,
           &a_low,
           &z_lo,
         );
 
-        // eval 2: a_bound × z_bound where z_bound = 2·z_hi - z_lo
-        let a_bound = a_high + a_high - a_low;
-        acc.1 += W::eval_2_contribution(z_hi, z_lo, a_bound);
+        // leading coeff: (a_high - a_low) × (z_hi - z_lo)
+        let da = a_high - a_low;
+        acc.1 += W::leading_contribution(z_hi, z_lo, da);
 
         acc
       },
@@ -417,7 +412,7 @@ where
       },
     );
 
-  (<E::Scalar as DelayedReduction<W>>::reduce(&acc_0), acc_2)
+  (<E::Scalar as DelayedReduction<W>>::reduce(&acc_0), acc_leading)
 }
 
 /// Bind a witness z polynomial with challenge r, producing field elements.
@@ -460,11 +455,10 @@ where
   let mut claim_per_round = *claim;
 
   // === Round 0: witness z fast path ===
-  let (eval_point_0, eval_point_2) =
+  let (p0, leading) =
     compute_eval_points_quad_witness_z::<E, W>(poly_A, z);
 
-  let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
-  let poly = UniPoly::from_evals(&evals)?;
+  let poly = UniPoly::from_evals_deg2(p0, leading, claim_per_round);
 
   transcript.absorb(b"p", &poly);
   let r_0 = transcript.squeeze(b"c")?;
@@ -482,11 +476,10 @@ where
     let (_round_span, round_t) = start_span!("sumcheck_quad_round", round = round);
 
     let poly = {
-      let (eval_point_0, eval_point_2) =
+      let (p0, leading) =
         SumcheckProof::<E>::compute_eval_points_quad(poly_A, &poly_B);
 
-      let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
-      UniPoly::from_evals(&evals)?
+      UniPoly::from_evals_deg2(p0, leading, claim_per_round)
     };
 
     transcript.absorb(b"p", &poly);
@@ -633,19 +626,8 @@ where
     let t_inf = t_all.at_infinity();
     let t0 = t_all.at_zero();
 
-    // t(1) = claim - t(0) (since s(0) + s(1) = claim and s = t, no eq factor)
-    let t1 = claim_per_round - t0;
-
-    // Build degree-2 polynomial from evaluations at 0, 1, 2
-    // t(X) = aX² + bX + c where a = t(∞), c = t(0), b = t(1) - a - c
-    let a = t_inf;
-    let c = t0;
-    let b = t1 - a - c;
-    // eval at 2: 4a + 2b + c
-    let eval_2 = a.double().double() + b.double() + c;
-
-    let evals = vec![t0, t1, eval_2];
-    let poly = UniPoly::from_evals(&evals)?;
+    // Build degree-2 polynomial directly: p0 = t0, leading = t_inf
+    let poly = UniPoly::from_evals_deg2(t0, t_inf, claim_per_round);
 
     // Transcript interaction
     transcript.absorb(b"p", &poly);
@@ -675,10 +657,9 @@ where
     let (_round_span, round_t) = start_span!("inner_quad_round", round = round);
 
     let poly = {
-      let (eval_point_0, eval_point_2) =
+      let (p0, leading) =
         SumcheckProof::<E>::compute_eval_points_quad(&poly_M_bound, &poly_z_bound);
-      let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
-      UniPoly::from_evals(&evals)?
+      UniPoly::from_evals_deg2(p0, leading, claim_per_round)
     };
 
     transcript.absorb(b"p", &poly);
@@ -780,10 +761,12 @@ mod tests {
     let mut poly_C = cz.clone();
 
     for (round, &tau_round) in taus.iter().enumerate().take(SMALL_VALUE_ROUNDS) {
-      // Get expected evaluations from standard method
-      let (expected_eval_0, expected_eval_2, expected_eval_3) =
+      // Get expected evaluations from standard method (returns p0, leading, p_neg1)
+      let (expected_p0, expected_leading, expected_neg1) =
         eq_instance.evaluation_points_cubic_with_three_inputs(round, &poly_A, &poly_B, &poly_C);
-      let expected_eval_1 = claim - expected_eval_0; // s(0) + s(1) = claim
+
+      // Build the reference polynomial from BDDT values
+      let expected_poly = UniPoly::from_evals_deg3(expected_p0, expected_leading, expected_neg1, claim);
 
       // Build small-value polynomial
       let li = small_value.eq_round_values(tau_round);
@@ -795,29 +778,10 @@ mod tests {
 
       let poly = build_univariate_round_polynomial(&li, t0, t1, t_inf);
 
-      // Check all 4 evaluation points
+      // Check all coefficients match
       assert_eq!(
-        poly.evaluate(&F::ZERO),
-        expected_eval_0,
-        "s(0) mismatch at round {}",
-        round
-      );
-      assert_eq!(
-        poly.evaluate(&F::ONE),
-        expected_eval_1,
-        "s(1) mismatch at round {}",
-        round
-      );
-      assert_eq!(
-        poly.evaluate(&F::from(2u64)),
-        expected_eval_2,
-        "s(2) mismatch at round {}",
-        round
-      );
-      assert_eq!(
-        poly.evaluate(&F::from(3u64)),
-        expected_eval_3,
-        "s(3) mismatch at round {}",
+        poly.coeffs, expected_poly.coeffs,
+        "polynomial coefficients mismatch at round {}",
         round
       );
 

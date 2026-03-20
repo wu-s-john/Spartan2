@@ -47,6 +47,15 @@ pub trait WitnessValue: Copy + Default + PartialEq + Send + Sync + 'static {
     a_bound * z_bound
   }
 
+  /// Compute `da * (hi - lo)` for the BDDT leading coefficient.
+  ///
+  /// Default: converts to field. Override for binary/small types to avoid field muls.
+  #[inline(always)]
+  fn leading_contribution<F: PrimeField>(hi: Self, lo: Self, da: F) -> F {
+    let dz = hi.to_field::<F>() - lo.to_field::<F>();
+    da * dz
+  }
+
   /// Compute the bind contribution: `lo * (1 - r) + hi * r`.
   ///
   /// Default: converts to field and multiplies. Override for binary types to use
@@ -87,6 +96,18 @@ impl WitnessValue for bool {
       (false, true)  => -a_bound,  // z_bound = -1
       (true,  false) => a_bound + a_bound, // z_bound = 2
       (true,  true)  => a_bound,   // z_bound = 1
+    }
+  }
+
+  /// Fast path: `da * (hi - lo)` for bool ∈ {0,1} has only 4 cases,
+  /// all computable with conditional adds — zero field multiplies.
+  #[inline(always)]
+  fn leading_contribution<F: PrimeField>(hi: bool, lo: bool, da: F) -> F {
+    match (hi, lo) {
+      (false, false) => F::ZERO,  // dz = 0
+      (false, true)  => -da,      // dz = -1
+      (true,  false) => da,       // dz = 1
+      (true,  true)  => F::ZERO,  // dz = 0
     }
   }
 
