@@ -20,7 +20,7 @@ use ff::PrimeField;
 /// extending {0,1}^l0 to {∞,0,1}^l0 produces values growing by 3× per round;
 /// i16 safely handles l0 ≤ 9, i.e., 3^9 = 19683 ≤ i16::MAX = 32767). For i8
 /// witnesses, the extension type is `i8`.
-pub trait WitnessValue: Copy + Send + Sync + 'static {
+pub trait WitnessValue: Copy + Default + PartialEq + Send + Sync + 'static {
   /// The extended type after Lagrange interpolation.
   type Extended: Copy + Default + Send + Sync
     + std::ops::Add<Output = Self::Extended>

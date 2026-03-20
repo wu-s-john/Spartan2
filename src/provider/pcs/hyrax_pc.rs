@@ -150,6 +150,11 @@ where
           &v[lower..upper]
         };
 
+        // Padding row: all scalars are zero → skip MSM entirely
+        if scalars.iter().all(|s| *s == E::Scalar::ZERO) {
+          return Ok(ck.h * r.blind[i]);
+        }
+
         let msm_result = if !is_small {
           E::GE::vartime_multiscalar_mul(scalars, &ck.ck[..scalars.len()], false)?
         } else {
@@ -193,6 +198,11 @@ where
         } else {
           &v[lower..upper]
         };
+
+        // Padding row: all scalars are zero → skip MSM entirely
+        if scalars.iter().all(|s| *s == W::default()) {
+          return Ok(ck.h * r.blind[i]);
+        }
 
         let msm_result = W::msm::<E::GE>(scalars, &ck.ck[..scalars.len()], false)?;
         Ok(msm_result + ck.h * r.blind[i])
