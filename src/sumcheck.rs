@@ -683,16 +683,19 @@ impl<E: Engine> SumcheckProof<E> {
     vc_shape: &SplitMultiRoundR1CSShape<E>,
     vc_ck: &CommitmentKey<E>,
     transcript: &mut E::TE,
-  ) -> Result<Vec<E::Scalar>, SpartanError> {
+  ) -> Result<Vec<E::Scalar>, SpartanError>
+  where
+    E::Scalar: DelayedReduction<E::Scalar>,
+  {
     let mut r_x: Vec<E::Scalar> = Vec::with_capacity(num_rounds);
     let mut claim_outer_round = E::Scalar::ZERO;
     let mut eq_instance = eq_sumcheck::EqSumCheckInstance::<E>::new(taus.to_vec());
 
     for i in 0..num_rounds {
-      // -------- interpolate coefficients --------
+      // -------- interpolate coefficients (delayed reduction) --------
 
       let (p0, leading, p_neg1) =
-        eq_instance.evaluation_points_cubic_with_three_inputs(i, poly_Az, poly_Bz, poly_Cz);
+        eq_instance.evaluation_points_cubic_with_three_inputs_delayed(i, poly_Az, poly_Bz, poly_Cz);
       let poly = UniPoly::from_evals_deg3(p0, leading, p_neg1, claim_outer_round);
       verifier_circuit.outer_polys[i] = [
         poly.coeffs[0],
@@ -715,15 +718,8 @@ impl<E: Engine> SumcheckProof<E> {
       // -------- advance claim and bind polys --------
       claim_outer_round = poly.evaluate(&chals[0]);
 
-      rayon::join(
-        || poly_Az.bind_poly_var_top(&chals[0]),
-        || {
-          rayon::join(
-            || poly_Bz.bind_poly_var_top(&chals[0]),
-            || poly_Cz.bind_poly_var_top(&chals[0]),
-          );
-        },
-      );
+      // Fused 3-poly binding: single Rayon dispatch instead of nested joins
+      bind_three_polys_top(poly_Az, poly_Bz, poly_Cz, &chals[0]);
       eq_instance.bound(&chals[0]);
     }
 
