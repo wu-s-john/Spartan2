@@ -272,13 +272,144 @@ fn repr_low_u64<F: PrimeField>(s: &F) -> u64 {
 // Main MSM with signed decomposition + bit-width partitioning
 // ==================================================================================
 
-/// Serial windowed Pippenger MSM with XYZZ bucket coordinates.
-///
-/// Uses Booth encoding (signed digits) with XYZZ buckets for ~42% fewer field ops
-/// per bucket addition compared to standard projective. Designed to run without
-/// spawning rayon tasks, making it ideal when the caller already parallelizes.
-fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+// ==================================================================================
+// Batch affine bucket accumulation
+// ==================================================================================
 
+/// Batch size for Montgomery batch inversion in bucket accumulation.
+const BATCH_AFFINE_SIZE: usize = 64;
+
+/// Affine bucket for batch affine MSM. Stores None (empty) or an affine point.
+#[derive(Clone, Copy)]
+enum AffineBucket<F: Field> {
+  Empty,
+  Point { x: F, y: F },
+}
+
+impl<F: Field> AffineBucket<F> {
+  #[inline]
+  fn is_empty(&self) -> bool {
+    matches!(self, AffineBucket::Empty)
+  }
+}
+
+/// A scheduled point addition for batch processing.
+#[derive(Clone, Copy)]
+struct ScheduledAdd {
+  base_idx: usize,
+  bucket_idx: usize,
+  negate: bool,
+}
+
+/// Process a batch of scheduled affine additions using Montgomery's trick.
+/// Each addition computes: bucket += point (or bucket -= point if negate).
+/// Uses a single batch inversion for all additions in the batch.
+/// Cost: ~4M per addition (amortized) vs 7M+2S for XYZZ mixed addition.
+fn batch_affine_add<C: CurveAffine>(
+  buckets: &mut [AffineBucket<C::Base>],
+  schedule: &[ScheduledAdd],
+  count: usize,
+  pts_x: &[C::Base],
+  pts_y: &[C::Base],
+) {
+  if count == 0 {
+    return;
+  }
+
+  // Phase 1: compute all denominators and accumulate for batch inversion
+  let mut denoms = [C::Base::ZERO; BATCH_AFFINE_SIZE];
+  let mut lambdas = [C::Base::ZERO; BATCH_AFFINE_SIZE];
+  let mut acc = C::Base::ONE;
+
+  for i in 0..count {
+    let s = &schedule[i];
+    let bkt = &buckets[s.bucket_idx];
+
+    match bkt {
+      AffineBucket::Empty => {
+        // Will be handled in phase 2 directly
+        denoms[i] = C::Base::ONE; // placeholder
+      }
+      AffineBucket::Point { x: bx, y: by } => {
+        let py = if s.negate { -pts_y[s.base_idx] } else { pts_y[s.base_idx] };
+        let px = pts_x[s.base_idx];
+
+        if *bx == px {
+          if *by == py {
+            // Doubling case: denominator = 2*y
+            let denom = by.double();
+            denoms[i] = denom;
+            lambdas[i] = acc * (px.square().double() + px.square()); // 3x^2 (for a=0 curves)
+            acc *= denom;
+          } else {
+            // Point at infinity case (P + (-P))
+            denoms[i] = C::Base::ONE; // placeholder
+          }
+        } else {
+          // Regular addition: denominator = x2 - x1
+          let denom = px - *bx;
+          denoms[i] = denom;
+          lambdas[i] = acc * (py - *by);
+          acc *= denom;
+        }
+      }
+    }
+  }
+
+  // Phase 2: batch inversion using Montgomery's trick
+  let acc_inv = acc.invert().unwrap_or(C::Base::ONE);
+  let mut running_inv = acc_inv;
+
+  // Process in reverse to recover individual inverses
+  for i in (0..count).rev() {
+    let s = &schedule[i];
+    let bkt = &buckets[s.bucket_idx];
+
+    match bkt {
+      AffineBucket::Empty => {
+        // Direct assignment
+        let py = if s.negate { -pts_y[s.base_idx] } else { pts_y[s.base_idx] };
+        buckets[s.bucket_idx] = AffineBucket::Point {
+          x: pts_x[s.base_idx],
+          y: py,
+        };
+      }
+      AffineBucket::Point { x: bx, y: by } => {
+        let py = if s.negate { -pts_y[s.base_idx] } else { pts_y[s.base_idx] };
+        let px = pts_x[s.base_idx];
+
+        if *bx == px && *by != py {
+          // P + (-P) = O
+          buckets[s.bucket_idx] = AffineBucket::Empty;
+          // Don't update running_inv since denom was placeholder
+        } else if *bx == px && *by == py {
+          // Doubling
+          let lambda = lambdas[i] * running_inv;
+          running_inv *= denoms[i];
+
+          let x3 = lambda.square() - bx.double();
+          let y3 = lambda * (*bx - x3) - *by;
+          buckets[s.bucket_idx] = AffineBucket::Point { x: x3, y: y3 };
+        } else {
+          // Regular addition
+          let lambda = lambdas[i] * running_inv;
+          running_inv *= denoms[i];
+
+          let x3 = lambda.square() - *bx - px;
+          let y3 = lambda * (*bx - x3) - *by;
+          buckets[s.bucket_idx] = AffineBucket::Point { x: x3, y: y3 };
+        }
+      }
+    }
+  }
+}
+
+/// Serial windowed Pippenger MSM with batch affine bucket accumulation.
+///
+/// Uses Booth encoding (signed digits) with batch affine additions using
+/// Montgomery's trick. Each bucket addition costs ~4M (amortized) instead of
+/// 7M+2S for XYZZ mixed addition. Designed to run without spawning rayon tasks.
+fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
   let curve_a = compute_curve_a::<C>();
   let c = if bases.len() < 4 {
     1
@@ -382,46 +513,99 @@ fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve
 
   let non_boolean_sum = {
     let num_buckets = half;
-    // Allocate buckets once, reuse across windows
-    let mut buckets: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); num_buckets];
-    // Keep accumulator in XYZZ to avoid per-window inversions
+    // Batch affine buckets — use affine coordinates with Montgomery batch inversion
+    let mut buckets: Vec<AffineBucket<C::Base>> =
+      vec![AffineBucket::Empty; num_buckets];
+    let mut schedule = [ScheduledAdd {
+      base_idx: 0,
+      bucket_idx: 0,
+      negate: false,
+    }; BATCH_AFFINE_SIZE];
+    // Fallback XYZZ buckets for collisions within a batch
+    let mut xyzz_fallback: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); num_buckets];
+
+    // Keep accumulator in XYZZ for window summation
     let mut acc: BucketXYZZ<C::Base> = BucketXYZZ::zero();
 
     for segment in (0..num_windows).rev() {
       // Double acc c times (window shift)
       (0..c).for_each(|_| acc.double_in_place(curve_a));
 
-      // Reset buckets (faster than re-allocating)
+      // Reset buckets
       for b in buckets.iter_mut() {
+        *b = AffineBucket::Empty;
+      }
+      for b in xyzz_fallback.iter_mut() {
         *b = BucketXYZZ::zero();
       }
+      let mut sched_count: usize = 0;
+
+      // Track which bucket indices are in the current schedule
+      // to detect collisions (two points going to the same bucket in one batch)
+      let mut in_schedule = vec![false; num_buckets];
 
       let digit_base = segment * n_scalars;
       for i in 0..n_scalars {
         let d = signed_digits[digit_base + i];
-        if d > 0 {
+        if d == 0 {
+          continue;
+        }
+        let (bucket_idx, negate) = if d > 0 {
+          ((d as usize) - 1, false)
+        } else {
+          ((-d as usize) - 1, true)
+        };
+
+        // Check if this bucket is already in the current schedule
+        if in_schedule[bucket_idx] {
+          // Collision: fall back to XYZZ for this addition
+          let py = if negate { -pts_y[i] } else { pts_y[i] };
           bucket_add_affine_xy::<C>(
-            &mut buckets[(d as usize) - 1],
+            &mut xyzz_fallback[bucket_idx],
             pts_x[i],
-            pts_y[i],
+            py,
             curve_a,
           );
-        } else if d < 0 {
-          // Negate the y-coordinate for subtraction
-          bucket_add_affine_xy::<C>(
-            &mut buckets[(-d as usize) - 1],
-            pts_x[i],
-            -pts_y[i],
-            curve_a,
-          );
+        } else if buckets[bucket_idx].is_empty() {
+          // Empty bucket: direct assign (free, no field ops)
+          let py = if negate { -pts_y[i] } else { pts_y[i] };
+          buckets[bucket_idx] = AffineBucket::Point { x: pts_x[i], y: py };
+        } else {
+          // Schedule for batch affine addition
+          schedule[sched_count] = ScheduledAdd {
+            base_idx: i,
+            bucket_idx,
+            negate,
+          };
+          in_schedule[bucket_idx] = true;
+          sched_count += 1;
+
+          if sched_count == BATCH_AFFINE_SIZE {
+            batch_affine_add::<C>(&mut buckets, &schedule, sched_count, &pts_x, &pts_y);
+            sched_count = 0;
+            in_schedule.iter_mut().for_each(|v| *v = false);
+          }
         }
       }
 
-      // Summation by parts: stay in XYZZ throughout
+      // Flush remaining scheduled additions
+      if sched_count > 0 {
+        batch_affine_add::<C>(&mut buckets, &schedule, sched_count, &pts_x, &pts_y);
+      }
+
+      // Summation by parts: convert affine buckets to XYZZ, merge with fallback
       let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
       let mut window_acc: BucketXYZZ<C::Base> = BucketXYZZ::zero();
-      for b in buckets.iter().rev() {
-        running_sum.add_assign_bucket(b, curve_a);
+      for idx in (0..num_buckets).rev() {
+        // Merge affine bucket into XYZZ
+        match buckets[idx] {
+          AffineBucket::Point { x, y } => {
+            bucket_add_affine_xy::<C>(&mut running_sum, x, y, curve_a);
+          }
+          AffineBucket::Empty => {}
+        }
+        // Merge XYZZ fallback
+        running_sum.add_assign_bucket(&xyzz_fallback[idx], curve_a);
         window_acc.add_assign_bucket(&running_sum, curve_a);
       }
       acc.add_assign_bucket(&window_acc, curve_a);
