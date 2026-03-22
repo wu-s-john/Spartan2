@@ -192,7 +192,12 @@ fn bucket_add_affine<C: CurveAffine>(bucket: &mut BucketXYZZ<C::Base>, p: &C, cu
 /// Avoids CurveAffine::coordinates() overhead since caller pre-extracts them.
 /// Cost: 7M + 2S
 #[inline]
-fn bucket_add_affine_xy<C: CurveAffine>(bucket: &mut BucketXYZZ<C::Base>, px: C::Base, py: C::Base, curve_a: C::Base) {
+fn bucket_add_affine_xy<C: CurveAffine>(
+  bucket: &mut BucketXYZZ<C::Base>,
+  px: C::Base,
+  py: C::Base,
+  curve_a: C::Base,
+) {
   if bucket.is_zero() {
     bucket.x = px;
     bucket.y = py;
@@ -268,6 +273,300 @@ fn repr_low_u64<F: PrimeField>(s: &F) -> u64 {
   u64::from_le_bytes(buf)
 }
 
+#[inline(always)]
+fn serial_window_size(num_bases: usize) -> usize {
+  if num_bases < 4 {
+    1
+  } else if num_bases < 32 {
+    3
+  } else {
+    let c_base = (f64::from(num_bases as u32)).ln().ceil() as usize;
+    let cost = |c: usize| ((256 + c - 1) / c) * (num_bases + (1 << (c - 1)));
+    if cost(c_base + 1) < cost(c_base) {
+      c_base + 1
+    } else {
+      c_base
+    }
+  }
+}
+
+#[inline(always)]
+fn serial_get_at<F: PrimeField>(segment: usize, c: usize, bytes: &F::Repr) -> usize {
+  let skip_bits = segment * c;
+  let skip_bytes = skip_bits / 8;
+
+  if skip_bytes >= 32 {
+    return 0;
+  }
+
+  let mut v = [0; 8];
+  for (v, o) in v.iter_mut().zip(bytes.as_ref()[skip_bytes..].iter()) {
+    *v = *o;
+  }
+
+  let mut tmp = u64::from_le_bytes(v);
+  tmp >>= skip_bits - (skip_bytes * 8);
+  tmp %= 1 << c;
+
+  tmp as usize
+}
+
+struct SerialMsmPrepared<C: CurveAffine> {
+  boolean_sum: C::Curve,
+  reprs: Vec<<C::Scalar as PrimeField>::Repr>,
+  pts_x: Vec<C::Base>,
+  pts_y: Vec<C::Base>,
+  max_num_bits: usize,
+}
+
+struct SharedAffineCoords<C: CurveAffine> {
+  curve_a: C::Base,
+  pts_x: Vec<C::Base>,
+  pts_y: Vec<C::Base>,
+  non_identity: Vec<bool>,
+}
+
+impl<C: CurveAffine> SharedAffineCoords<C> {
+  fn new(bases: &[C]) -> Self {
+    let mut pts_x = Vec::with_capacity(bases.len());
+    let mut pts_y = Vec::with_capacity(bases.len());
+    let mut non_identity = Vec::with_capacity(bases.len());
+
+    for base in bases {
+      if bool::from(base.is_identity()) {
+        pts_x.push(C::Base::ZERO);
+        pts_y.push(C::Base::ZERO);
+        non_identity.push(false);
+      } else {
+        let coords = base.coordinates().unwrap();
+        pts_x.push(*coords.x());
+        pts_y.push(*coords.y());
+        non_identity.push(true);
+      }
+    }
+
+    Self {
+      curve_a: compute_curve_a::<C>(),
+      pts_x,
+      pts_y,
+      non_identity,
+    }
+  }
+}
+
+fn prepare_serial_msm_inputs<C: CurveAffine, PushPoint>(
+  coeffs: &[C::Scalar],
+  bases: &[C],
+  mut push_point: PushPoint,
+) -> SerialMsmPrepared<C>
+where
+  PushPoint: FnMut(usize, &C, &mut Vec<C::Base>, &mut Vec<C::Base>),
+{
+  let mut boolean_sum = C::Curve::identity();
+  let mut reprs: Vec<<C::Scalar as PrimeField>::Repr> = Vec::new();
+  let mut pts_x: Vec<C::Base> = Vec::new();
+  let mut pts_y: Vec<C::Base> = Vec::new();
+
+  let field_byte_size = <C::Scalar as PrimeField>::Repr::default().as_ref().len();
+  let mut acc_or = [0u8; 32];
+
+  for (i, (s, b)) in coeffs.iter().zip(bases.iter()).enumerate() {
+    if *s == C::Scalar::ZERO || bool::from(b.is_identity()) {
+      continue;
+    }
+    if *s == C::Scalar::ONE {
+      boolean_sum += b;
+      continue;
+    }
+
+    let repr = s.to_repr();
+    for (a, &byte) in acc_or[..field_byte_size]
+      .iter_mut()
+      .zip(repr.as_ref().iter())
+    {
+      *a |= byte;
+    }
+    reprs.push(repr);
+    push_point(i, b, &mut pts_x, &mut pts_y);
+  }
+
+  let max_num_bits = if reprs.is_empty() {
+    0
+  } else {
+    let max_byte_size = field_byte_size
+      - acc_or[..field_byte_size]
+        .iter()
+        .rev()
+        .position(|v| *v != 0)
+        .unwrap_or(field_byte_size);
+    max_byte_size * 8
+  };
+
+  SerialMsmPrepared {
+    boolean_sum,
+    reprs,
+    pts_x,
+    pts_y,
+    max_num_bits,
+  }
+}
+
+fn finish_serial_msm<C: CurveAffine>(
+  num_bases: usize,
+  curve_a: C::Base,
+  prepared: SerialMsmPrepared<C>,
+) -> C::Curve {
+  let SerialMsmPrepared {
+    boolean_sum,
+    reprs,
+    pts_x,
+    pts_y,
+    max_num_bits,
+  } = prepared;
+
+  if reprs.is_empty() || max_num_bits == 0 {
+    return boolean_sum;
+  }
+
+  let c = serial_window_size(num_bases);
+  debug_assert!(c < 31, "window size c={c} would overflow 1i32 << c");
+
+  let half = 1usize << (c - 1);
+  let num_windows = max_num_bits / c + 1;
+  let n_scalars = reprs.len();
+
+  let mut signed_digits = vec![0i32; num_windows * n_scalars];
+  for (i, repr) in reprs.iter().enumerate() {
+    let mut carry = 0u32;
+    for seg in 0..num_windows {
+      let raw = serial_get_at::<C::Scalar>(seg, c, repr) as u32 + carry;
+      let (digit, new_carry) = if (raw as usize) <= half {
+        (raw as i32, 0)
+      } else {
+        (raw as i32 - (1i32 << c), 1)
+      };
+      signed_digits[seg * n_scalars + i] = digit;
+      carry = new_carry;
+    }
+  }
+
+  let non_boolean_sum = {
+    let num_buckets = half;
+    let mut buckets: Vec<AffineBucket<C::Base>> = vec![AffineBucket::Empty; num_buckets];
+    let mut schedule = [ScheduledAdd {
+      base_idx: 0,
+      bucket_idx: 0,
+      negate: false,
+    }; BATCH_AFFINE_SIZE];
+    let mut xyzz_fallback: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); num_buckets];
+    let mut acc: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+
+    for segment in (0..num_windows).rev() {
+      (0..c).for_each(|_| acc.double_in_place(curve_a));
+
+      for b in &mut buckets {
+        *b = AffineBucket::Empty;
+      }
+      for b in &mut xyzz_fallback {
+        *b = BucketXYZZ::zero();
+      }
+      let mut sched_count: usize = 0;
+      let mut in_schedule = vec![false; num_buckets];
+
+      let digit_base = segment * n_scalars;
+      for i in 0..n_scalars {
+        let d = signed_digits[digit_base + i];
+        if d == 0 {
+          continue;
+        }
+
+        let (bucket_idx, negate) = if d > 0 {
+          ((d as usize) - 1, false)
+        } else {
+          ((-d as usize) - 1, true)
+        };
+
+        if in_schedule[bucket_idx] {
+          let py = if negate { -pts_y[i] } else { pts_y[i] };
+          bucket_add_affine_xy::<C>(&mut xyzz_fallback[bucket_idx], pts_x[i], py, curve_a);
+        } else if buckets[bucket_idx].is_empty() {
+          let py = if negate { -pts_y[i] } else { pts_y[i] };
+          buckets[bucket_idx] = AffineBucket::Point { x: pts_x[i], y: py };
+        } else {
+          schedule[sched_count] = ScheduledAdd {
+            base_idx: i,
+            bucket_idx,
+            negate,
+          };
+          in_schedule[bucket_idx] = true;
+          sched_count += 1;
+
+          if sched_count == BATCH_AFFINE_SIZE {
+            batch_affine_add::<C>(&mut buckets, &schedule, sched_count, &pts_x, &pts_y);
+            sched_count = 0;
+            in_schedule.iter_mut().for_each(|v| *v = false);
+          }
+        }
+      }
+
+      if sched_count > 0 {
+        batch_affine_add::<C>(&mut buckets, &schedule, sched_count, &pts_x, &pts_y);
+      }
+
+      let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+      let mut window_acc: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+      for idx in (0..num_buckets).rev() {
+        match buckets[idx] {
+          AffineBucket::Point { x, y } => {
+            bucket_add_affine_xy::<C>(&mut running_sum, x, y, curve_a);
+          }
+          AffineBucket::Empty => {}
+        }
+        running_sum.add_assign_bucket(&xyzz_fallback[idx], curve_a);
+        window_acc.add_assign_bucket(&running_sum, curve_a);
+      }
+      acc.add_assign_bucket(&window_acc, curve_a);
+    }
+
+    bucket_to_curve::<C>(&acc)
+  };
+
+  boolean_sum + non_boolean_sum
+}
+
+fn cpu_msm_serial_with_shared_coords<C: CurveAffine>(
+  coeffs: &[C::Scalar],
+  bases: &[C],
+  shared: &SharedAffineCoords<C>,
+) -> C::Curve {
+  let prepared = prepare_serial_msm_inputs(coeffs, bases, |idx, _base, pts_x, pts_y| {
+    if shared.non_identity[idx] {
+      pts_x.push(shared.pts_x[idx]);
+      pts_y.push(shared.pts_y[idx]);
+    }
+  });
+  finish_serial_msm(coeffs.len(), shared.curve_a, prepared)
+}
+
+pub(crate) fn batch_msm_common_bases<C: CurveAffine>(
+  coeffs: &[&[C::Scalar]],
+  bases: &[C],
+) -> Result<Vec<C::Curve>, SpartanError> {
+  if coeffs.iter().any(|row| row.len() > bases.len()) {
+    return Err(SpartanError::InvalidInputLength {
+      reason: "Batch MSM: row length exceeds number of bases".to_string(),
+    });
+  }
+
+  let shared = SharedAffineCoords::new(bases);
+  Ok(
+    coeffs
+      .par_iter()
+      .map(|row| cpu_msm_serial_with_shared_coords(row, &bases[..row.len()], &shared))
+      .collect(),
+  )
+}
+
 // ==================================================================================
 // Main MSM with signed decomposition + bit-width partitioning
 // ==================================================================================
@@ -331,7 +630,11 @@ fn batch_affine_add<C: CurveAffine>(
         denoms[i] = C::Base::ONE; // placeholder
       }
       AffineBucket::Point { x: bx, y: by } => {
-        let py = if s.negate { -pts_y[s.base_idx] } else { pts_y[s.base_idx] };
+        let py = if s.negate {
+          -pts_y[s.base_idx]
+        } else {
+          pts_y[s.base_idx]
+        };
         let px = pts_x[s.base_idx];
 
         if *bx == px {
@@ -368,14 +671,22 @@ fn batch_affine_add<C: CurveAffine>(
     match bkt {
       AffineBucket::Empty => {
         // Direct assignment
-        let py = if s.negate { -pts_y[s.base_idx] } else { pts_y[s.base_idx] };
+        let py = if s.negate {
+          -pts_y[s.base_idx]
+        } else {
+          pts_y[s.base_idx]
+        };
         buckets[s.bucket_idx] = AffineBucket::Point {
           x: pts_x[s.base_idx],
           y: py,
         };
       }
       AffineBucket::Point { x: bx, y: by } => {
-        let py = if s.negate { -pts_y[s.base_idx] } else { pts_y[s.base_idx] };
+        let py = if s.negate {
+          -pts_y[s.base_idx]
+        } else {
+          pts_y[s.base_idx]
+        };
         let px = pts_x[s.base_idx];
 
         if *bx == px && *by != py {
@@ -411,209 +722,12 @@ fn batch_affine_add<C: CurveAffine>(
 /// 7M+2S for XYZZ mixed addition. Designed to run without spawning rayon tasks.
 fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
   let curve_a = compute_curve_a::<C>();
-  let c = if bases.len() < 4 {
-    1
-  } else if bases.len() < 32 {
-    3
-  } else {
-    let c_base = (f64::from(bases.len() as u32)).ln().ceil() as usize;
-    let cost = |c: usize| ((256 + c - 1) / c) * (bases.len() + (1 << (c - 1)));
-    if cost(c_base + 1) < cost(c_base) {
-      c_base + 1
-    } else {
-      c_base
-    }
-  };
-
-  fn get_at<F: PrimeField>(segment: usize, c: usize, bytes: &F::Repr) -> usize {
-    let skip_bits = segment * c;
-    let skip_bytes = skip_bits / 8;
-
-    if skip_bytes >= 32 {
-      return 0;
-    }
-
-    let mut v = [0; 8];
-    for (v, o) in v.iter_mut().zip(bytes.as_ref()[skip_bytes..].iter()) {
-      *v = *o;
-    }
-
-    let mut tmp = u64::from_le_bytes(v);
-    tmp >>= skip_bits - (skip_bytes * 8);
-    tmp %= 1 << c;
-
-    tmp as usize
-  }
-
-  // Pre-compute scalar byte representations, filter zeros, separate booleans.
-  // Also extract affine (x, y) coordinates to avoid repeated CurveAffine lookups.
-  let mut boolean_sum = C::Curve::identity();
-  let mut reprs: Vec<<C::Scalar as PrimeField>::Repr> = Vec::new();
-  let mut pts_x: Vec<C::Base> = Vec::new();
-  let mut pts_y: Vec<C::Base> = Vec::new();
-
-  // Compute actual max byte size (OR all reprs to find highest nonzero byte)
-  let field_byte_size = <C::Scalar as PrimeField>::Repr::default().as_ref().len();
-  let mut acc_or = [0u8; 32]; // enough for any field
-
-  for (s, b) in coeffs.iter().zip(bases) {
-    if *s == C::Scalar::ZERO || bool::from(b.is_identity()) {
-      // skip zero scalars and identity bases
-    } else if *s == C::Scalar::ONE {
-      boolean_sum += b;
-    } else {
-      let repr = s.to_repr();
-      for (a, &byte) in acc_or[..field_byte_size].iter_mut().zip(repr.as_ref().iter()) {
-        *a |= byte;
-      }
-      let coords = b.coordinates().unwrap();
-      reprs.push(repr);
-      pts_x.push(*coords.x());
-      pts_y.push(*coords.y());
-    }
-  }
-
-  if reprs.is_empty() {
-    return boolean_sum;
-  }
-
-  let max_byte_size = field_byte_size
-    - acc_or[..field_byte_size]
-      .iter()
-      .rev()
-      .position(|v| *v != 0)
-      .unwrap_or(field_byte_size);
-  if max_byte_size == 0 {
-    return boolean_sum;
-  }
-  let max_num_bits = max_byte_size * 8;
-
-  // Signed digit representation — halves bucket count per window
-  debug_assert!(c < 31, "window size c={c} would overflow 1i32 << c");
-  let half = 1usize << (c - 1);
-  let num_windows = max_num_bits / c + 1;
-  let n_scalars = reprs.len();
-
-  // Pre-compute signed digits in WINDOW-MAJOR layout for cache-friendly access.
-  // Layout: signed_digits[seg * n_scalars + i] — sequential access within each window.
-  let mut signed_digits = vec![0i32; num_windows * n_scalars];
-  for (i, repr) in reprs.iter().enumerate() {
-    let mut carry = 0u32;
-    for seg in 0..num_windows {
-      let raw = get_at::<C::Scalar>(seg, c, repr) as u32 + carry;
-      let (digit, new_carry) = if (raw as usize) <= half {
-        (raw as i32, 0)
-      } else {
-        (raw as i32 - (1i32 << c), 1)
-      };
-      signed_digits[seg * n_scalars + i] = digit;
-      carry = new_carry;
-    }
-  }
-
-  let non_boolean_sum = {
-    let num_buckets = half;
-    // Batch affine buckets — use affine coordinates with Montgomery batch inversion
-    let mut buckets: Vec<AffineBucket<C::Base>> =
-      vec![AffineBucket::Empty; num_buckets];
-    let mut schedule = [ScheduledAdd {
-      base_idx: 0,
-      bucket_idx: 0,
-      negate: false,
-    }; BATCH_AFFINE_SIZE];
-    // Fallback XYZZ buckets for collisions within a batch
-    let mut xyzz_fallback: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); num_buckets];
-
-    // Keep accumulator in XYZZ for window summation
-    let mut acc: BucketXYZZ<C::Base> = BucketXYZZ::zero();
-
-    for segment in (0..num_windows).rev() {
-      // Double acc c times (window shift)
-      (0..c).for_each(|_| acc.double_in_place(curve_a));
-
-      // Reset buckets
-      for b in buckets.iter_mut() {
-        *b = AffineBucket::Empty;
-      }
-      for b in xyzz_fallback.iter_mut() {
-        *b = BucketXYZZ::zero();
-      }
-      let mut sched_count: usize = 0;
-
-      // Track which bucket indices are in the current schedule
-      // to detect collisions (two points going to the same bucket in one batch)
-      let mut in_schedule = vec![false; num_buckets];
-
-      let digit_base = segment * n_scalars;
-      for i in 0..n_scalars {
-        let d = signed_digits[digit_base + i];
-        if d == 0 {
-          continue;
-        }
-        let (bucket_idx, negate) = if d > 0 {
-          ((d as usize) - 1, false)
-        } else {
-          ((-d as usize) - 1, true)
-        };
-
-        // Check if this bucket is already in the current schedule
-        if in_schedule[bucket_idx] {
-          // Collision: fall back to XYZZ for this addition
-          let py = if negate { -pts_y[i] } else { pts_y[i] };
-          bucket_add_affine_xy::<C>(
-            &mut xyzz_fallback[bucket_idx],
-            pts_x[i],
-            py,
-            curve_a,
-          );
-        } else if buckets[bucket_idx].is_empty() {
-          // Empty bucket: direct assign (free, no field ops)
-          let py = if negate { -pts_y[i] } else { pts_y[i] };
-          buckets[bucket_idx] = AffineBucket::Point { x: pts_x[i], y: py };
-        } else {
-          // Schedule for batch affine addition
-          schedule[sched_count] = ScheduledAdd {
-            base_idx: i,
-            bucket_idx,
-            negate,
-          };
-          in_schedule[bucket_idx] = true;
-          sched_count += 1;
-
-          if sched_count == BATCH_AFFINE_SIZE {
-            batch_affine_add::<C>(&mut buckets, &schedule, sched_count, &pts_x, &pts_y);
-            sched_count = 0;
-            in_schedule.iter_mut().for_each(|v| *v = false);
-          }
-        }
-      }
-
-      // Flush remaining scheduled additions
-      if sched_count > 0 {
-        batch_affine_add::<C>(&mut buckets, &schedule, sched_count, &pts_x, &pts_y);
-      }
-
-      // Summation by parts: convert affine buckets to XYZZ, merge with fallback
-      let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
-      let mut window_acc: BucketXYZZ<C::Base> = BucketXYZZ::zero();
-      for idx in (0..num_buckets).rev() {
-        // Merge affine bucket into XYZZ
-        match buckets[idx] {
-          AffineBucket::Point { x, y } => {
-            bucket_add_affine_xy::<C>(&mut running_sum, x, y, curve_a);
-          }
-          AffineBucket::Empty => {}
-        }
-        // Merge XYZZ fallback
-        running_sum.add_assign_bucket(&xyzz_fallback[idx], curve_a);
-        window_acc.add_assign_bucket(&running_sum, curve_a);
-      }
-      acc.add_assign_bucket(&window_acc, curve_a);
-    }
-    bucket_to_curve::<C>(&acc)
-  };
-
-  boolean_sum + non_boolean_sum
+  let prepared = prepare_serial_msm_inputs(coeffs, bases, |_idx, base, pts_x, pts_y| {
+    let coords = base.coordinates().unwrap();
+    pts_x.push(*coords.x());
+    pts_y.push(*coords.y());
+  });
+  finish_serial_msm(bases.len(), curve_a, prepared)
 }
 
 /// Simple MSM fallback for very small inputs.
@@ -678,10 +792,7 @@ pub fn msm_standalone<C: CurveAffine>(
   Ok(halo2curves::msm::msm_best(coeffs, bases))
 }
 
-pub fn msm<C: CurveAffine>(
-  coeffs: &[C::Scalar],
-  bases: &[C],
-) -> Result<C::Curve, SpartanError> {
+pub fn msm<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> Result<C::Curve, SpartanError> {
   let (_msm_span, msm_t) = start_span!("msm", size = coeffs.len());
 
   if coeffs.len() != bases.len() {
@@ -903,7 +1014,10 @@ fn num_bits(n: usize) -> usize {
 // ==================================================================================
 
 /// Internal helper: MSM for small scalars with a known max bit-width.
-fn msm_small_with_max_num_bits<C: CurveAffine, T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
+fn msm_small_with_max_num_bits<
+  C: CurveAffine,
+  T: Integer + Into<u64> + Copy + Sync + ToPrimitive,
+>(
   scalars: &[T],
   bases: &[C],
   max_num_bits: usize,
@@ -1016,10 +1130,7 @@ fn msm_binary<C: CurveAffine, T: Integer + Sync>(scalars: &[T], bases: &[C]) -> 
 ///
 /// Pippenger bucketing is useless for binary scalars — there's only 1 nonzero bucket.
 /// This directly sums the matching bases with parallel chunking.
-pub fn msm_bool<C: CurveAffine>(
-  bits: &[bool],
-  bases: &[C],
-) -> Result<C::Curve, SpartanError> {
+pub fn msm_bool<C: CurveAffine>(bits: &[bool], bases: &[C]) -> Result<C::Curve, SpartanError> {
   if bits.len() != bases.len() {
     return Err(SpartanError::InvalidInputLength {
       reason: "msm_bool: bits and bases must have the same length".to_string(),
@@ -1033,12 +1144,12 @@ pub fn msm_bool<C: CurveAffine>(
   };
 
   let process_chunk = |bits: &[bool], bases: &[C]| {
-    bits
-      .iter()
-      .zip(bases.iter())
-      .fold(C::Curve::identity(), |acc, (&bit, base)| {
+    bits.iter().zip(bases.iter()).fold(
+      C::Curve::identity(),
+      |acc, (&bit, base)| {
         if bit { acc + base } else { acc }
-      })
+      },
+    )
   };
 
   let result = if bits.len() > num_threads {
@@ -1382,18 +1493,19 @@ mod tests {
     // Test {-1, 0, 1, 2} scalars
     let scalars: Vec<i8> = (0..n).map(|i| (i % 4) as i8 - 1).collect(); // -1, 0, 1, 2, -1, 0, ...
 
-    let naive = scalars
-      .iter()
-      .zip(bases.iter())
-      .fold(A::CurveExt::identity(), |acc, (&s, base)| {
-        if s == 0 {
-          acc
-        } else if s > 0 {
-          acc + *base * F::from(s as u64)
-        } else {
-          acc - *base * F::from((-s) as u64)
-        }
-      });
+    let naive =
+      scalars
+        .iter()
+        .zip(bases.iter())
+        .fold(A::CurveExt::identity(), |acc, (&s, base)| {
+          if s == 0 {
+            acc
+          } else if s > 0 {
+            acc + *base * F::from(s as u64)
+          } else {
+            acc - *base * F::from((-s) as u64)
+          }
+        });
 
     let result = msm_signed_small(&scalars, &bases).unwrap();
     assert_eq!(naive, result);
@@ -1453,5 +1565,32 @@ mod tests {
   fn test_msm_identity_bases() {
     test_msm_identity_bases_with::<pallas::Scalar, pallas::Affine>();
     test_msm_identity_bases_with::<vesta::Scalar, vesta::Affine>();
+  }
+
+  fn test_batch_msm_common_bases_with<F: Field, A: CurveAffine<ScalarExt = F>>() {
+    let n = 128;
+    let bases = (0..n)
+      .map(|_| A::from(A::generator() * F::random(OsRng)))
+      .collect::<Vec<_>>();
+    let coeff_rows = vec![
+      (0..n).map(|_| F::random(OsRng)).collect::<Vec<_>>(),
+      (0..n).map(|_| F::random(OsRng)).collect::<Vec<_>>(),
+      (0..(n - 17)).map(|_| F::random(OsRng)).collect::<Vec<_>>(),
+    ];
+    let coeff_refs = coeff_rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+
+    let expected = coeff_rows
+      .iter()
+      .map(|row| msm(row, &bases[..row.len()]).unwrap())
+      .collect::<Vec<_>>();
+    let actual = batch_msm_common_bases(&coeff_refs, &bases).unwrap();
+
+    assert_eq!(expected, actual);
+  }
+
+  #[test]
+  fn test_batch_msm_common_bases() {
+    test_batch_msm_common_bases_with::<pallas::Scalar, pallas::Affine>();
+    test_batch_msm_common_bases_with::<vesta::Scalar, vesta::Affine>();
   }
 }

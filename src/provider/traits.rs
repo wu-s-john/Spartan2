@@ -81,7 +81,7 @@ pub trait DlogGroup:
     + Serialize
     + for<'de> Deserialize<'de>
     + TranscriptReprTrait<Self>
-    + CurveAffine
+    + CurveAffine<ScalarExt = <Self as Group>::Scalar, CurveExt = Self>
     + SerdeObject;
 
   /// Produce a vector of group elements using a static label

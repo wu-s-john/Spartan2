@@ -10,7 +10,7 @@
 //!   cargo run --release --example rs_shuffle_bp_full
 //!   cargo run --release --example rs_shuffle_bp_full -- --zk
 
-use bellpepper_core::{num::AllocatedNum, ConstraintSystem, SynthesisError};
+use bellpepper_core::{ConstraintSystem, SynthesisError, num::AllocatedNum};
 use clap::Parser;
 use ff::{Field, PrimeField};
 use std::time::{Duration, Instant};
@@ -18,27 +18,22 @@ use tracing_subscriber::prelude::*;
 
 use spartan2::{
   gadgets::ecc::AllocatedPointNonInfinity,
-  provider::{pasta::pallas, PallasHyraxEngine, VestaHyraxEngine},
+  provider::{PallasHyraxEngine, VestaHyraxEngine, pasta::pallas},
   rs_shuffle_bp::{
-    data_structures::{
-      ElGamalCiphertext, ElGamalCiphertextVar, PermutationWitnessTrace,
-      PermutationWitnessTraceVar,
-    },
+    data_structures::{ElGamalCiphertext, ElGamalCiphertextVar, PermutationWitnessTrace},
     encryption::{
-      native_reencrypt_parallel, precompute_native_powers, reencrypt_deck_bp,
-      NativeReencryptionData,
+      NativeReencryptionData, native_reencrypt_parallel, precompute_native_powers,
+      reencrypt_deck_bp,
     },
     native::run_rs_shuffle_permutation,
-    permutation::{check_grand_product, IndexPositionPair, IndexedCiphertext},
+    permutation::{IndexPositionPair, IndexedCiphertext, check_grand_product},
   },
   spartan::SpartanSNARK,
   spartan_zk::SpartanZkSNARK,
-  timing::{clear_timings, snapshot_timings, TimingData, TimingLayer, SPARTAN_PHASES, SPARTAN_ZK_PHASES},
-  traits::{
-    circuit::SpartanCircuit,
-    snark::R1CSSNARKTrait,
-    Engine, Group,
+  timing::{
+    SPARTAN_PHASES, SPARTAN_ZK_PHASES, TimingData, TimingLayer, clear_timings, snapshot_timings,
   },
+  traits::{Engine, Group, circuit::SpartanCircuit, snark::R1CSSNARKTrait},
 };
 
 #[derive(Parser)]
@@ -57,6 +52,102 @@ type Scalar = pallas::Scalar;
 
 /// EC engine for in-circuit operations (Vesta curve, coords in pallas::Scalar)
 type ECEngine = VestaHyraxEngine;
+
+fn alloc_point_public_input<E: Engine, CS: ConstraintSystem<E::Base>>(
+  mut cs: CS,
+  coords: (E::Base, E::Base),
+) -> Result<AllocatedPointNonInfinity<E>, SynthesisError> {
+  Ok(AllocatedPointNonInfinity {
+    x: AllocatedNum::alloc_input(cs.namespace(|| "x"), || Ok(coords.0))?,
+    y: AllocatedNum::alloc_input(cs.namespace(|| "y"), || Ok(coords.1))?,
+  })
+}
+
+fn alloc_ciphertext_public_input<E: Engine, CS: ConstraintSystem<E::Base>>(
+  mut cs: CS,
+  ct: &ElGamalCiphertext<E>,
+) -> Result<ElGamalCiphertextVar<E>, SynthesisError> {
+  Ok(ElGamalCiphertextVar::new(
+    alloc_point_public_input(cs.namespace(|| "c1"), (ct.c1_x, ct.c1_y))?,
+    alloc_point_public_input(cs.namespace(|| "c2"), (ct.c2_x, ct.c2_y))?,
+  ))
+}
+
+#[derive(Clone)]
+struct MinimalUnsortedRowVar<F: PrimeField> {
+  idx: AllocatedNum<F>,
+  next_pos: AllocatedNum<F>,
+}
+
+#[derive(Clone)]
+struct MinimalSortedRowVar<F: PrimeField> {
+  idx: AllocatedNum<F>,
+}
+
+#[derive(Clone)]
+struct MinimalPermutationWitnessTraceVar<F: PrimeField, const N: usize, const LEVELS: usize> {
+  uns_levels: [[MinimalUnsortedRowVar<F>; N]; LEVELS],
+  sorted_levels: [[MinimalSortedRowVar<F>; N]; LEVELS],
+}
+
+impl<F: PrimeField, const N: usize, const LEVELS: usize>
+  MinimalPermutationWitnessTraceVar<F, N, LEVELS>
+{
+  fn alloc<CS: ConstraintSystem<F>>(
+    mut cs: CS,
+    witness_data: &PermutationWitnessTrace<N, LEVELS>,
+  ) -> Result<Self, SynthesisError> {
+    let mut uns_levels_vec: Vec<[MinimalUnsortedRowVar<F>; N]> = Vec::with_capacity(LEVELS);
+    for level in 0..LEVELS {
+      let mut level_rows: Vec<MinimalUnsortedRowVar<F>> = Vec::with_capacity(N);
+      for i in 0..N {
+        let row = &witness_data.uns_levels[level][i];
+        level_rows.push(MinimalUnsortedRowVar {
+          idx: AllocatedNum::alloc(cs.namespace(|| format!("uns_idx_{}_{}", level, i)), || {
+            Ok(F::from(row.idx as u64))
+          })?,
+          next_pos: AllocatedNum::alloc(
+            cs.namespace(|| format!("uns_next_pos_{}_{}", level, i)),
+            || Ok(F::from(row.next_pos as u64)),
+          )?,
+        });
+      }
+      uns_levels_vec.push(
+        level_rows
+          .try_into()
+          .map_err(|_| SynthesisError::Unsatisfiable)?,
+      );
+    }
+
+    let mut sorted_levels_vec: Vec<[MinimalSortedRowVar<F>; N]> = Vec::with_capacity(LEVELS);
+    for level in 0..LEVELS {
+      let mut level_rows: Vec<MinimalSortedRowVar<F>> = Vec::with_capacity(N);
+      for i in 0..N {
+        let row = &witness_data.next_levels[level][i];
+        level_rows.push(MinimalSortedRowVar {
+          idx: AllocatedNum::alloc(
+            cs.namespace(|| format!("sorted_idx_{}_{}", level, i)),
+            || Ok(F::from(row.idx as u64)),
+          )?,
+        });
+      }
+      sorted_levels_vec.push(
+        level_rows
+          .try_into()
+          .map_err(|_| SynthesisError::Unsatisfiable)?,
+      );
+    }
+
+    Ok(Self {
+      uns_levels: uns_levels_vec
+        .try_into()
+        .map_err(|_| SynthesisError::Unsatisfiable)?,
+      sorted_levels: sorted_levels_vec
+        .try_into()
+        .map_err(|_| SynthesisError::Unsatisfiable)?,
+    })
+  }
+}
 
 // ============================================================================
 // Helper: find a valid curve point
@@ -148,12 +239,9 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
 
   fn precommitted<CS: ConstraintSystem<Scalar>>(
     &self,
-    cs: &mut CS,
+    _cs: &mut CS,
     _shared: &[AllocatedNum<Scalar>],
   ) -> Result<Vec<AllocatedNum<Scalar>>, SynthesisError> {
-    // Allocate witness trace as precommitted
-    let _witness_var =
-      PermutationWitnessTraceVar::<Scalar, N, LEVELS>::alloc(cs.namespace(|| "witness"), &self.witness_trace)?;
     Ok(vec![])
   }
 
@@ -174,8 +262,7 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       None => [Scalar::from(0u64); 7],
     };
 
-    // Re-allocate witness trace for synthesis ("rest" variables)
-    let witness_var = PermutationWitnessTraceVar::<Scalar, N, LEVELS>::alloc(
+    let witness_var = MinimalPermutationWitnessTraceVar::<Scalar, N, LEVELS>::alloc(
       cs.namespace(|| "witness_synth"),
       &self.witness_trace,
     )?;
@@ -186,45 +273,35 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
     // =========================================================================
 
     // Allocate generator from native powers[0] — public input
-    let gen_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
+    let _gen_var = alloc_point_public_input::<ECEngine, _>(
       cs.namespace(|| "generator"),
-      Some(self.gen_powers_native[0]),
+      self.gen_powers_native[0],
     )?;
-    gen_var.x.inputize(cs.namespace(|| "gen_x_pub"))?;
-    gen_var.y.inputize(cs.namespace(|| "gen_y_pub"))?;
 
     // Allocate public key (non-infinity) — public input
-    let pk_var = AllocatedPointNonInfinity::<ECEngine>::alloc(
+    let _pk_var = alloc_point_public_input::<ECEngine, _>(
       cs.namespace(|| "pk"),
-      Some((self.pk_coords.0, self.pk_coords.1)),
+      (self.pk_coords.0, self.pk_coords.1),
     )?;
-    pk_var.x.inputize(cs.namespace(|| "pk_x_pub"))?;
-    pk_var.y.inputize(cs.namespace(|| "pk_y_pub"))?;
 
     // Allocate pk power table — public inputs
     let num_bits = Scalar::NUM_BITS as usize;
     let mut pk_powers_vars = Vec::with_capacity(num_bits);
     for i in 0..num_bits {
-      let p = AllocatedPointNonInfinity::<ECEngine>::alloc(
+      let p = alloc_point_public_input::<ECEngine, _>(
         cs.namespace(|| format!("pk_power_{}", i)),
-        Some(self.pk_powers_native[i]),
+        self.pk_powers_native[i],
       )?;
-      p.x.inputize(cs.namespace(|| format!("pk_power_{}_x", i)))?;
-      p.y.inputize(cs.namespace(|| format!("pk_power_{}_y", i)))?;
       pk_powers_vars.push(p);
     }
 
     // Allocate input ciphertexts (original order, before shuffle) — public inputs
     let mut input_deck_vars = Vec::with_capacity(N);
     for i in 0..N {
-      let ct_var = ElGamalCiphertextVar::<ECEngine>::alloc(
+      let ct_var = alloc_ciphertext_public_input::<ECEngine, _>(
         cs.namespace(|| format!("input_ct_{}", i)),
         &self.input_ciphertexts[i],
       )?;
-      ct_var.c1.x.inputize(cs.namespace(|| format!("input_ct_{}_c1x", i)))?;
-      ct_var.c1.y.inputize(cs.namespace(|| format!("input_ct_{}_c1y", i)))?;
-      ct_var.c2.x.inputize(cs.namespace(|| format!("input_ct_{}_c2x", i)))?;
-      ct_var.c2.y.inputize(cs.namespace(|| format!("input_ct_{}_c2y", i)))?;
       input_deck_vars.push(ct_var);
     }
 
@@ -250,6 +327,15 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       rand_vars.push(r_var);
     }
     let rand_arr: [AllocatedNum<Scalar>; N] = rand_vars.try_into().ok().unwrap();
+    let index_vars: [AllocatedNum<Scalar>; N] = (0..N)
+      .map(|i| {
+        AllocatedNum::alloc(cs.namespace(|| format!("idx_{}", i)), || {
+          Ok(Scalar::from(i as u64))
+        })
+      })
+      .collect::<Result<Vec<_>, _>>()?
+      .try_into()
+      .map_err(|_| SynthesisError::Unsatisfiable)?;
 
     // Re-encrypt the deck (includes inputize for output coords)
     reencrypt_deck_bp::<ECEngine, _, N>(
@@ -270,10 +356,9 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       AllocatedNum::alloc_input(cs.namespace(|| "challenge_beta"), || Ok(challenge_vals[1]))?;
     let mut ict_challenges = Vec::with_capacity(5);
     for i in 0..5 {
-      let c = AllocatedNum::alloc_input(
-        cs.namespace(|| format!("challenge_ict_{}", i)),
-        || Ok(challenge_vals[2 + i]),
-      )?;
+      let c = AllocatedNum::alloc_input(cs.namespace(|| format!("challenge_ict_{}", i)), || {
+        Ok(challenge_vals[2 + i])
+      })?;
       ict_challenges.push(c);
     }
     let ict_challenges_arr: [AllocatedNum<Scalar>; 5] = ict_challenges.try_into().unwrap();
@@ -289,13 +374,9 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
 
       let mut sorted_pairs: Vec<IndexPositionPair<Scalar>> = Vec::with_capacity(N);
       for i in 0..N {
-        let pos =
-          AllocatedNum::alloc(cs.namespace(|| format!("sorted_pos_{}_{}", level, i)), || {
-            Ok(Scalar::from(i as u64))
-          })?;
         sorted_pairs.push(IndexPositionPair::new(
           witness_var.sorted_levels[level][i].idx.clone(),
-          pos,
+          index_vars[i].clone(),
         ));
       }
 
@@ -315,10 +396,10 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
 
     let left: Vec<IndexedCiphertext<Scalar>> = (0..N)
       .map(|i| {
-        let idx = AllocatedNum::alloc(cs.namespace(|| format!("ict_left_idx_{}", i)), || {
-          Ok(Scalar::from(i as u64))
-        })?;
-        Ok(IndexedCiphertext::new::<ECEngine>(idx, &input_deck_vars[i]))
+        Ok(IndexedCiphertext::new::<ECEngine>(
+          index_vars[i].clone(),
+          &input_deck_vars[i],
+        ))
       })
       .collect::<Result<Vec<_>, SynthesisError>>()?;
 
@@ -363,9 +444,18 @@ fn run_spartan<S: R1CSSNARKTrait<PallasHyraxEngine>>(
   let sizes = S::pk_sizes(&pk);
   println!("  Constraints (unpadded): {}", sizes[0]);
   println!("  Constraints (padded):   {}", sizes[4]);
-  println!("  Variables (shared):     {} (unpadded: {})", sizes[5], sizes[1]);
-  println!("  Variables (precommit):  {} (unpadded: {})", sizes[6], sizes[2]);
-  println!("  Variables (rest):       {} (unpadded: {})", sizes[7], sizes[3]);
+  println!(
+    "  Variables (shared):     {} (unpadded: {})",
+    sizes[5], sizes[1]
+  );
+  println!(
+    "  Variables (precommit):  {} (unpadded: {})",
+    sizes[6], sizes[2]
+  );
+  println!(
+    "  Variables (rest):       {} (unpadded: {})",
+    sizes[7], sizes[3]
+  );
 
   // Prep Prove
   println!("\n--- Prep Prove ---");
@@ -405,7 +495,12 @@ fn run_spartan<S: R1CSSNARKTrait<PallasHyraxEngine>>(
 
   // Timing Breakdown
   println!("\n================================================================");
-  println!("           {} TIMING BREAKDOWN (N={}, LEVELS={})", label.to_uppercase(), N, LEVELS);
+  println!(
+    "           {} TIMING BREAKDOWN (N={}, LEVELS={})",
+    label.to_uppercase(),
+    N,
+    LEVELS
+  );
   println!("================================================================");
   println!("  SETUP (one-time):               {:>10.2?}", setup_time);
   println!("  Constraints:                    {:>10}", sizes[0]);
@@ -426,8 +521,14 @@ fn run_spartan<S: R1CSSNARKTrait<PallasHyraxEngine>>(
   println!("----------------------------------------------------------------");
   println!("  VERIFY:                         {:>10.2?}", verify_time);
   println!("----------------------------------------------------------------");
-  println!("  TOTAL PROVE (prep+prove):       {:>10.2?}", prep_time + prove_time);
-  println!("  Native re-encrypt (parallel):   {:>10.2?}", reencrypt_time);
+  println!(
+    "  TOTAL PROVE (prep+prove):       {:>10.2?}",
+    prep_time + prove_time
+  );
+  println!(
+    "  Native re-encrypt (parallel):   {:>10.2?}",
+    reencrypt_time
+  );
   println!("================================================================");
 }
 
@@ -484,8 +585,7 @@ fn main() {
   for i in 0..N {
     shuffled_cts.push(input_ct_arr[permutation[i]].clone());
   }
-  let shuffled_ct_arr: [ElGamalCiphertext<ECEngine>; N] =
-    shuffled_cts.try_into().ok().unwrap();
+  let shuffled_ct_arr: [ElGamalCiphertext<ECEngine>; N] = shuffled_cts.try_into().ok().unwrap();
 
   // Randomization scalars
   let mut randomizations = Vec::with_capacity(N);
@@ -496,12 +596,8 @@ fn main() {
 
   // Parallel native re-encryption
   let reencrypt_start = Instant::now();
-  let native_data = native_reencrypt_parallel::<ECEngine, N>(
-    &shuffled_ct_arr,
-    &rand_arr,
-    pk_coords,
-    gen_coords,
-  );
+  let native_data =
+    native_reencrypt_parallel::<ECEngine, N>(&shuffled_ct_arr, &rand_arr, pk_coords, gen_coords);
   let reencrypt_time = reencrypt_start.elapsed();
   println!("  Re-encryption time: {:?} (parallel)", reencrypt_time);
 
@@ -537,8 +633,20 @@ fn main() {
   // Step 4: Run Spartan (ZK or non-ZK)
   // =========================================================================
   if cli.zk {
-    run_spartan::<SpartanZkSNARK<PallasHyraxEngine>>(circuit, &timing_data, SPARTAN_ZK_PHASES, "ZK Spartan", reencrypt_time);
+    run_spartan::<SpartanZkSNARK<PallasHyraxEngine>>(
+      circuit,
+      &timing_data,
+      SPARTAN_ZK_PHASES,
+      "ZK Spartan",
+      reencrypt_time,
+    );
   } else {
-    run_spartan::<SpartanSNARK<PallasHyraxEngine>>(circuit, &timing_data, SPARTAN_PHASES, "Spartan", reencrypt_time);
+    run_spartan::<SpartanSNARK<PallasHyraxEngine>>(
+      circuit,
+      &timing_data,
+      SPARTAN_PHASES,
+      "Spartan",
+      reencrypt_time,
+    );
   }
 }

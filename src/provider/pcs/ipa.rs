@@ -49,10 +49,15 @@ where
 {
   /// Creates a new inner product instance
   pub fn new(comm_a_vec: &E::GE, b_vec: &[E::Scalar], comm_c: &E::GE) -> Self {
+    Self::new_owned(*comm_a_vec, b_vec.to_vec(), *comm_c)
+  }
+
+  /// Creates a new inner product instance, taking ownership of the input vector.
+  pub fn new_owned(comm_a_vec: E::GE, b_vec: Vec<E::Scalar>, comm_c: E::GE) -> Self {
     InnerProductInstance {
-      comm_a_vec: *comm_a_vec,
-      b_vec: b_vec.to_vec(),
-      comm_c: *comm_c,
+      comm_a_vec,
+      b_vec,
+      comm_c,
     }
   }
 }
@@ -74,11 +79,12 @@ where
 impl<E: Engine> InnerProductWitness<E> {
   /// Creates a new inner product witness
   pub fn new(a_vec: &[E::Scalar], r_a: &E::Scalar, r_c: &E::Scalar) -> Self {
-    InnerProductWitness {
-      a_vec: a_vec.to_vec(),
-      r_a: *r_a,
-      r_c: *r_c,
-    }
+    Self::new_owned(a_vec.to_vec(), *r_a, *r_c)
+  }
+
+  /// Creates a new inner product witness, taking ownership of the vector.
+  pub fn new_owned(a_vec: Vec<E::Scalar>, r_a: E::Scalar, r_c: E::Scalar) -> Self {
+    InnerProductWitness { a_vec, r_a, r_c }
   }
 }
 
@@ -204,8 +210,7 @@ where
     }
 
     if U.comm_a_vec * r + self.delta
-      != E::GE::vartime_multiscalar_mul(&self.z_vec, &ck[0..self.z_vec.len()])?
-        + *h * self.z_delta
+      != E::GE::vartime_multiscalar_mul(&self.z_vec, &ck[0..self.z_vec.len()])? + *h * self.z_delta
     {
       return Err(SpartanError::InvalidPCS {
         reason: "Inner product argument verify: First equation failed".to_string(),

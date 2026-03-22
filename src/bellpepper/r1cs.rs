@@ -89,7 +89,6 @@ pub trait SpartanWitness<E: Engine> {
   ) -> Result<(SplitR1CSInstance<E>, R1CSWitness<E>), SpartanError>;
 }
 
-
 /// `MultiRoundSpartanShape` provides methods for acquiring `SplitMultiRoundR1CSShape` and `CommitmentKey` from implementers.
 pub trait MultiRoundSpartanShape<E: Engine> {
   /// Return an appropriate `SplitMultiRoundR1CSShape` and `CommitmentKey` structs.
@@ -232,7 +231,6 @@ impl<E: Engine> SpartanShape<E> for ShapeCS<E> {
   }
 }
 
-
 /// A commitment to a witness segment together with its blinding factor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound = "")]
@@ -240,7 +238,6 @@ pub struct WitnessCommitment<E: Engine> {
   pub(crate) comm: Commitment<E>,
   pub(crate) blind: Blind<E>,
 }
-
 
 pub(crate) fn add_constraint<S: PrimeField>(
   X: &mut (
@@ -455,28 +452,30 @@ impl<E: Engine> SpartanWitness<E> for SatisfyingAssignment<E> {
     info!(elapsed_ms = %commit_rest_t.elapsed().as_millis(), "commit_witness_rest");
     transcript.absorb(b"comm_W_rest", &comm_W_rest); // add commitment to transcript
 
-    let public_values = ps.cs.input_assignment[1..].to_vec()[..S.num_public].to_vec();
+    let public_values = ps.cs.input_assignment[1..1 + S.num_public].to_vec();
+    let comm_shared = ps.comm_shared.take();
+    let comm_precommitted = ps.comm_precommitted.take();
     let U = SplitR1CSInstance::<E>::new(
       S,
-      ps.comm_shared.as_ref().map(|wc| wc.comm.clone()),
-      ps.comm_precommitted.as_ref().map(|wc| wc.comm.clone()),
+      comm_shared.as_ref().map(|wc| wc.comm.clone()),
+      comm_precommitted.as_ref().map(|wc| wc.comm.clone()),
       comm_W_rest,
       public_values,
       challenges,
     )?;
 
     let mut blinds = Vec::with_capacity(3);
-    if let Some(wc) = &ps.comm_shared {
-      blinds.push(wc.blind.clone());
+    if let Some(wc) = comm_shared {
+      blinds.push(wc.blind);
     }
-    if let Some(wc) = &ps.comm_precommitted {
-      blinds.push(wc.blind.clone());
+    if let Some(wc) = comm_precommitted {
+      blinds.push(wc.blind);
     }
     blinds.push(r_W_rest);
 
     let r_W = PCS::<E>::combine_blinds(&blinds)?;
 
-    let W = R1CSWitness::<E>::new_unchecked(ps.W.clone(), r_W, is_small)?;
+    let W = R1CSWitness::<E>::new_unchecked(std::mem::take(&mut ps.W), r_W, is_small)?;
 
     info!(elapsed_ms = %synth_t.elapsed().as_millis(), "circuit_synthesize_rest");
 
@@ -781,17 +780,13 @@ impl<E: Engine> MultiRoundSpartanWitness<E> for SatisfyingAssignment<E> {
     // collect public values
     let public_values = state.cs.input_assignment[1 + num_challenges..].to_vec();
 
-    let u = SplitMultiRoundR1CSInstance::<E>::new(
-      s,
-      state.comm_w_per_round.clone(),
-      public_values,
-      state.challenges.clone(),
-    )?;
-
     let r_w = PCS::<E>::combine_blinds(&state.r_w_per_round)?;
-    let w = R1CSWitness::<E>::new_unchecked(state.w.clone(), r_w, false)?;
+    let comm_w_per_round = std::mem::take(&mut state.comm_w_per_round);
+    let challenges = std::mem::take(&mut state.challenges);
+    let w = R1CSWitness::<E>::new_unchecked(std::mem::take(&mut state.w), r_w, false)?;
+
+    let u = SplitMultiRoundR1CSInstance::<E>::new(s, comm_w_per_round, public_values, challenges)?;
 
     Ok((u, w))
   }
 }
-

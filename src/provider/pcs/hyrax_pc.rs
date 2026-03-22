@@ -10,6 +10,7 @@ use crate::{
   math::Math,
   polys::{eq::EqPolynomial, multilinear::MultilinearPolynomial},
   provider::{
+    msm::batch_msm_common_bases,
     pcs::ipa::{InnerProductArgumentLinear, InnerProductInstance, InnerProductWitness},
     traits::{DlogGroup, DlogGroupExt},
   },
@@ -139,25 +140,46 @@ where
     let num_cols = ck.num_cols;
     let num_rows = div_ceil(n, num_cols);
 
-    let comm = (0..num_rows)
-      .into_par_iter()
+    let row_scalars = (0..num_rows)
       .map(|i| {
         let upper = i.saturating_mul(num_cols).saturating_add(num_cols);
         let lower = i.saturating_mul(num_cols);
-        let scalars = if upper > n {
+        if upper > n {
           &v[lower..]
         } else {
           &v[lower..upper]
-        };
-
-        // Padding row: all scalars are zero → skip MSM entirely
-        if scalars.iter().all(|s| *s == E::Scalar::ZERO) {
-          return Ok(ck.h * r.blind[i]);
         }
+      })
+      .collect::<Vec<_>>();
 
-        let msm_result = if !is_small {
-          E::GE::vartime_multiscalar_mul(scalars, &ck.ck[..scalars.len()])?
+    let comm = if !is_small {
+      let mut comm = vec![E::GE::zero(); num_rows];
+      let mut nonzero_rows = Vec::with_capacity(num_rows);
+      let mut nonzero_scalars = Vec::with_capacity(num_rows);
+
+      for (i, scalars) in row_scalars.iter().enumerate() {
+        if scalars.iter().all(|s| *s == E::Scalar::ZERO) {
+          comm[i] = ck.h * r.blind[i];
         } else {
+          nonzero_rows.push(i);
+          nonzero_scalars.push(*scalars);
+        }
+      }
+
+      let msm_results: Vec<E::GE> = batch_msm_common_bases(&nonzero_scalars, &ck.ck)?;
+      for (row_idx, msm_result) in nonzero_rows.into_iter().zip(msm_results) {
+        comm[row_idx] = msm_result + ck.h * r.blind[row_idx];
+      }
+      comm
+    } else {
+      row_scalars
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, scalars)| {
+          if scalars.iter().all(|s| *s == E::Scalar::ZERO) {
+            return Ok(ck.h * r.blind[i]);
+          }
+
           let scalars_small = scalars
             .par_iter()
             .map(|s| {
@@ -166,14 +188,12 @@ where
               u64::from_le_bytes(bytes[..8].try_into().unwrap())
             })
             .collect::<Vec<_>>();
-          E::GE::vartime_multiscalar_mul_small(
-            &scalars_small,
-            &ck.ck[..scalars_small.len()],
-          )?
-        };
-        Ok(msm_result + ck.h * r.blind[i])
-      })
-      .collect::<Result<Vec<_>, _>>()?;
+          let msm_result =
+            E::GE::vartime_multiscalar_mul_small(&scalars_small, &ck.ck[..scalars_small.len()])?;
+          Ok(msm_result + ck.h * r.blind[i])
+        })
+        .collect::<Result<Vec<_>, _>>()?
+    };
 
     Ok(HyraxCommitment { comm })
   }
@@ -341,8 +361,8 @@ where
 
     // a dot product argument (IPA) of size R_size
     let (_ipa_span, ipa_t) = start_span!("hyrax_prove_ipa");
-    let ipa_instance = InnerProductInstance::<E>::new(&comm_LZ, &R, &comm_eval.comm[0]);
-    let ipa_witness = InnerProductWitness::<E>::new(&LZ, &r_LZ, &blind_eval.blind[0]);
+    let ipa_instance = InnerProductInstance::<E>::new_owned(comm_LZ, R, comm_eval.comm[0]);
+    let ipa_witness = InnerProductWitness::<E>::new_owned(LZ, r_LZ, blind_eval.blind[0]);
     let ipa = InnerProductArgumentLinear::<E>::prove(
       &ck.ck,
       &ck.h,
@@ -426,8 +446,8 @@ where
 
     // a dot product argument (IPA) of size R_size
     let (_ipa_span, ipa_t) = start_span!("hyrax_prove_witness_ipa");
-    let ipa_instance = InnerProductInstance::<E>::new(&comm_LZ, &R, &comm_eval.comm[0]);
-    let ipa_witness = InnerProductWitness::<E>::new(&LZ, &r_LZ, &blind_eval.blind[0]);
+    let ipa_instance = InnerProductInstance::<E>::new_owned(comm_LZ, R, comm_eval.comm[0]);
+    let ipa_witness = InnerProductWitness::<E>::new_owned(LZ, r_LZ, blind_eval.blind[0]);
     let ipa = InnerProductArgumentLinear::<E>::prove(
       &ck.ck,
       &ck.h,

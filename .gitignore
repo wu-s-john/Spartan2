@@ -15,3 +15,6 @@ Cargo.lock
 
 # Git worktrees
 .worktrees/
+
+# Autoresearch experiment log (do not commit)
+autoresearch/results.tsv
