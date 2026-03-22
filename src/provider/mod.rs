@@ -16,6 +16,9 @@ pub mod traits;
 
 pub(crate) mod msm;
 
+#[cfg(feature = "gpu")]
+pub mod metal_msm;
+
 use crate::{
   provider::{
     bn254::bn254 as bn254_types,

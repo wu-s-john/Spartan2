@@ -18,7 +18,8 @@
 #![allow(clippy::upper_case_acronyms)]
 #![allow(clippy::type_complexity)]
 #![allow(clippy::too_many_arguments)]
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "gpu"), forbid(unsafe_code))]
+#![cfg_attr(feature = "gpu", deny(unsafe_code))]
 
 // private modules
 mod csr;
