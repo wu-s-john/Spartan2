@@ -301,14 +301,22 @@ where
     )?;
     let r = chals[0];
 
-    // Prepare inner polynomials
-    let (_eval_rx_span, eval_rx_t) = start_span!("compute_eval_rx");
-    let evals_rx = EqPolynomial::evals_from_points(&r_x);
-    info!(elapsed_ms = %eval_rx_t.elapsed().as_millis(), "compute_eval_rx");
-
-    let (_sparse_span, sparse_t) = start_span!("compute_eval_table_sparse");
-    let poly_ABC = pk.S.bind_row_vars_combined(&evals_rx, r);
-    info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
+    // Overlap random instance generation (for NIFS) with inner sumcheck preparation.
+    // sample_random_instance_witness is independent of the sumcheck — it only needs
+    // the verifier circuit shape and commitment key, both available from setup.
+    let (_eval_rx_span, eval_rx_t) = start_span!("compute_eval_rx_and_random");
+    let S_verifier = &pk.vc_shape_regular;
+    let ((_evals_rx, poly_ABC_vec), random_result) = rayon::join(
+      || {
+        let evals_rx = EqPolynomial::evals_from_points(&r_x);
+        let poly_ABC = pk.S.bind_row_vars_combined(&evals_rx, r);
+        (evals_rx, poly_ABC)
+      },
+      || S_verifier.sample_random_instance_witness(&pk.vc_ck),
+    );
+    let poly_ABC = poly_ABC_vec;
+    let (random_U, random_W) = random_result?;
+    info!(elapsed_ms = %eval_rx_t.elapsed().as_millis(), "compute_eval_rx_and_random");
 
     let (_z_span, z_t) = start_span!("prepare_poly_z");
     z.resize(num_vars * 2, E::Scalar::ZERO);
@@ -384,8 +392,7 @@ where
     // Use the instance as produced by witness finalization; its public values
     // are exactly those absorbed during round 0 by the prover.
     let U_verifier_regular = U_verifier.to_regular_instance()?;
-    let S_verifier = &pk.vc_shape_regular;
-    let (random_U, random_W) = S_verifier.sample_random_instance_witness(&pk.vc_ck)?;
+    // random_U and random_W were precomputed in parallel with inner sumcheck prep
     let (nifs, folded_W) = NovaNIFS::<E>::prove(
       &pk.vc_ck,
       S_verifier,
