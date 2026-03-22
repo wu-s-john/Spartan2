@@ -35,6 +35,40 @@ use tracing::info;
 /// 4 k elements is a good cut-off on a 16-core machine.
 pub(crate) const PAR_THRESHOLD: usize = 4 << 10; // 4096
 
+/// Bind two polynomials to the same challenge in one pass.
+/// More efficient than two separate bind calls — single Rayon dispatch.
+pub(crate) fn bind_two_polys_top<F: ff::PrimeField>(
+  poly_a: &mut MultilinearPolynomial<F>,
+  poly_b: &mut MultilinearPolynomial<F>,
+  r: &F,
+) {
+  let n = poly_a.Z.len() / 2;
+  debug_assert_eq!(poly_b.Z.len() / 2, n);
+
+  let (a_lo, a_hi) = poly_a.Z.split_at_mut(n);
+  let (b_lo, b_hi) = poly_b.Z.split_at_mut(n);
+
+  if n >= PAR_THRESHOLD {
+    a_lo
+      .par_iter_mut()
+      .zip(a_hi.par_iter())
+      .zip(b_lo.par_iter_mut())
+      .zip(b_hi.par_iter())
+      .for_each(|(((a_l, a_h), b_l), b_h)| {
+        *a_l += *r * (*a_h - *a_l);
+        *b_l += *r * (*b_h - *b_l);
+      });
+  } else {
+    for i in 0..n {
+      a_lo[i] += *r * (a_hi[i] - a_lo[i]);
+      b_lo[i] += *r * (b_hi[i] - b_lo[i]);
+    }
+  }
+
+  poly_a.Z.truncate(n);
+  poly_b.Z.truncate(n);
+}
+
 /// Bind three polynomials to the same challenge in one pass.
 /// More efficient than three separate bind calls - reduces Rayon dispatches
 /// and uses serial fallback for small polynomials.
@@ -767,10 +801,8 @@ impl<E: Engine> SumcheckProof<E> {
       r_y.push(chals[0]);
 
       // -------- bind polys --------
-      rayon::join(
-        || poly_ABC.bind_poly_var_top(&chals[0]),
-        || poly_z.bind_poly_var_top(&chals[0]),
-      );
+      // Fused 2-poly binding: single Rayon dispatch instead of join
+      bind_two_polys_top(poly_ABC, poly_z, &chals[0]);
 
       // -------- advance claim for next round --------
       claim_current_round = poly.evaluate(&chals[0]);
