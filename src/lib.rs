@@ -34,6 +34,10 @@ pub mod r1cs;
 #[allow(missing_docs)]
 pub mod zk;
 
+/// Verifier circuit gadgets for in-circuit Spartan proof verification.
+#[allow(missing_docs)]
+pub mod verifier_circuit;
+
 /// Lagrange accumulator algorithm for small-value sumcheck optimization (Algorithm 6).
 pub mod lagrange_accumulator;
 

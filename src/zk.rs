@@ -19,7 +19,7 @@ use bellpepper_core::{ConstraintSystem, SynthesisError, num::AllocatedNum};
 use ff::Field;
 
 /// Evaluates a polynomial using Horner's method within R1CS constraints.
-fn eval_poly_horner<E: Engine, CS: ConstraintSystem<E::Scalar>>(
+pub(crate) fn eval_poly_horner<E: Engine, CS: ConstraintSystem<E::Scalar>>(
   mut cs: CS,
   coeffs: &[AllocatedNum<E::Scalar>],
   x: &AllocatedNum<E::Scalar>,
@@ -48,7 +48,7 @@ fn eval_poly_horner<E: Engine, CS: ConstraintSystem<E::Scalar>>(
 }
 
 /// Allocates a new variable fixed to zero and enforces the constraint `z = 0`.
-fn alloc_zero<E: Engine, CS: ConstraintSystem<E::Scalar>>(
+pub(crate) fn alloc_zero<E: Engine, CS: ConstraintSystem<E::Scalar>>(
   mut cs: CS,
 ) -> Result<AllocatedNum<E::Scalar>, SynthesisError> {
   // Allocate with value 0
@@ -64,7 +64,7 @@ fn alloc_zero<E: Engine, CS: ConstraintSystem<E::Scalar>>(
 }
 
 /// Helper function to allocate polynomial coefficients in R1CS constraints.
-fn alloc_coeffs<E: Engine, CS: ConstraintSystem<E::Scalar>>(
+pub(crate) fn alloc_coeffs<E: Engine, CS: ConstraintSystem<E::Scalar>>(
   mut cs: CS,
   coeffs: &[E::Scalar],
 ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
@@ -88,7 +88,7 @@ fn alloc_coeffs<E: Engine, CS: ConstraintSystem<E::Scalar>>(
 ///
 /// # Panics
 /// Panics if `poly` is empty.
-fn enforce_sc_claim<E: Engine, CS: ConstraintSystem<E::Scalar>>(
+pub(crate) fn enforce_sc_claim<E: Engine, CS: ConstraintSystem<E::Scalar>>(
   mut cs: CS,
   poly: &[AllocatedNum<E::Scalar>],
   claim: &AllocatedNum<E::Scalar>,
@@ -111,7 +111,7 @@ fn enforce_sc_claim<E: Engine, CS: ConstraintSystem<E::Scalar>>(
 
 /// Enforces the final check of the outer sum-check of Spartan:
 /// prev_claim = tau_at_rx * (claim_Az*claim_Bz - claim_Cz)
-fn enforce_outer_sc_final_check<E: Engine, CS: ConstraintSystem<E::Scalar>>(
+pub(crate) fn enforce_outer_sc_final_check<E: Engine, CS: ConstraintSystem<E::Scalar>>(
   mut cs: CS,
   claim_Az: &AllocatedNum<E::Scalar>,
   claim_Bz: &AllocatedNum<E::Scalar>,
@@ -134,7 +134,7 @@ fn enforce_outer_sc_final_check<E: Engine, CS: ConstraintSystem<E::Scalar>>(
 }
 
 /// Computes joint_claim = Az + r*Bz + r^2*Cz and returns joint_claim
-fn compute_joint_claim<E: Engine, CS: ConstraintSystem<E::Scalar>>(
+pub(crate) fn compute_joint_claim<E: Engine, CS: ConstraintSystem<E::Scalar>>(
   mut cs: CS,
   Az: &AllocatedNum<E::Scalar>,
   Bz: &AllocatedNum<E::Scalar>,
@@ -169,7 +169,7 @@ fn compute_joint_claim<E: Engine, CS: ConstraintSystem<E::Scalar>>(
 /// eval_z \gets (1-r_y0)*eval_W + r_y0*eval_X
 /// quotient = prev_claim / eval_z
 /// inputize(quotient)
-fn enforce_inner_sc_final_check<E: Engine, CS: ConstraintSystem<E::Scalar>>(
+pub(crate) fn enforce_inner_sc_final_check<E: Engine, CS: ConstraintSystem<E::Scalar>>(
   mut cs: CS,
   r_y0: &AllocatedNum<E::Scalar>,
   eval_W: &AllocatedNum<E::Scalar>,
