@@ -278,6 +278,7 @@ fn repr_low_u64<F: PrimeField>(s: &F) -> u64 {
 /// per bucket addition compared to standard projective. Designed to run without
 /// spawning rayon tasks, making it ideal when the caller already parallelizes.
 fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+
   let curve_a = compute_curve_a::<C>();
   let c = if bases.len() < 4 {
     1
@@ -362,8 +363,9 @@ fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve
   let num_windows = max_num_bits / c + 1;
   let n_scalars = reprs.len();
 
-  // Pre-compute signed digits for all scalars with carry propagation (flat layout)
-  let mut signed_digits = vec![0i32; n_scalars * num_windows];
+  // Pre-compute signed digits in WINDOW-MAJOR layout for cache-friendly access.
+  // Layout: signed_digits[seg * n_scalars + i] — sequential access within each window.
+  let mut signed_digits = vec![0i32; num_windows * n_scalars];
   for (i, repr) in reprs.iter().enumerate() {
     let mut carry = 0u32;
     for seg in 0..num_windows {
@@ -373,50 +375,58 @@ fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve
       } else {
         (raw as i32 - (1i32 << c), 1)
       };
-      signed_digits[i * num_windows + seg] = digit;
+      signed_digits[seg * n_scalars + i] = digit;
       carry = new_carry;
     }
   }
 
   let non_boolean_sum = {
     let num_buckets = half;
-    (0..num_windows)
-      .rev()
-      .fold(C::Curve::identity(), |mut acc, segment| {
-        (0..c).for_each(|_| acc = acc.double());
+    // Allocate buckets once, reuse across windows
+    let mut buckets: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); num_buckets];
+    // Keep accumulator in XYZZ to avoid per-window inversions
+    let mut acc: BucketXYZZ<C::Base> = BucketXYZZ::zero();
 
-        let mut buckets: Vec<BucketXYZZ<C::Base>> = vec![BucketXYZZ::zero(); num_buckets];
+    for segment in (0..num_windows).rev() {
+      // Double acc c times (window shift)
+      (0..c).for_each(|_| acc.double_in_place(curve_a));
 
-        for i in 0..n_scalars {
-          let d = signed_digits[i * num_windows + segment];
-          if d > 0 {
-            bucket_add_affine_xy::<C>(
-              &mut buckets[(d as usize) - 1],
-              pts_x[i],
-              pts_y[i],
-              curve_a,
-            );
-          } else if d < 0 {
-            // Negate the y-coordinate for subtraction
-            bucket_add_affine_xy::<C>(
-              &mut buckets[(-d as usize) - 1],
-              pts_x[i],
-              -pts_y[i],
-              curve_a,
-            );
-          }
+      // Reset buckets (faster than re-allocating)
+      for b in buckets.iter_mut() {
+        *b = BucketXYZZ::zero();
+      }
+
+      let digit_base = segment * n_scalars;
+      for i in 0..n_scalars {
+        let d = signed_digits[digit_base + i];
+        if d > 0 {
+          bucket_add_affine_xy::<C>(
+            &mut buckets[(d as usize) - 1],
+            pts_x[i],
+            pts_y[i],
+            curve_a,
+          );
+        } else if d < 0 {
+          // Negate the y-coordinate for subtraction
+          bucket_add_affine_xy::<C>(
+            &mut buckets[(-d as usize) - 1],
+            pts_x[i],
+            -pts_y[i],
+            curve_a,
+          );
         }
+      }
 
-        // Summation by parts: stay in XYZZ, convert only once per window
-        let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
-        let mut window_acc: BucketXYZZ<C::Base> = BucketXYZZ::zero();
-        for b in buckets.into_iter().rev() {
-          running_sum.add_assign_bucket(&b, curve_a);
-          window_acc.add_assign_bucket(&running_sum, curve_a);
-        }
-        acc += bucket_to_curve::<C>(&window_acc);
-        acc
-      })
+      // Summation by parts: stay in XYZZ throughout
+      let mut running_sum: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+      let mut window_acc: BucketXYZZ<C::Base> = BucketXYZZ::zero();
+      for b in buckets.iter().rev() {
+        running_sum.add_assign_bucket(b, curve_a);
+        window_acc.add_assign_bucket(&running_sum, curve_a);
+      }
+      acc.add_assign_bucket(&window_acc, curve_a);
+    }
+    bucket_to_curve::<C>(&acc)
   };
 
   boolean_sum + non_boolean_sum
