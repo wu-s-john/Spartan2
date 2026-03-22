@@ -725,6 +725,49 @@ mod tests {
     }
 
     #[test]
+    fn test_cpu_msm_variants() {
+        for n in [4096, 8192, 16384, 32768] {
+            test_msm_at_size(n);
+        }
+    }
+
+    fn test_msm_at_size(n: usize) {
+        use halo2curves::{group::Curve, msm::msm_best};
+        let mut rng = OsRng;
+
+        let bases: Vec<pallas::Affine> = (0..n)
+            .map(|_| pallas::Point::random(&mut rng).to_affine())
+            .collect();
+        let scalars: Vec<pallas::Scalar> = (0..n)
+            .map(|_| pallas::Scalar::random(&mut rng))
+            .collect();
+
+        // Warmup
+        let _ = msm::msm(&scalars, &bases).unwrap();
+        let _ = msm_best(&scalars, &bases);
+
+        let mut times = Vec::new();
+        for _ in 0..10 {
+            let start = Instant::now();
+            let _ = msm::msm(&scalars, &bases).unwrap();
+            times.push(start.elapsed());
+        }
+        times.sort();
+
+        let mut times2 = Vec::new();
+        for _ in 0..10 {
+            let start = Instant::now();
+            let _ = msm_best(&scalars, &bases);
+            times2.push(start.elapsed());
+        }
+        times2.sort();
+
+        println!("N={}: serial={:?}, msm_best={:?}, ratio={:.2}x",
+            n, times[5], times2[5],
+            times[5].as_secs_f64() / times2[5].as_secs_f64());
+    }
+
+    #[test]
     fn test_metal_msm_large_scale() {
         use halo2curves::group::Curve;
         let mut rng = OsRng;
