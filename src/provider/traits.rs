@@ -150,6 +150,16 @@ pub trait DlogGroupExt: DlogGroup {
     bits: &[bool],
     bases: &[Self::AffineGroupElement],
   ) -> Result<Self, SpartanError>;
+
+  /// Parallel MSM for standalone contexts (not inside an existing par_iter).
+  /// Uses all available threads. Call this for PCS/IPA prove MSMs.
+  fn vartime_multiscalar_mul_standalone(
+    scalars: &[Self::Scalar],
+    bases: &[Self::AffineGroupElement],
+  ) -> Result<Self, SpartanError> {
+    // Default: delegate to regular MSM
+    Self::vartime_multiscalar_mul(scalars, bases)
+  }
 }
 
 /// Implements Spartan's traits except DlogGroupExt so that the MSM can be implemented differently
@@ -332,6 +342,13 @@ macro_rules! impl_traits {
         bases: &[Self::AffineGroupElement],
       ) -> Result<Self, $crate::errors::SpartanError> {
         msm_bool(bits, bases)
+      }
+
+      fn vartime_multiscalar_mul_standalone(
+        scalars: &[Self::Scalar],
+        bases: &[Self::AffineGroupElement],
+      ) -> Result<Self, $crate::errors::SpartanError> {
+        msm_standalone(scalars, bases)
       }
     }
   };

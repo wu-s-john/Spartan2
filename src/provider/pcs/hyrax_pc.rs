@@ -330,7 +330,9 @@ where
         .into_par_iter()
         .map(|i| L[i] * blind.blind[i])
         .reduce(|| E::Scalar::ZERO, |acc, x| acc + x);
-      let comm_LZ = E::GE::vartime_multiscalar_mul(&LZ, &ck.ck[..LZ.len()])? + ck.h * r_LZ;
+      // Use standalone (parallel) MSM since we're not inside Hyrax par_iter here
+      let comm_LZ =
+        E::GE::vartime_multiscalar_mul_standalone(&LZ, &ck.ck[..LZ.len()])? + ck.h * r_LZ;
 
       info!(elapsed_ms = %commit_t.elapsed().as_millis(), "hyrax_prove_commit");
 
@@ -413,7 +415,9 @@ where
         .into_par_iter()
         .map(|i| L[i] * blind.blind[i])
         .reduce(|| E::Scalar::ZERO, |acc, x| acc + x);
-      let comm_LZ = E::GE::vartime_multiscalar_mul(&LZ, &ck.ck[..LZ.len()])? + ck.h * r_LZ;
+      // Use standalone (parallel) MSM since we're not inside Hyrax par_iter here
+      let comm_LZ =
+        E::GE::vartime_multiscalar_mul_standalone(&LZ, &ck.ck[..LZ.len()])? + ck.h * r_LZ;
 
       info!(elapsed_ms = %commit_t.elapsed().as_millis(), "hyrax_prove_witness_commit");
 

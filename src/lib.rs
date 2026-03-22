@@ -100,7 +100,7 @@ pub(crate) use start_span;
 pub(crate) const MULTIROUND_COMMITMENT_WIDTH: usize = 4;
 
 // The default width used for monolithic commitments.
-pub(crate) const DEFAULT_COMMITMENT_WIDTH: usize = 1024;
+pub(crate) const DEFAULT_COMMITMENT_WIDTH: usize = 4096;
 
 use traits::{Engine, pcs::PCSEngineTrait};
 type CommitmentKey<E> = <<E as traits::Engine>::PCS as PCSEngineTrait<E>>::CommitmentKey;

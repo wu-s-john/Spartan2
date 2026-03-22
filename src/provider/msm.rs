@@ -660,6 +660,24 @@ fn accumulate_bases<C: CurveAffine>(bases: &[C]) -> C::Curve {
 ///
 /// # Errors
 /// Returns `SpartanError::InvalidInputLength` if coeffs and bases have different lengths.
+/// Parallel MSM designed for standalone (non-nested) contexts.
+/// Uses halo2curves' parallel MSM which spawns its own rayon threads.
+/// Call this when NOT inside an existing par_iter (e.g., PCS prove, IPA prove).
+pub fn msm_standalone<C: CurveAffine>(
+  coeffs: &[C::Scalar],
+  bases: &[C],
+) -> Result<C::Curve, SpartanError> {
+  if coeffs.len() != bases.len() {
+    return Err(SpartanError::InvalidInputLength {
+      reason: "MSM: Coefficients and bases must have the same length".to_string(),
+    });
+  }
+  if coeffs.is_empty() {
+    return Ok(C::Curve::identity());
+  }
+  Ok(halo2curves::msm::msm_best(coeffs, bases))
+}
+
 pub fn msm<C: CurveAffine>(
   coeffs: &[C::Scalar],
   bases: &[C],

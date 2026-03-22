@@ -145,7 +145,9 @@ where
     let r_delta = E::Scalar::random(&mut OsRng);
     let r_beta = E::Scalar::random(&mut OsRng);
 
-    let delta = E::GE::vartime_multiscalar_mul(&d_vec, &ck[0..d_vec.len()])? + *h * r_delta;
+    // Use standalone parallel MSM — IPA prove is not inside a par_iter
+    let delta =
+      E::GE::vartime_multiscalar_mul_standalone(&d_vec, &ck[0..d_vec.len()])? + *h * r_delta;
     let beta = E::GE::group(ck_c) * inner_product(&U.b_vec, &d_vec) + *h_c * r_beta;
 
     transcript.absorb(b"delta", &delta);
