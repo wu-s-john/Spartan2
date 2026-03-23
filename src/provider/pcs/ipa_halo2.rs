@@ -547,7 +547,13 @@ where
   /// Fold two accumulators into an [`AccumulatedS`] using challenge `r`.
   ///
   /// Computes `G_new = G₁ + r·G₂` and `s_new = s(ch₁) + r·s(ch₂)`.
-  pub fn fold(acc1: &Self, acc2: &Self, r: &E::Scalar) -> AccumulatedS<E> {
+  ///
+  /// **Security note:** `r` must be derived via Fiat-Shamir (e.g., by absorbing
+  /// both accumulators into a transcript). Use [`fold_all`] for the safe API.
+  /// This method is `pub(crate)` to prevent external callers from supplying
+  /// adversarial `r` values.
+  #[allow(dead_code)]
+  pub(crate) fn fold(acc1: &Self, acc2: &Self, r: &E::Scalar) -> AccumulatedS<E> {
     let s1 = compute_s(&acc1.challenges, &E::Scalar::ONE);
     let s2 = compute_s(&acc2.challenges, &E::Scalar::ONE);
 
@@ -573,10 +579,21 @@ where
     accumulators: &[Self],
     transcript: &mut E::TE,
   ) -> Result<AccumulatedS<E>, SpartanError> {
-    assert!(accumulators.len() >= 2);
+    if accumulators.len() < 2 {
+      return Err(SpartanError::InvalidPCS {
+        reason: format!(
+          "fold_all requires at least 2 accumulators, got {}",
+          accumulators.len()
+        ),
+      });
+    }
 
+    // Absorb both G points AND challenges for each accumulator to fully
+    // bind the Fiat-Shamir randomness. Without challenges, two accumulator
+    // sets with identical G but different challenges produce the same r.
     for acc in accumulators {
       transcript.absorb(b"G", &acc.g);
+      transcript.absorb(b"challenges", &acc.challenges.as_slice());
     }
 
     let mut result = AccumulatedS {
