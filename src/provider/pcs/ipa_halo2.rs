@@ -543,6 +543,97 @@ where
     let expected = E::GE::vartime_multiscalar_mul(&s, &params.g)?;
     Ok(expected == self.g)
   }
+
+  /// Fold two accumulators into an [`AccumulatedS`] using challenge `r`.
+  ///
+  /// Computes `G_new = G₁ + r·G₂` and `s_new = s(ch₁) + r·s(ch₂)`.
+  pub fn fold(acc1: &Self, acc2: &Self, r: &E::Scalar) -> AccumulatedS<E> {
+    let s1 = compute_s(&acc1.challenges, &E::Scalar::ONE);
+    let s2 = compute_s(&acc2.challenges, &E::Scalar::ONE);
+
+    let s_new: Vec<E::Scalar> = s1
+      .par_iter()
+      .zip(s2.par_iter())
+      .map(|(a, b)| *a + *r * *b)
+      .collect();
+
+    let g_new = acc1.g + acc2.g * *r;
+
+    AccumulatedS {
+      s: s_new,
+      g_acc: g_new,
+    }
+  }
+
+  /// Fold N accumulators into one [`AccumulatedS`] using Fiat-Shamir challenges.
+  ///
+  /// The first accumulator enters unscaled; each subsequent one is scaled by
+  /// a fresh challenge squeezed from the transcript.
+  pub fn fold_all(
+    accumulators: &[Self],
+    transcript: &mut E::TE,
+  ) -> Result<AccumulatedS<E>, SpartanError> {
+    assert!(accumulators.len() >= 2);
+
+    for acc in accumulators {
+      transcript.absorb(b"G", &acc.g);
+    }
+
+    let mut result = AccumulatedS {
+      s: compute_s(&accumulators[0].challenges, &E::Scalar::ONE),
+      g_acc: accumulators[0].g,
+    };
+
+    for acc in &accumulators[1..] {
+      let r = transcript.squeeze(b"r_acc")?;
+      result.fold_next(acc, &r);
+    }
+
+    Ok(result)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AccumulatedS — folded accumulator state
+// ---------------------------------------------------------------------------
+
+/// Accumulated s-vector state for the decider.
+///
+/// After folding multiple accumulators, the s vector loses its tensor-product
+/// structure (it can no longer be represented as k challenges) and must be
+/// stored explicitly as a length-n vector.
+pub struct AccumulatedS<E: Engine>
+where
+  E::GE: DlogGroup,
+{
+  /// Combined s-vector: `s₁ + r₂·s₂ + r₃·s₃ + ...`, length `2^k`.
+  pub s: Vec<E::Scalar>,
+  /// Accumulated G point: `G₁ + r₂·G₂ + r₃·G₃ + ...`.
+  pub g_acc: E::GE,
+}
+
+impl<E: Engine> AccumulatedS<E>
+where
+  E::GE: DlogGroupExt,
+{
+  /// Fold another accumulator into this state using challenge `r`.
+  pub fn fold_next(&mut self, acc: &Accumulator<E>, r: &E::Scalar) {
+    let s_acc = compute_s(&acc.challenges, &E::Scalar::ONE);
+    self
+      .s
+      .par_iter_mut()
+      .zip(s_acc.par_iter())
+      .for_each(|(si, sa)| *si += *r * *sa);
+    self.g_acc = self.g_acc + acc.g * *r;
+  }
+
+  /// The decider: verify that `g_acc == MSM(s, params.g)`.
+  ///
+  /// Performs one `O(n)` MSM regardless of how many accumulators were folded.
+  pub fn decide(&self, params: &IpaParams<E>) -> Result<bool, SpartanError> {
+    let expected = E::GE::vartime_multiscalar_mul(&self.s, &params.g)?;
+    Ok(expected == self.g_acc)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -940,5 +1031,124 @@ mod tests {
         "Accumulator {i} decide should pass (it was correct)"
       );
     }
+  }
+
+  // ─── Accumulator fold tests ──────────────────────────────────────────
+
+  /// Helper: create an IPA proof and return the accumulator with correct G.
+  /// Generic over engine.
+  fn make_accumulator<EE: Engine>(
+    params: &IpaParams<EE>,
+  ) -> (Accumulator<EE>, DeferredMSM<EE>)
+  where
+    EE::GE: DlogGroupExt,
+  {
+    let poly: Vec<EE::Scalar> = (0..params.n)
+      .map(|_| EE::Scalar::random(&mut OsRng))
+      .collect();
+    let blind = EE::Scalar::random(&mut OsRng);
+    let commitment = params.commit(&poly, &blind).unwrap();
+    let x = EE::Scalar::random(&mut OsRng);
+    let v = eval_polynomial(&poly, &x);
+
+    let mut pt = EE::TE::new(b"test_ipa");
+    let proof =
+      IpaProof::<EE>::create(params, &mut pt, &poly, &blind, &x, &v, &commitment).unwrap();
+
+    let mut vt = EE::TE::new(b"test_ipa");
+    let guard = proof
+      .verify(params, &mut vt, &commitment, &x, &v)
+      .unwrap();
+
+    let g = guard.compute_g().unwrap();
+    let (msm, acc) = guard.use_g(&g);
+    (acc, msm)
+  }
+
+  fn test_accumulator_fold_two_with<EE: Engine>()
+  where
+    EE::GE: DlogGroupExt,
+  {
+    let k = 4;
+    let params = IpaParams::<EE>::new(k);
+
+    let (acc1, msm1) = make_accumulator::<EE>(&params);
+    let (acc2, msm2) = make_accumulator::<EE>(&params);
+
+    // Individual checks pass
+    assert!(msm1.is_identity().unwrap());
+    assert!(msm2.is_identity().unwrap());
+    assert!(acc1.decide(&params).unwrap());
+    assert!(acc2.decide(&params).unwrap());
+
+    // Fold
+    let r = EE::Scalar::random(&mut OsRng);
+    let folded = Accumulator::<EE>::fold(&acc1, &acc2, &r);
+
+    // Folded decider passes
+    assert!(
+      folded.decide(&params).unwrap(),
+      "Folded accumulator decide should pass"
+    );
+  }
+
+  #[test]
+  fn test_accumulator_fold_two() {
+    test_accumulator_fold_two_with::<PallasHyraxEngine>();
+  }
+
+  fn test_accumulator_fold_seven_with<EE: Engine>()
+  where
+    EE::GE: DlogGroupExt,
+  {
+    let k = 4;
+    let params = IpaParams::<EE>::new(k);
+
+    let mut accumulators = Vec::new();
+    for _ in 0..7 {
+      let (acc, msm) = make_accumulator::<EE>(&params);
+      assert!(msm.is_identity().unwrap());
+      accumulators.push(acc);
+    }
+
+    let mut transcript = EE::TE::new(b"test_fold_all");
+    let folded = Accumulator::<EE>::fold_all(&accumulators, &mut transcript).unwrap();
+
+    assert!(
+      folded.decide(&params).unwrap(),
+      "fold_all of 7 accumulators should decide correctly"
+    );
+  }
+
+  #[test]
+  fn test_accumulator_fold_seven() {
+    test_accumulator_fold_seven_with::<PallasHyraxEngine>();
+  }
+
+  fn test_accumulator_fold_bad_g_with<EE: Engine>()
+  where
+    EE::GE: DlogGroupExt,
+  {
+    let k = 4;
+    let params = IpaParams::<EE>::new(k);
+
+    let (acc1, _) = make_accumulator::<EE>(&params);
+
+    // Create acc2 with a corrupted G
+    let (mut acc2, _) = make_accumulator::<EE>(&params);
+    acc2.g = acc2.g + EE::GE::generator(); // corrupt
+
+    let r = EE::Scalar::random(&mut OsRng);
+    let folded = Accumulator::<EE>::fold(&acc1, &acc2, &r);
+
+    assert!(
+      !folded.decide(&params).unwrap(),
+      "Folded accumulator with bad G should fail decide"
+    );
+  }
+
+  #[test]
+  fn test_accumulator_fold_bad_g() {
+    test_accumulator_fold_bad_g_with::<PallasHyraxEngine>();
   }
 }

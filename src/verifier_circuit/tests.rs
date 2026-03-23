@@ -1,7 +1,14 @@
-use super::gadgets::{enforce_nifs_scalar_fold, enforce_relaxed_r1cs_sat};
-use crate::{r1cs::R1CSShape, traits::Engine};
-use bellpepper_core::{num::AllocatedNum, test_cs::TestConstraintSystem, ConstraintSystem};
-use ff::Field;
+use super::gadgets::{enforce_accumulator_fold, enforce_nifs_scalar_fold, enforce_relaxed_r1cs_sat};
+use crate::{
+  gadgets::ecc::AllocatedPoint,
+  provider::traits::DlogGroupExt,
+  r1cs::R1CSShape,
+  traits::Engine,
+};
+use bellpepper_core::{
+  boolean::AllocatedBit, num::AllocatedNum, test_cs::TestConstraintSystem, ConstraintSystem,
+};
+use ff::{Field, PrimeFieldBits};
 
 type E = crate::provider::PallasHyraxEngine;
 type Scalar = <E as Engine>::Scalar;
@@ -271,4 +278,91 @@ fn test_enforce_relaxed_r1cs_sat_bad_witness() {
     !cs.is_satisfied(),
     "Relaxed R1CS sat with bad E should NOT be satisfied"
   );
+}
+
+// ─── Accumulator fold (EC) tests ────────────────────────────────────────
+
+fn test_enforce_accumulator_fold_with<ECE: Engine>()
+where
+  ECE::GE: DlogGroupExt,
+  ECE::Base: PrimeFieldBits,
+{
+  use crate::provider::traits::DlogGroup;
+
+  let mut rng = rand_core::OsRng;
+
+  // Create two random EC points (simulating G₁, G₂ from accumulators)
+  let g1 = ECE::GE::generator() * ECE::Scalar::random(&mut rng);
+  let g2 = ECE::GE::generator() * ECE::Scalar::random(&mut rng);
+
+  // Random fold challenge — use Base field since the circuit operates over E::Base
+  let r = ECE::Base::random(&mut rng);
+
+  // Native fold: G_out = G₁ + r · G₂
+  // We need r as a scalar (E::Scalar) for native EC ops.
+  // In the cycle, Base of one curve = Scalar of the other.
+  // For the in-circuit test, r is in E::Base (the circuit field).
+  // The scalar_mul gadget uses bits, so we decompose r to bits.
+  let r_bits_native: Vec<bool> = r
+    .to_le_bits()
+    .iter()
+    .by_vals()
+    .collect();
+
+  // Reconstruct r as a scalar for native EC computation
+  let mut r_as_scalar = ECE::Scalar::ZERO;
+  let mut power = ECE::Scalar::ONE;
+  for bit in &r_bits_native {
+    if *bit {
+      r_as_scalar += power;
+    }
+    power = power.double();
+  }
+
+  let g_out_native = g1 + g2 * r_as_scalar;
+
+  // Convert points to coordinates for circuit allocation
+  let g1_coords = g1.to_coordinates();
+  let g2_coords = g2.to_coordinates();
+  let g_out_coords = g_out_native.to_coordinates();
+
+  // Build circuit over E::Base
+  let mut cs = TestConstraintSystem::<ECE::Base>::new();
+
+  let g1_alloc =
+    AllocatedPoint::<ECE>::alloc(cs.namespace(|| "g1"), Some(g1_coords)).unwrap();
+  let g2_alloc =
+    AllocatedPoint::<ECE>::alloc(cs.namespace(|| "g2"), Some(g2_coords)).unwrap();
+  let g_out_alloc =
+    AllocatedPoint::<ECE>::alloc(cs.namespace(|| "g_out"), Some(g_out_coords)).unwrap();
+
+  // Allocate r as bits
+  let r_bits_alloc: Vec<AllocatedBit> = r_bits_native
+    .iter()
+    .enumerate()
+    .map(|(i, b)| {
+      AllocatedBit::alloc(cs.namespace(|| format!("r_bit_{i}")), Some(*b)).unwrap()
+    })
+    .collect();
+
+  enforce_accumulator_fold::<ECE, _>(
+    cs.namespace(|| "acc_fold"),
+    &g1_alloc,
+    &g2_alloc,
+    &r_bits_alloc,
+    &g_out_alloc,
+  )
+  .unwrap();
+
+  assert!(
+    cs.is_satisfied(),
+    "Accumulator fold should be satisfied. First unsatisfied: {:?}",
+    cs.which_is_unsatisfied()
+  );
+}
+
+#[test]
+fn test_enforce_accumulator_fold() {
+  test_enforce_accumulator_fold_with::<crate::provider::PallasHyraxEngine>();
+  test_enforce_accumulator_fold_with::<crate::provider::VestaHyraxEngine>();
 }

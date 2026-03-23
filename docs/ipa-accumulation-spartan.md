@@ -1,0 +1,1 @@
+/home/john-wu/sync-files/blogs/crypto/ipa-accumulation-spartan.md
