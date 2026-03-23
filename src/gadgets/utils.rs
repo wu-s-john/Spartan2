@@ -4,7 +4,7 @@
 //! including conditional selection, bit manipulation, and equality checks.
 
 use bellpepper_core::{
-  boolean::Boolean, num::AllocatedNum, ConstraintSystem, LinearCombination, SynthesisError,
+  ConstraintSystem, LinearCombination, SynthesisError, boolean::Boolean, num::AllocatedNum,
 };
 use ff::{PrimeField, PrimeFieldBits};
 

@@ -23,7 +23,7 @@ use spartan2::{
     data_structures::{ElGamalCiphertext, ElGamalCiphertextVar, PermutationWitnessTrace},
     encryption::{
       NativeReencryptionData, native_reencrypt_parallel, precompute_native_powers,
-      reencrypt_deck_bp,
+      reencrypt_deck_bp_fixed_bases,
     },
     native::run_rs_shuffle_permutation,
     permutation::{IndexPositionPair, IndexedCiphertext, check_grand_product},
@@ -195,7 +195,7 @@ struct RSShuffleReencryptCircuit {
 
 impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
   fn public_values(&self) -> Result<Vec<Scalar>, SynthesisError> {
-    let mut vals = Vec::with_capacity(4 + 2 * self.pk_powers_native.len() + 4 * N * 2);
+    let mut vals = Vec::with_capacity(4 + 4 * N * 2);
 
     // Generator coords
     vals.push(self.gen_coords.0);
@@ -204,12 +204,6 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
     // Public key coords
     vals.push(self.pk_coords.0);
     vals.push(self.pk_coords.1);
-
-    // PK power table coords (public inputs)
-    for &(x, y) in &self.pk_powers_native {
-      vals.push(x);
-      vals.push(y);
-    }
 
     // Input ciphertexts (original order)
     for ct in &self.input_ciphertexts {
@@ -273,27 +267,16 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
     // =========================================================================
 
     // Allocate generator from native powers[0] — public input
-    let _gen_var = alloc_point_public_input::<ECEngine, _>(
+    let gen_var = alloc_point_public_input::<ECEngine, _>(
       cs.namespace(|| "generator"),
       self.gen_powers_native[0],
     )?;
 
     // Allocate public key (non-infinity) — public input
-    let _pk_var = alloc_point_public_input::<ECEngine, _>(
+    let pk_var = alloc_point_public_input::<ECEngine, _>(
       cs.namespace(|| "pk"),
       (self.pk_coords.0, self.pk_coords.1),
     )?;
-
-    // Allocate pk power table — public inputs
-    let num_bits = Scalar::NUM_BITS as usize;
-    let mut pk_powers_vars = Vec::with_capacity(num_bits);
-    for i in 0..num_bits {
-      let p = alloc_point_public_input::<ECEngine, _>(
-        cs.namespace(|| format!("pk_power_{}", i)),
-        self.pk_powers_native[i],
-      )?;
-      pk_powers_vars.push(p);
-    }
 
     // Allocate input ciphertexts (original order, before shuffle) — public inputs
     let mut input_deck_vars = Vec::with_capacity(N);
@@ -305,18 +288,8 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       input_deck_vars.push(ct_var);
     }
 
-    // Allocate shuffled ciphertexts (permuted order)
-    let mut shuffled_deck_vars = Vec::with_capacity(N);
-    for i in 0..N {
-      let src = self.permutation[i];
-      let ct_var = ElGamalCiphertextVar::<ECEngine>::alloc(
-        cs.namespace(|| format!("shuffled_ct_{}", i)),
-        &self.input_ciphertexts[src],
-      )?;
-      shuffled_deck_vars.push(ct_var);
-    }
     let shuffled_deck: [ElGamalCiphertextVar<ECEngine>; N] =
-      shuffled_deck_vars.try_into().ok().unwrap();
+      std::array::from_fn(|i| input_deck_vars[self.permutation[i]].clone());
 
     // Allocate randomization scalars
     let mut rand_vars = Vec::with_capacity(N);
@@ -338,13 +311,15 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleReencryptCircuit {
       .map_err(|_| SynthesisError::Unsatisfiable)?;
 
     // Re-encrypt the deck (includes inputize for output coords)
-    reencrypt_deck_bp::<ECEngine, _, N>(
+    reencrypt_deck_bp_fixed_bases::<ECEngine, _, N>(
       cs,
       &shuffled_deck,
       &rand_arr,
-      &pk_powers_vars,
+      &gen_var,
+      &pk_var,
       &self._native_reencrypt_data,
       &self.gen_powers_native,
+      &self.pk_powers_native,
     )?;
 
     // =========================================================================

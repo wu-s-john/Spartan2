@@ -30,7 +30,10 @@ pub struct SmallToBellpepperCS<'a, Scalar: PrimeField, CS: ConstraintSystem<Scal
 impl<'a, Scalar: PrimeField, CS: ConstraintSystem<Scalar>> SmallToBellpepperCS<'a, Scalar, CS> {
   /// Wrap a bellpepper constraint system.
   pub fn new(cs: &'a mut CS) -> Self {
-    SmallToBellpepperCS { cs, _marker: PhantomData }
+    SmallToBellpepperCS {
+      cs,
+      _marker: PhantomData,
+    }
   }
 
   /// Convert a `SmallLinearCombination<i32>` to a bellpepper `LinearCombination<Scalar>`.
@@ -65,7 +68,11 @@ impl<Scalar: PrimeField, CS: ConstraintSystem<Scalar>> SmallConstraintSystem<i32
   {
     self.cs.alloc(annotation, || {
       let val = f()?;
-      Ok(if val >= 0 { Scalar::from(val as u64) } else { -Scalar::from((-val) as u64) })
+      Ok(if val >= 0 {
+        Scalar::from(val as u64)
+      } else {
+        -Scalar::from((-val) as u64)
+      })
     })
   }
 
@@ -77,7 +84,11 @@ impl<Scalar: PrimeField, CS: ConstraintSystem<Scalar>> SmallConstraintSystem<i32
   {
     self.cs.alloc_input(annotation, || {
       let val = f()?;
-      Ok(if val >= 0 { Scalar::from(val as u64) } else { -Scalar::from((-val) as u64) })
+      Ok(if val >= 0 {
+        Scalar::from(val as u64)
+      } else {
+        -Scalar::from((-val) as u64)
+      })
     })
   }
 

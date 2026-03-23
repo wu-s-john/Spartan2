@@ -6,15 +6,15 @@
 //! Run with:
 //!   cargo run --release --example rs_shuffle_bp_simple
 
-use bellpepper_core::{num::AllocatedNum, ConstraintSystem, SynthesisError};
+use bellpepper_core::{ConstraintSystem, SynthesisError, num::AllocatedNum};
 use std::time::Instant;
 
 use spartan2::{
-  provider::{pasta::pallas, PallasHyraxEngine},
+  provider::{PallasHyraxEngine, pasta::pallas},
   rs_shuffle_bp::{
     data_structures::PermutationWitnessTraceVar,
     native::run_rs_shuffle_permutation,
-    permutation::{check_grand_product, IndexPositionPair},
+    permutation::{IndexPositionPair, check_grand_product},
   },
   spartan::SpartanSNARK,
   traits::{circuit::SpartanCircuit, snark::R1CSSNARKTrait},
@@ -95,7 +95,8 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleCircuit {
     };
 
     // Allocate challenges as public inputs FIRST (required by Spartan protocol)
-    let alpha_var = AllocatedNum::alloc_input(cs.namespace(|| "challenge_alpha"), || Ok(alpha_val))?;
+    let alpha_var =
+      AllocatedNum::alloc_input(cs.namespace(|| "challenge_alpha"), || Ok(alpha_val))?;
     let beta_var = AllocatedNum::alloc_input(cs.namespace(|| "challenge_beta"), || Ok(beta_val))?;
 
     // Re-allocate the witness trace for synthesis (these become "rest" variables)
@@ -117,10 +118,10 @@ impl SpartanCircuit<PallasHyraxEngine> for RSShuffleCircuit {
       // Position is just the array index for sorted rows
       let mut sorted_pairs: Vec<IndexPositionPair<Scalar>> = Vec::with_capacity(N);
       for i in 0..N {
-        let pos =
-          AllocatedNum::alloc(cs.namespace(|| format!("sorted_pos_{}_{}", level, i)), || {
-            Ok(Scalar::from(i as u64))
-          })?;
+        let pos = AllocatedNum::alloc(
+          cs.namespace(|| format!("sorted_pos_{}_{}", level, i)),
+          || Ok(Scalar::from(i as u64)),
+        )?;
         sorted_pairs.push(IndexPositionPair::new(
           witness_var.sorted_levels[level][i].idx.clone(),
           pos,
@@ -172,8 +173,7 @@ fn main() {
   // =========================================================================
   println!("\n--- Setup ---");
   let setup_start = Instant::now();
-  let (pk, vk) =
-    SpartanSNARK::<PallasHyraxEngine>::setup(circuit.clone()).expect("Setup failed");
+  let (pk, vk) = SpartanSNARK::<PallasHyraxEngine>::setup(circuit.clone()).expect("Setup failed");
   let setup_time = setup_start.elapsed();
   println!("  Setup time: {:?}", setup_time);
 

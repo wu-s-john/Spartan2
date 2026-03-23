@@ -56,19 +56,19 @@ where
 
   group.bench_function("prove", |b| {
     b.iter(|| {
-      let prep = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), is_small)
-        .expect("prep_prove failed");
-      let proof = SpartanSNARK::<E>::prove(&pk, circuit.clone(), &prep, is_small)
-        .expect("prove failed");
+      let prep =
+        SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), is_small).expect("prep_prove failed");
+      let proof =
+        SpartanSNARK::<E>::prove(&pk, circuit.clone(), &prep, is_small).expect("prove failed");
       proof
     });
   });
 
   group.bench_function("verify", |b| {
-    let prep = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), is_small)
-      .expect("prep_prove failed");
-    let proof = SpartanSNARK::<E>::prove(&pk, circuit.clone(), &prep, is_small)
-      .expect("prove failed");
+    let prep =
+      SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), is_small).expect("prep_prove failed");
+    let proof =
+      SpartanSNARK::<E>::prove(&pk, circuit.clone(), &prep, is_small).expect("prove failed");
     b.iter(|| {
       proof.verify(&vk).expect("verify failed");
     });

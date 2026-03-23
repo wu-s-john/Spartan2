@@ -23,7 +23,7 @@ use crate::{
     eq::{EqPolynomial, compute_suffix_eq_pyramid},
     multilinear::MultilinearPolynomial,
   },
-  small_field::{DelayedReduction, SmallValueField, WitnessValue, WideMul},
+  small_field::{DelayedReduction, SmallValueField, WideMul, WitnessValue},
 };
 use ff::PrimeField;
 use rayon::prelude::*;
@@ -81,13 +81,8 @@ where
     + DelayedReduction<F>
     + Send
     + Sync,
-  SmallValue: WideMul
-    + Copy
-    + Default
-    + Add<Output = SmallValue>
-    + Sub<Output = SmallValue>
-    + Send
-    + Sync,
+  SmallValue:
+    WideMul + Copy + Default + Add<Output = SmallValue> + Sub<Output = SmallValue> + Send + Sync,
 {
   let base: usize = 3; // D + 1 = 2 + 1 = 3
   let l = az.Z.len().trailing_zeros() as usize;
@@ -325,13 +320,8 @@ where
     + DelayedReduction<F>
     + Send
     + Sync,
-  SmallValue: WideMul
-    + Copy
-    + Default
-    + Add<Output = SmallValue>
-    + Sub<Output = SmallValue>
-    + Send
-    + Sync,
+  SmallValue:
+    WideMul + Copy + Default + Add<Output = SmallValue> + Sub<Output = SmallValue> + Send + Sync,
 {
   let n = a_layers.len();
   let ell_b = n.trailing_zeros() as usize; // ℓ_b = log2(n)

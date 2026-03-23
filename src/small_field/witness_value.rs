@@ -9,8 +9,7 @@
 //! This trait abstracts over the witness representation (bool, i8) so that
 //! the commit/prove/bind pipeline is generic over the witness type.
 
-use crate::errors::SpartanError;
-use crate::provider::traits::DlogGroupExt;
+use crate::{errors::SpartanError, provider::traits::DlogGroupExt};
 use ff::PrimeField;
 
 /// Trait for witness value types that can be committed and used in sumcheck.
@@ -22,7 +21,10 @@ use ff::PrimeField;
 /// witnesses, the extension type is `i8`.
 pub trait WitnessValue: Copy + Default + PartialEq + Send + Sync + 'static {
   /// The extended type after Lagrange interpolation.
-  type Extended: Copy + Default + Send + Sync
+  type Extended: Copy
+    + Default
+    + Send
+    + Sync
     + std::ops::Add<Output = Self::Extended>
     + std::ops::Sub<Output = Self::Extended>;
 
@@ -92,10 +94,10 @@ impl WitnessValue for bool {
   #[inline(always)]
   fn eval_2_contribution<F: PrimeField>(hi: bool, lo: bool, a_bound: F) -> F {
     match (hi, lo) {
-      (false, false) => F::ZERO,   // z_bound = 0
-      (false, true)  => -a_bound,  // z_bound = -1
-      (true,  false) => a_bound + a_bound, // z_bound = 2
-      (true,  true)  => a_bound,   // z_bound = 1
+      (false, false) => F::ZERO,          // z_bound = 0
+      (false, true) => -a_bound,          // z_bound = -1
+      (true, false) => a_bound + a_bound, // z_bound = 2
+      (true, true) => a_bound,            // z_bound = 1
     }
   }
 
@@ -104,10 +106,10 @@ impl WitnessValue for bool {
   #[inline(always)]
   fn leading_contribution<F: PrimeField>(hi: bool, lo: bool, da: F) -> F {
     match (hi, lo) {
-      (false, false) => F::ZERO,  // dz = 0
-      (false, true)  => -da,      // dz = -1
-      (true,  false) => da,       // dz = 1
-      (true,  true)  => F::ZERO,  // dz = 0
+      (false, false) => F::ZERO, // dz = 0
+      (false, true) => -da,      // dz = -1
+      (true, false) => da,       // dz = 1
+      (true, true) => F::ZERO,   // dz = 0
     }
   }
 
@@ -117,9 +119,9 @@ impl WitnessValue for bool {
   fn bind_lo_hi<F: PrimeField>(lo: bool, hi: bool, r: F, one_minus_r: F) -> F {
     match (lo, hi) {
       (false, false) => F::ZERO,
-      (false, true)  => r,
-      (true,  false) => one_minus_r,
-      (true,  true)  => F::ONE,
+      (false, true) => r,
+      (true, false) => one_minus_r,
+      (true, true) => F::ONE,
     }
   }
 }

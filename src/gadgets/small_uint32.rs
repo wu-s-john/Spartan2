@@ -20,8 +20,10 @@
 
 use bellpepper_core::SynthesisError;
 
-use crate::gadgets::small_boolean::{Double, NegOne, SmallBit, SmallBoolean};
-use crate::small_constraint_system::SmallConstraintSystem;
+use crate::{
+  gadgets::small_boolean::{Double, NegOne, SmallBit, SmallBoolean},
+  small_constraint_system::SmallConstraintSystem,
+};
 
 /// A 32-bit unsigned integer for circuits with small-value optimization.
 #[derive(Clone, Debug)]
@@ -148,12 +150,7 @@ impl SmallUInt32 {
   }
 
   /// SHA-256 CH function: (a AND b) XOR ((NOT a) AND c)
-  pub fn sha256_ch<V, CS>(
-    mut cs: CS,
-    a: &Self,
-    b: &Self,
-    c: &Self,
-  ) -> Result<Self, SynthesisError>
+  pub fn sha256_ch<V, CS>(mut cs: CS, a: &Self, b: &Self, c: &Self) -> Result<Self, SynthesisError>
   where
     V: Copy + From<bool> + NegOne,
     CS: SmallConstraintSystem<V>,
@@ -164,8 +161,7 @@ impl SmallUInt32 {
       .zip(a.bits.iter().zip(b.bits.iter()).zip(c.bits.iter()))
       .enumerate()
     {
-      *slot =
-        SmallBoolean::sha256_ch(cs.namespace(|| format!("b{i}")).inner, a_bit, b_bit, c_bit)?;
+      *slot = SmallBoolean::sha256_ch(cs.namespace(|| format!("b{i}")).inner, a_bit, b_bit, c_bit)?;
     }
 
     Ok(SmallUInt32 {
@@ -180,12 +176,7 @@ impl SmallUInt32 {
   ///
   /// Optimized identity: Maj(a,b,c) = (a & b) ^ (c & (a ^ b))
   /// This uses 2 AND + 2 XOR per bit instead of 3 AND + 2 XOR.
-  pub fn sha256_maj<V, CS>(
-    mut cs: CS,
-    a: &Self,
-    b: &Self,
-    c: &Self,
-  ) -> Result<Self, SynthesisError>
+  pub fn sha256_maj<V, CS>(mut cs: CS, a: &Self, b: &Self, c: &Self) -> Result<Self, SynthesisError>
   where
     V: Copy + From<bool> + NegOne + Double,
     CS: SmallConstraintSystem<V>,

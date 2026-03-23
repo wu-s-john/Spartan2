@@ -16,13 +16,13 @@ use crate::{
     r1cs::{MultiRoundSpartanWitness, MultiRoundState},
     solver::SatisfyingAssignment,
   },
-  small_field::DelayedReduction,
   errors::SpartanError,
   polys::{
     multilinear::MultilinearPolynomial,
     univariate::{CompressedUniPoly, UniPoly},
   },
   r1cs::SplitMultiRoundR1CSShape,
+  small_field::DelayedReduction,
   start_span,
   traits::{Engine, transcript::TranscriptEngineTrait},
   zk::{NeutronNovaVerifierCircuit, SpartanVerifierCircuit},
@@ -378,7 +378,9 @@ impl<E: Engine> SumcheckProof<E> {
           // No dd term — A*D is only degree 2
           let inner_leading = db * dc;
           <E::Scalar as DelayedReduction<E::Scalar>>::unreduced_multiply_accumulate(
-            &mut acc.1, &da, &inner_leading,
+            &mut acc.1,
+            &da,
+            &inner_leading,
           );
 
           // p(-1): a_neg * (b_neg * c_neg - d_neg)
@@ -1287,8 +1289,7 @@ pub(crate) mod eq_sumcheck {
               let inner_0_red = <E::Scalar as DelayedReduction<E::Scalar>>::reduce(&inner_0);
               let inner_leading_red =
                 <E::Scalar as DelayedReduction<E::Scalar>>::reduce(&inner_leading);
-              let inner_neg1_red =
-                <E::Scalar as DelayedReduction<E::Scalar>>::reduce(&inner_neg1);
+              let inner_neg1_red = <E::Scalar as DelayedReduction<E::Scalar>>::reduce(&inner_neg1);
 
               // Accumulate E_out * inner_reduced in wide limbs (NO REDUCTION)
               <E::Scalar as DelayedReduction<E::Scalar>>::unreduced_multiply_accumulate(
@@ -1414,12 +1415,7 @@ pub(crate) mod eq_sumcheck {
     }
 
     #[inline]
-    fn update_evals(
-      &self,
-      q0: &mut E::Scalar,
-      q_leading: &mut E::Scalar,
-      q_neg1: &mut E::Scalar,
-    ) {
+    fn update_evals(&self, q0: &mut E::Scalar, q_leading: &mut E::Scalar, q_neg1: &mut E::Scalar) {
       let p = self.eval_eq_left;
       // Invariant: self.round is always >= 1 when this is called from evaluation_points methods
       let (eq_0, eq_leading, eq_neg1) = self.eq_tau_0_leading_neg1[self.round - 1];

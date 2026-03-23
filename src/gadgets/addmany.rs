@@ -13,8 +13,10 @@
 //!   Used by NoBatchEq for the pure-integer proving path.
 
 use super::{small_multi_eq::SmallMultiEq, small_uint32::SmallUInt32};
-use crate::gadgets::small_boolean::{SmallBit, SmallBoolean};
-use crate::small_constraint_system::SmallLinearCombination;
+use crate::{
+  gadgets::small_boolean::{SmallBit, SmallBoolean},
+  small_constraint_system::SmallLinearCombination,
+};
 use bellpepper_core::SynthesisError;
 
 /// 16-bit limbed addition for i32/i8 path.
@@ -27,10 +29,7 @@ use bellpepper_core::SynthesisError;
 ///
 /// Constraint 2 (high limb):
 ///   Σ(operand_hi) + carry = result_hi + overflow × 2^16
-pub(crate) fn limbed<M>(
-  cs: &mut M,
-  operands: &[SmallUInt32],
-) -> Result<SmallUInt32, SynthesisError>
+pub(crate) fn limbed<M>(cs: &mut M, operands: &[SmallUInt32]) -> Result<SmallUInt32, SynthesisError>
 where
   M: SmallMultiEq<i32>,
 {
@@ -213,11 +212,7 @@ where
 /// - `Constant(true)` → add coeff to ONE term
 /// - `Is(bit)` → add coeff * bit
 /// - `Not(bit)` → add coeff * ONE, add -coeff * bit
-fn add_boolean_to_lc(
-  lc: &mut SmallLinearCombination<i32>,
-  boolean: &SmallBoolean,
-  coeff: i32,
-) {
+fn add_boolean_to_lc(lc: &mut SmallLinearCombination<i32>, boolean: &SmallBoolean, coeff: i32) {
   use bellpepper_core::Index;
   let one_var = bellpepper_core::Variable::new_unchecked(Index::Input(0));
   match boolean {
