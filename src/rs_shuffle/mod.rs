@@ -40,13 +40,13 @@ pub mod poseidon;
 
 // Re-export main types and functions
 pub use data_structures::{
-    ElGamalCiphertext, ElGamalCiphertextVar, PermutationWitnessTrace, PermutationWitnessTraceVar,
-    SortedRow, SortedRowVar, UnsortedRow, UnsortedRowVar,
+  ElGamalCiphertext, ElGamalCiphertextVar, PermutationWitnessTrace, PermutationWitnessTraceVar,
+  SortedRow, SortedRowVar, UnsortedRow, UnsortedRowVar,
 };
 
 pub use gadget::{rs_shuffle, rs_shuffle_with_reencryption};
 
-pub use native::{prepare_rs_witness_trace, run_rs_shuffle_permutation, RSShuffleTrace};
+pub use native::{RSShuffleTrace, prepare_rs_witness_trace, run_rs_shuffle_permutation};
 
 pub use encryption::ElGamalEncryption;
 

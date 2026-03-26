@@ -34,7 +34,7 @@ use crate::{
     derive_t1,
   },
   polys::{eq::EqPolynomial, multilinear::MultilinearPolynomial, univariate::UniPoly},
-  small_field::{DelayedReduction, SmallValueField, WitnessValue, WideMul},
+  small_field::{DelayedReduction, SmallValueField, WideMul, WitnessValue},
   start_span,
   sumcheck::{SumcheckProof, eq_sumcheck},
   traits::{Engine, transcript::TranscriptEngineTrait},
@@ -391,9 +391,7 @@ where
 
         // p(0): field × witness accumulation
         <E::Scalar as DelayedReduction<W>>::unreduced_multiply_accumulate(
-          &mut acc.0,
-          &a_low,
-          &z_lo,
+          &mut acc.0, &a_low, &z_lo,
         );
 
         // leading coeff: (a_high - a_low) × (z_hi - z_lo)
@@ -412,7 +410,10 @@ where
       },
     );
 
-  (<E::Scalar as DelayedReduction<W>>::reduce(&acc_0), acc_leading)
+  (
+    <E::Scalar as DelayedReduction<W>>::reduce(&acc_0),
+    acc_leading,
+  )
 }
 
 /// Bind a witness z polynomial with challenge r, producing field elements.
@@ -423,9 +424,7 @@ fn bind_witness_z<F: PrimeField, W: WitnessValue>(z: &[W], r: &F) -> Vec<F> {
   let len = z.len() / 2;
   let one_minus_r = F::ONE - *r;
 
-  let compute = |i: usize| -> F {
-    W::bind_lo_hi(z[i], z[len + i], *r, one_minus_r)
-  };
+  let compute = |i: usize| -> F { W::bind_lo_hi(z[i], z[len + i], *r, one_minus_r) };
 
   if len >= PAR_THRESHOLD {
     (0..len).into_par_iter().map(compute).collect()
@@ -455,8 +454,7 @@ where
   let mut claim_per_round = *claim;
 
   // === Round 0: witness z fast path ===
-  let (p0, leading) =
-    compute_eval_points_quad_witness_z::<E, W>(poly_A, z);
+  let (p0, leading) = compute_eval_points_quad_witness_z::<E, W>(poly_A, z);
 
   let poly = UniPoly::from_evals_deg2(p0, leading, claim_per_round);
 
@@ -476,8 +474,7 @@ where
     let (_round_span, round_t) = start_span!("sumcheck_quad_round", round = round);
 
     let poly = {
-      let (p0, leading) =
-        SumcheckProof::<E>::compute_eval_points_quad(poly_A, &poly_B);
+      let (p0, leading) = SumcheckProof::<E>::compute_eval_points_quad(poly_A, &poly_B);
 
       UniPoly::from_evals_deg2(p0, leading, claim_per_round)
     };
@@ -497,11 +494,7 @@ where
     info!(elapsed_ms = %round_t.elapsed().as_millis(), round = round, "sumcheck_quad_round");
   }
 
-  Ok((
-    SumcheckProof::new(polys),
-    r,
-    vec![poly_A[0], poly_B[0]],
-  ))
+  Ok((SumcheckProof::new(polys), r, vec![poly_A[0], poly_B[0]]))
 }
 
 /// Batch-bind l0 top variables of M̃ (field) and z (witness) using eq-weighted accumulation.
@@ -648,8 +641,7 @@ where
 
   // ===== Transition: bind M̃ and z by l0 challenges =====
   let (_bind_span, bind_t) = start_span!("bind_inner_transition");
-  let (mut poly_M_bound, mut poly_z_bound) =
-    bind_inner_polys_batched(poly_M, z, &r[..l0]);
+  let (mut poly_M_bound, mut poly_z_bound) = bind_inner_polys_batched(poly_M, z, &r[..l0]);
   info!(elapsed_ms = %bind_t.elapsed().as_millis(), "bind_inner_transition");
 
   // ===== Remaining rounds (l0 to num_rounds-1): standard quadratic =====
@@ -766,7 +758,8 @@ mod tests {
         eq_instance.evaluation_points_cubic_with_three_inputs(round, &poly_A, &poly_B, &poly_C);
 
       // Build the reference polynomial from BDDT values
-      let expected_poly = UniPoly::from_evals_deg3(expected_p0, expected_leading, expected_neg1, claim);
+      let expected_poly =
+        UniPoly::from_evals_deg3(expected_p0, expected_leading, expected_neg1, claim);
 
       // Build small-value polynomial
       let li = small_value.eq_round_values(tau_round);
@@ -1132,9 +1125,21 @@ mod tests {
 
     // Evaluate M̃ and z at r_v to check final claim
     let eq_evals = EqPolynomial::evals_from_points(&r_v);
-    let m_eval: F = eq_evals.iter().zip(poly_M_vals.iter()).map(|(&e, &m)| e * m).sum();
+    let m_eval: F = eq_evals
+      .iter()
+      .zip(poly_M_vals.iter())
+      .map(|(&e, &m)| e * m)
+      .sum();
     let z_field: Vec<F> = z_bool.iter().map(|&z| F::from(z as u64)).collect();
-    let z_eval: F = eq_evals.iter().zip(z_field.iter()).map(|(&e, &z)| e * z).sum();
-    assert_eq!(final_claim, m_eval * z_eval, "final claim should match M̃(r) · z(r)");
+    let z_eval: F = eq_evals
+      .iter()
+      .zip(z_field.iter())
+      .map(|(&e, &z)| e * z)
+      .sum();
+    assert_eq!(
+      final_claim,
+      m_eval * z_eval,
+      "final claim should match M̃(r) · z(r)"
+    );
   }
 }

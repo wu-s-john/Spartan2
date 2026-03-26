@@ -146,8 +146,7 @@ where
     .collect();
 
   // Convert to arrays
-  let uns_levels: [[UnsortedRow; N]; LEVELS] =
-    std::array::from_fn(|i| level_results[i].0.clone());
+  let uns_levels: [[UnsortedRow; N]; LEVELS] = std::array::from_fn(|i| level_results[i].0.clone());
   let next_levels: [[SortedRow; N]; LEVELS] = std::array::from_fn(|i| level_results[i].1.clone());
 
   (

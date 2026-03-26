@@ -457,7 +457,11 @@ mod tests {
 
     for i in 0..100 {
       let field = Scalar::random(&mut rng);
-      let value: i8 = if i % 2 == 0 { (i % 3) as i8 } else { -((i % 3) as i8) };
+      let value: i8 = if i % 2 == 0 {
+        (i % 3) as i8
+      } else {
+        -((i % 3) as i8)
+      };
 
       <Scalar as DelayedReduction<i8>>::unreduced_multiply_accumulate(&mut acc, &field, &value);
       let field_value = match value {

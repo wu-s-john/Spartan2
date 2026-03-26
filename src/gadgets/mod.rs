@@ -37,10 +37,7 @@ pub use small_boolean::{SmallBit, SmallBoolean};
 pub use small_keccak::small_keccak256;
 pub use small_multi_eq::{BatchingEq, NoBatchEq, SmallMultiEq};
 pub use small_sha256::{
-  small_sha256,
-  small_sha256_int,
-  small_sha256_int_with_prefix,
-  small_sha256_with_prefix,
+  small_sha256, small_sha256_int, small_sha256_int_with_prefix, small_sha256_with_prefix,
   small_sha256_with_small_multi_eq,
 };
 pub use small_uint32::SmallUInt32;

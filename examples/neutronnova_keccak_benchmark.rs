@@ -32,7 +32,9 @@ use spartan2::{
     NEUTRONNOVA_PHASES, NEUTRONNOVA_ZK_PROVE_PHASES, TimingData, TimingLayer, clear_timings,
     normalize_parallel_timings, print_table, snapshot_timings,
   },
-  traits::{Engine, circuit::SpartanCircuit, pcs::FoldingEngineTrait, transcript::TranscriptEngineTrait},
+  traits::{
+    Engine, circuit::SpartanCircuit, pcs::FoldingEngineTrait, transcript::TranscriptEngineTrait,
+  },
   zk::NeutronNovaVerifierCircuit,
 };
 use std::{collections::HashMap, time::Instant};
@@ -184,8 +186,7 @@ fn verify_snark<E: Engine>(
   let mode = if l0 > 0 { "small-value" } else { "large-value" };
   let prep =
     NeutronNovaZkSNARK::<E>::prep_prove(pk, circuits, core_circuit, l0).expect("prep_prove");
-  let snark =
-    NeutronNovaZkSNARK::<E>::prove(pk, circuits, core_circuit, &prep, l0).expect("prove");
+  let snark = NeutronNovaZkSNARK::<E>::prove(pk, circuits, core_circuit, &prep, l0).expect("prove");
   let res = snark.verify(vk, num_instances);
   assert!(res.is_ok(), "Verification failed: {:?}", res.err());
   eprintln!("  verified: yes ({})", mode);
@@ -237,12 +238,11 @@ fn benchmark_nifs_prove<E: Engine>(
     let t_total = Instant::now();
 
     // Witness generation: prep_prove
-    let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0)
-      .expect("prep_prove");
+    let prep =
+      NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0).expect("prep_prove");
 
     // Witness generation: synthesize instances
-    let (instances, witnesses) =
-      generate_instances_and_witnesses(&pk, &prep, &circuits, l0);
+    let (instances, witnesses) = generate_instances_and_witnesses(&pk, &prep, &circuits, l0);
 
     // NIFS prove
     nifs_prove_single(&pk, &instances, &witnesses, l0);
@@ -313,10 +313,10 @@ fn benchmark_zk_prove<E: Engine>(
     let t_total = Instant::now();
 
     // Full ZK prove
-    let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0)
-      .expect("prep_prove");
-    let snark = NeutronNovaZkSNARK::<E>::prove(&pk, &circuits, &core_circuit, &prep, l0)
-      .expect("prove");
+    let prep =
+      NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0).expect("prep_prove");
+    let snark =
+      NeutronNovaZkSNARK::<E>::prove(&pk, &circuits, &core_circuit, &prep, l0).expect("prove");
 
     let total_ms = t_total.elapsed().as_millis();
     info!(elapsed_ms = total_ms as u64, "end_to_end_total");

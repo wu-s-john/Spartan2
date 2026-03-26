@@ -19,8 +19,7 @@ use crate::{
   errors::SpartanError,
   r1cs::{SplitR1CSInstance, SplitR1CSShape},
   small_constraint_system::{
-    SmallCoeff, SmallSatisfyingAssignment, SmallShapeCS,
-    circuit::SmallSpartanCircuit,
+    SmallCoeff, SmallSatisfyingAssignment, SmallShapeCS, circuit::SmallSpartanCircuit,
   },
   start_span,
   traits::{Engine, pcs::PCSEngineTrait, transcript::TranscriptEngineTrait},

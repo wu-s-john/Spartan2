@@ -6,7 +6,7 @@
 //! for a random challenge r.
 
 use crate::traits::Engine;
-use bellpepper_core::{num::AllocatedNum, ConstraintSystem, SynthesisError};
+use bellpepper_core::{ConstraintSystem, SynthesisError, num::AllocatedNum};
 use ff::PrimeField;
 
 /// Trait for types that can be compressed into a field element for permutation products
@@ -45,7 +45,10 @@ impl<F: PrimeField> IndexPositionPair<F> {
     // Compute alpha * idx
     let alpha_idx = AllocatedNum::alloc(cs.namespace(|| "alpha_idx"), || {
       let a = alpha.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let i = self.idx.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let i = self
+        .idx
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(a * i)
     })?;
     cs.enforce(
@@ -58,7 +61,10 @@ impl<F: PrimeField> IndexPositionPair<F> {
     // Compute beta * pos
     let beta_pos = AllocatedNum::alloc(cs.namespace(|| "beta_pos"), || {
       let b = beta.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let p = self.pos.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let p = self
+        .pos
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(b * p)
     })?;
     cs.enforce(
@@ -137,7 +143,10 @@ impl<F: PrimeField> PermutationProduct<F, 5> for IndexedCiphertext<F> {
       let c = challenges[0]
         .get_value()
         .ok_or(SynthesisError::AssignmentMissing)?;
-      let v = self.idx.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let v = self
+        .idx
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(c * v)
     })?;
     cs.enforce(

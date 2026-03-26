@@ -134,7 +134,8 @@ fn run_benchmark<E: Engine>(
 
       // Setup small (once, cached)
       let t0 = Instant::now();
-      let pk_small = SpartanSNARK::<E>::setup_small::<i32, _>(&circuit, &vk).expect("setup_small failed");
+      let pk_small =
+        SpartanSNARK::<E>::setup_small::<i32, _>(&circuit, &vk).expect("setup_small failed");
       let setup_small_ms = t0.elapsed().as_millis() as u64;
       info!(elapsed_ms = setup_small_ms, "setup_small");
 

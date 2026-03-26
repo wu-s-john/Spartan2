@@ -14,9 +14,9 @@ use crate::{
   traits::{Engine, Group},
 };
 use bellpepper_core::{
+  ConstraintSystem, SynthesisError,
   boolean::{AllocatedBit, Boolean},
   num::AllocatedNum,
-  ConstraintSystem, SynthesisError,
 };
 use ff::{Field, PrimeField};
 
@@ -94,7 +94,10 @@ where
         if a_is_zero {
           Ok(x_cube_val + b)
         } else {
-          let x_val = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+          let x_val = self
+            .x
+            .get_value()
+            .ok_or(SynthesisError::AssignmentMissing)?;
           Ok(x_cube_val + x_val * a + b)
         }
       }
@@ -143,7 +146,10 @@ where
   /// Negates the provided point
   pub fn negate<CS: ConstraintSystem<E::Base>>(&self, mut cs: CS) -> Result<Self, SynthesisError> {
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
-      let y_val = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let y_val = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(-y_val)
     })?;
 
@@ -284,13 +290,25 @@ where
         E::Base::ONE
       } else {
         // Set to the actual inverse
-        let other_x = other.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-        let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let other_x = other
+          .x
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
+        let self_x = self
+          .x
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
         (other_x - self_x).invert().unwrap()
       };
 
-      let other_y = other.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let other_y = other
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok((other_y - self_y) * x_diff_inv)
     })?;
     cs.enforce(
@@ -304,9 +322,17 @@ where
     // x = lambda * lambda - self.x - other.x;
     //************************************************************************/
     let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let other_x = other.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let other_x = other
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * lambda_val - self_x - other_x)
     })?;
     cs.enforce(
@@ -320,10 +346,18 @@ where
     // y = lambda * (self.x - x) - self.y;
     //************************************************************************/
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       let x_val = x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * (self_x - x_val) - self_y)
     })?;
 
@@ -400,7 +434,10 @@ where
 
     // Compute tmp = (E::Base::ONE + E::Base::ONE)* self.y ? self != inf : 1
     let tmp_actual = AllocatedNum::alloc(cs.namespace(|| "tmp_actual"), || {
-      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(self_y + self_y)
     })?;
     cs.enforce(
@@ -415,7 +452,10 @@ where
     // Now compute lambda as (E::Base::from(3) * self.x * self.x + E::GE::A()) * tmp_inv
 
     let prod_1 = AllocatedNum::alloc(cs.namespace(|| "alloc prod 1"), || {
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(E::Base::from(3) * self_x * self_x)
     })?;
     cs.enforce(
@@ -439,7 +479,9 @@ where
         tmp_val.invert().unwrap()
       };
 
-      let prod_1_val = prod_1.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let prod_1_val = prod_1
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       if a_is_zero {
         Ok(tmp_inv * prod_1_val)
       } else {
@@ -469,8 +511,13 @@ where
     /*************************************************************/
 
     let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok((lambda_val * lambda_val) - self_x - self_x)
     })?;
     cs.enforce(
@@ -485,10 +532,18 @@ where
     /*************************************************************/
 
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       let x_val = x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * (self_x - x_val) - self_y)
     })?;
     cs.enforce(
@@ -697,8 +752,14 @@ where
       if is_inf == E::Base::ONE {
         Ok(E::Base::ONE) // bogus value when self is infinity
       } else {
-        let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-        let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let self_x = self
+          .x
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
+        let self_y = self
+          .y
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
         Ok((other_y - self_y) * (other_x - self_x).invert().unwrap())
       }
     })?;
@@ -712,7 +773,10 @@ where
       if is_inf == E::Base::ONE {
         Ok(E::Base::ONE)
       } else {
-        let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let self_x = self
+          .x
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
         Ok(other_x - self_x)
       }
     })?;
@@ -739,7 +803,10 @@ where
       if is_inf == E::Base::ONE {
         Ok(E::Base::ZERO)
       } else {
-        let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let self_y = self
+          .y
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
         Ok(other_y - self_y)
       }
     })?;
@@ -760,8 +827,13 @@ where
 
     // x_result = lambda² - self.x - other_x
     let x_computed = AllocatedNum::alloc(cs.namespace(|| "x_computed"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * lambda_val - self_x - other_x)
     })?;
     cs.enforce(
@@ -773,10 +845,20 @@ where
 
     // y_computed = lambda * (self.x - x_computed) - self.y
     let y_computed = AllocatedNum::alloc(cs.namespace(|| "y_computed"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let x_val = x_computed.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let x_val = x_computed
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * (self_x - x_val) - self_y)
     })?;
 
@@ -850,13 +932,25 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
   {
     // allocate a free variable that an honest prover sets to lambda = (y2-y1)/(x2-x1)
     let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
-      let other_x = other.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let other_x = other
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       if other_x == self_x {
         Ok(E::Base::ONE)
       } else {
-        let other_y = other.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-        let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let other_y = other
+          .y
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
+        let self_y = self
+          .y
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
         Ok((other_y - self_y) * (other_x - self_x).invert().unwrap())
       }
     })?;
@@ -871,9 +965,17 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
     // x = lambda * lambda - self.x - other.x;
     //************************************************************************/
     let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let other_x = other.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let other_x = other
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * lambda_val - self_x - other_x)
     })?;
     cs.enforce(
@@ -887,10 +989,18 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
     // y = lambda * (self.x - x) - self.y;
     //************************************************************************/
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       let x_val = x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * (self_x - x_val) - self_y)
     })?;
 
@@ -913,13 +1023,25 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
   {
     // lambda = (-other.y - self.y) / (other.x - self.x)
     let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
-      let other_x = other.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let other_x = other
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       if other_x == self_x {
         Ok(E::Base::ONE)
       } else {
-        let other_y = other.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-        let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let other_y = other
+          .y
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
+        let self_y = self
+          .y
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
         Ok((-other_y - self_y) * (other_x - self_x).invert().unwrap())
       }
     })?;
@@ -933,9 +1055,17 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
 
     // x = lambda² - self.x - other.x
     let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let other_x = other.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let other_x = other
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * lambda_val - self_x - other_x)
     })?;
     cs.enforce(
@@ -947,10 +1077,18 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
 
     // y = lambda * (self.x - x) - self.y
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       let x_val = x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * (self_x - x_val) - self_y)
     })?;
     cs.enforce(
@@ -977,7 +1115,10 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
 
     let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
       let x_sq_val = x_sq.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       let n = if a_is_zero {
         E::Base::from(3) * x_sq_val
       } else {
@@ -1009,8 +1150,13 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
     }
 
     let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * lambda_val - self_x - self_x)
     })?;
 
@@ -1022,10 +1168,18 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
     );
 
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       let x_val = x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * (self_x - x_val) - self_y)
     })?;
 
@@ -1054,8 +1208,14 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
 
     // lambda = (other_y - self.y) / (other_x - self.x)
     let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       if other_x == self_x {
         Ok(E::Base::ONE)
       } else {
@@ -1074,8 +1234,13 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
 
     // x = lambda² - self.x - other_x
     let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * lambda_val - self_x - other_x)
     })?;
     cs.enforce(
@@ -1087,10 +1252,18 @@ impl<E: Engine> AllocatedPointNonInfinity<E> {
 
     // y = lambda * (self.x - x) - self.y
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
-      let lambda_val = lambda.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_x = self.x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let lambda_val = lambda
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let self_x = self
+        .x
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       let x_val = x.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-      let self_y = self.y.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+      let self_y = self
+        .y
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
       Ok(lambda_val * (self_x - x_val) - self_y)
     })?;
 

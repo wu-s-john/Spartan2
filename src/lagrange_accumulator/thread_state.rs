@@ -12,7 +12,7 @@
 //! we reduce allocations from O(num_x_out) to O(num_threads).
 
 use super::accumulator::LagrangeAccumulators;
-use crate::small_field::{DelayedReduction, SmallValueField, WitnessValue, WideMul};
+use crate::small_field::{DelayedReduction, SmallValueField, WideMul, WitnessValue};
 use ff::PrimeField;
 use std::ops::{Add, Sub};
 
@@ -32,13 +32,8 @@ where
     + DelayedReduction<F>
     + Send
     + Sync,
-  SmallValue: WideMul
-    + Copy
-    + Default
-    + Add<Output = SmallValue>
-    + Sub<Output = SmallValue>
-    + Send
-    + Sync,
+  SmallValue:
+    WideMul + Copy + Default + Add<Output = SmallValue> + Sub<Output = SmallValue> + Send + Sync,
 {
   /// Partial sums indexed by β, accumulated over the x_in loop.
   pub partial_sums: Vec<<F as DelayedReduction<SmallValue::Product>>::Accumulator>,
@@ -69,13 +64,8 @@ where
     + DelayedReduction<F>
     + Send
     + Sync,
-  SmallValue: WideMul
-    + Copy
-    + Default
-    + Add<Output = SmallValue>
-    + Sub<Output = SmallValue>
-    + Send
-    + Sync,
+  SmallValue:
+    WideMul + Copy + Default + Add<Output = SmallValue> + Sub<Output = SmallValue> + Send + Sync,
 {
   pub fn new(l0: usize, num_betas: usize, prefix_size: usize, ext_size: usize) -> Self {
     Self {
@@ -109,8 +99,12 @@ where
 /// - `SmallValue`: Value type for pref/extension buffers (i32, i64, etc.)
 /// - `PS`: Partial sum type (Accumulator for delayed reduction)
 /// - `D`: Polynomial degree bound
-pub(crate) struct NeutronNovaThreadState<F, SmallValue, PS: Copy + Default + PartialEq, const D: usize>
-where
+pub(crate) struct NeutronNovaThreadState<
+  F,
+  SmallValue,
+  PS: Copy + Default + PartialEq,
+  const D: usize,
+> where
   F: PrimeField
     + SmallValueField<SmallValue>
     + DelayedReduction<SmallValue>
@@ -118,13 +112,8 @@ where
     + DelayedReduction<F>
     + Send
     + Sync,
-  SmallValue: WideMul
-    + Copy
-    + Default
-    + Add<Output = SmallValue>
-    + Sub<Output = SmallValue>
-    + Send
-    + Sync,
+  SmallValue:
+    WideMul + Copy + Default + Add<Output = SmallValue> + Sub<Output = SmallValue> + Send + Sync,
 {
   /// Partial sums indexed by β, accumulated over the x_L loop. Reset each x_R iteration.
   pub partial_sums: Vec<PS>,
@@ -156,13 +145,8 @@ where
     + DelayedReduction<F>
     + Send
     + Sync,
-  SmallValue: WideMul
-    + Copy
-    + Default
-    + Add<Output = SmallValue>
-    + Sub<Output = SmallValue>
-    + Send
-    + Sync,
+  SmallValue:
+    WideMul + Copy + Default + Add<Output = SmallValue> + Sub<Output = SmallValue> + Send + Sync,
 {
   pub fn new(l0: usize, num_betas: usize, prefix_size: usize, ext_size: usize) -> Self {
     Self {
@@ -195,11 +179,7 @@ where
 /// - `D`: Polynomial degree bound
 pub(crate) struct InnerThreadState<F, W: WitnessValue, const D: usize>
 where
-  F: PrimeField
-    + DelayedReduction<W::Extended>
-    + DelayedReduction<F>
-    + Send
-    + Sync,
+  F: PrimeField + DelayedReduction<W::Extended> + DelayedReduction<F> + Send + Sync,
   W::Extended: Copy + Default + Add<Output = W::Extended> + Sub<Output = W::Extended> + Send + Sync,
 {
   /// Partial sums indexed by β, accumulated over suffixes.
@@ -220,11 +200,7 @@ where
 
 impl<F, W: WitnessValue, const D: usize> InnerThreadState<F, W, D>
 where
-  F: PrimeField
-    + DelayedReduction<W::Extended>
-    + DelayedReduction<F>
-    + Send
-    + Sync,
+  F: PrimeField + DelayedReduction<W::Extended> + DelayedReduction<F> + Send + Sync,
   W::Extended: Copy + Default + Add<Output = W::Extended> + Sub<Output = W::Extended> + Send + Sync,
 {
   pub fn new(l0: usize, num_betas: usize, ext_size: usize) -> Self {

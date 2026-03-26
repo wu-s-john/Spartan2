@@ -11,14 +11,17 @@ use bellpepper_core::{Circuit, ConstraintSystem, SynthesisError, num::AllocatedN
 use ff::{PrimeField, PrimeFieldBits};
 use std::marker::PhantomData;
 
-use ff::Field;
-#[cfg(debug_assertions)]
-use sha2::{Digest, Sha256};
 use crate::{
   gadgets::{NoBatchEq, SmallBoolean, small_sha256_int},
   small_constraint_system::{SmallConstraintSystem, SmallToBellpepperCS},
-  traits::{Engine, circuit::{SmallSpartanCircuit, SpartanCircuit}},
+  traits::{
+    Engine,
+    circuit::{SmallSpartanCircuit, SpartanCircuit},
+  },
 };
+use ff::Field;
+#[cfg(debug_assertions)]
+use sha2::{Digest, Sha256};
 
 /// SHA-256 circuit using small_sha256 gadget (small-value compatible).
 ///
@@ -88,7 +91,13 @@ where
     for bit in &hash_bits {
       outer_cs.alloc_input(
         || "hash_bit",
-        || Ok(if bit.get_value().unwrap_or(false) { E::Scalar::ONE } else { E::Scalar::ZERO }),
+        || {
+          Ok(if bit.get_value().unwrap_or(false) {
+            E::Scalar::ONE
+          } else {
+            E::Scalar::ZERO
+          })
+        },
       )?;
     }
 
@@ -146,7 +155,12 @@ where
   fn public_values(&self) -> Result<Vec<i32>, SynthesisError> {
     use crate::sha256_circuits::hash_to_public_scalars;
     let bits: Vec<E::Scalar> = hash_to_public_scalars(&self.preimage);
-    Ok(bits.iter().map(|b| if b.is_zero().into() { 0i32 } else { 1i32 }).collect())
+    Ok(
+      bits
+        .iter()
+        .map(|b| if b.is_zero().into() { 0i32 } else { 1i32 })
+        .collect(),
+    )
   }
 
   fn shared<CS: SmallConstraintSystem<i32>>(
@@ -169,13 +183,18 @@ where
     // Inputize hash bits as public values
     for bit in &hash_bits {
       let val = bit.get_value().map(|b| if b { 1i32 } else { 0i32 });
-      cs.alloc_input(|| "hash_bit", || val.ok_or(SynthesisError::AssignmentMissing))?;
+      cs.alloc_input(
+        || "hash_bit",
+        || val.ok_or(SynthesisError::AssignmentMissing),
+      )?;
     }
 
     Ok(vec![])
   }
 
-  fn num_challenges(&self) -> usize { 0 }
+  fn num_challenges(&self) -> usize {
+    0
+  }
 
   fn synthesize<CS: SmallConstraintSystem<i32>>(
     &self,
@@ -198,7 +217,12 @@ where
   fn public_values(&self) -> Result<Vec<i8>, SynthesisError> {
     use crate::sha256_circuits::hash_to_public_scalars;
     let bits: Vec<E::Scalar> = hash_to_public_scalars(&self.preimage);
-    Ok(bits.iter().map(|b| if b.is_zero().into() { 0i8 } else { 1i8 }).collect())
+    Ok(
+      bits
+        .iter()
+        .map(|b| if b.is_zero().into() { 0i8 } else { 1i8 })
+        .collect(),
+    )
   }
 
   fn shared<CS: SmallConstraintSystem<i8>>(
@@ -223,13 +247,18 @@ where
     // Inputize hash bits as public values (i8)
     for bit in &hash_bits {
       let val = bit.get_value().map(|b| if b { 1i8 } else { 0i8 });
-      cs.alloc_input(|| "hash_bit", || val.ok_or(SynthesisError::AssignmentMissing))?;
+      cs.alloc_input(
+        || "hash_bit",
+        || val.ok_or(SynthesisError::AssignmentMissing),
+      )?;
     }
 
     Ok(vec![])
   }
 
-  fn num_challenges(&self) -> usize { 0 }
+  fn num_challenges(&self) -> usize {
+    0
+  }
 
   fn synthesize<CS: SmallConstraintSystem<i8>>(
     &self,
