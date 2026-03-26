@@ -98,7 +98,7 @@ pub(crate) use start_span;
 
 /// The width used for per-round commitments in the multiround protocol.
 /// This affects the commitment scheme structure and padding calculations.
-pub(crate) const MULTIROUND_COMMITMENT_WIDTH: usize = 4;
+pub(crate) const MULTIROUND_COMMITMENT_WIDTH: usize = 8;
 
 // The default width used for monolithic commitments.
 pub(crate) const DEFAULT_COMMITMENT_WIDTH: usize = 8192;
