@@ -24,11 +24,12 @@ use bellpepper_core::{
   test_cs::TestConstraintSystem,
 };
 use ff::{Field, PrimeField, PrimeFieldBits};
+use halo2curves::{CurveAffine, group::prime::PrimeCurveAffine};
 use num_bigint::BigUint;
 use num_traits::{One as _, Zero as _};
 use once_cell::sync::Lazy;
-use std::collections::BTreeMap;
 use std::time::Instant;
+use std::{collections::BTreeMap, fmt};
 
 use spartan2::{
   bellpepper::{
@@ -43,8 +44,8 @@ use spartan2::{
       select_num_or_zero,
     },
   },
-  provider::{PallasHyraxEngine, VestaHyraxEngine, pasta::pallas},
   provider::traits::DlogGroup,
+  provider::{PallasHyraxEngine, VestaHyraxEngine, pasta::pallas},
   rs_shuffle_bp::{
     data_structures::{
       ElGamalCiphertext as NativeCiphertext, PermutationWitnessTrace, PermutationWitnessTraceVar,
@@ -71,6 +72,8 @@ const POSEIDON_ALPHA: u64 = 5;
 type Scalar = pallas::Scalar;
 type CurveEngine = VestaHyraxEngine;
 type LinkerScalar = <CurveEngine as Engine>::Scalar;
+type ShuffleSnark = SpartanSNARK<PallasHyraxEngine>;
+type CurveAffinePoint = <<CurveEngine as Engine>::GE as DlogGroup>::AffineGroupElement;
 
 const EMULATED_LIMB_BITS: usize = 32;
 const EMULATED_LIMBS: usize = 8;
@@ -81,8 +84,7 @@ const EMULATED_ADD_CARRY_BIAS: i64 = 1;
 const EMULATED_MUL_CARRY_BITS: usize = 36;
 const EMULATED_MUL_CARRY_BIAS: i64 = 1i64 << (EMULATED_MUL_CARRY_BITS - 1);
 const LINK_LINEAR_QUOTIENT_BITS: usize = EMULATED_TOTAL_BITS + 6;
-const LINK_LINEAR_QUOTIENT_LIMBS: usize =
-  LINK_LINEAR_QUOTIENT_BITS.div_ceil(EMULATED_LIMB_BITS);
+const LINK_LINEAR_QUOTIENT_LIMBS: usize = LINK_LINEAR_QUOTIENT_BITS.div_ceil(EMULATED_LIMB_BITS);
 const LINK_LINEAR_CARRY_BITS: usize = 48;
 const LINK_LINEAR_CARRY_BIAS: i64 = 1i64 << (LINK_LINEAR_CARRY_BITS - 1);
 
@@ -135,27 +137,87 @@ struct LinkerChallenges {
 }
 
 #[derive(Clone)]
-struct BenchInstance {
-  sk: LinkerScalar,
+struct ShuffleStatement<const N_LOCAL: usize> {
   pk: (Scalar, Scalar),
   nonce: Scalar,
   seed_digest: Scalar,
-  witness_trace: PermutationWitnessTrace<N, LEVELS>,
-  power_perm_vec: [LinkerScalar; N],
   power_challenge: Scalar,
-  power_challenge_scalar: LinkerScalar,
   tau_base: Scalar,
-  tau_scalar: LinkerScalar,
-  tau_powers: [LinkerScalar; N],
-  perm_blinding: LinkerScalar,
   permutation_commitment: (Scalar, Scalar),
   power_commitment: (Scalar, Scalar),
-  power_blinding: LinkerScalar,
   link_commitment: (Scalar, Scalar),
   tuple_expected_product: Scalar,
+  input_ciphertexts: [NativeCiphertext<CurveEngine>; N_LOCAL],
+  output_ciphertexts: [NativeCiphertext<CurveEngine>; N_LOCAL],
+}
+
+#[derive(Clone)]
+struct ShuffleWitness<const N_LOCAL: usize, const LEVELS_LOCAL: usize> {
+  sk: LinkerScalar,
+  witness_trace: PermutationWitnessTrace<N_LOCAL, LEVELS_LOCAL>,
+  power_perm_vec: [LinkerScalar; N_LOCAL],
+  power_challenge_scalar: LinkerScalar,
+  tau_scalar: LinkerScalar,
+  tau_powers: [LinkerScalar; N_LOCAL],
+  perm_blinding: LinkerScalar,
+  power_blinding: LinkerScalar,
   link_value: LinkerScalar,
   link_blinding: LinkerScalar,
+  rerandomization_scalars: [LinkerScalar; N_LOCAL],
+}
+
+struct ShuffleProof<const N_LOCAL: usize> {
+  spartan_proof: ShuffleSnark,
+  sigma_proof: NativeReencryptionProof<N_LOCAL>,
+}
+
+#[derive(Debug)]
+enum ShuffleVerifyError {
+  InvalidPoint { label: String },
+  InvalidCiphertext { label: String },
+  InconsistentStatement { reason: String },
+  SpartanVerify(spartan2::errors::SpartanError),
+  SpartanPublicValuesMismatch,
+  SigmaVerification { reason: String },
+}
+
+impl fmt::Display for ShuffleVerifyError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::InvalidPoint { label } => write!(f, "invalid curve point: {label}"),
+      Self::InvalidCiphertext { label } => write!(f, "invalid ciphertext: {label}"),
+      Self::InconsistentStatement { reason } => write!(f, "inconsistent statement: {reason}"),
+      Self::SpartanVerify(err) => write!(f, "Spartan verification failed: {err}"),
+      Self::SpartanPublicValuesMismatch => {
+        write!(
+          f,
+          "Spartan proof returned public values for a different statement"
+        )
+      }
+      Self::SigmaVerification { reason } => write!(f, "Sigma verification failed: {reason}"),
+    }
+  }
+}
+
+impl std::error::Error for ShuffleVerifyError {}
+
+impl From<spartan2::errors::SpartanError> for ShuffleVerifyError {
+  fn from(value: spartan2::errors::SpartanError) -> Self {
+    Self::SpartanVerify(value)
+  }
+}
+
+#[derive(Clone)]
+struct FullRSShuffleCircuit {
+  statement: ShuffleStatement<N>,
+  witness: ShuffleWitness<N, LEVELS>,
   bases: CommitmentBases,
+}
+
+struct PoseidonGrainLfsr {
+  prime_num_bits: usize,
+  state: [bool; 80],
+  head: usize,
 }
 
 #[derive(Clone)]
@@ -167,46 +229,12 @@ struct NativeReencryptionProof<const N_LOCAL: usize> {
   sigma_response_rerand: LinkerScalar,
 }
 
-#[derive(Clone)]
-struct NativeSigmaInputs<const N_LOCAL: usize> {
-  input_ciphertexts: [NativeCiphertext<CurveEngine>; N_LOCAL],
-  output_ciphertexts: [NativeCiphertext<CurveEngine>; N_LOCAL],
-  rerandomization_scalars: [LinkerScalar; N_LOCAL],
-}
-
-#[derive(Clone)]
-struct FullRSShuffleCircuit {
-  sk: LinkerScalar,
-  pk: (Scalar, Scalar),
-  nonce: Scalar,
-  seed_digest: Scalar,
-  witness_trace: PermutationWitnessTrace<N, LEVELS>,
-  power_perm_vec: [LinkerScalar; N],
-  power_challenge: Scalar,
-  power_challenge_scalar: LinkerScalar,
-  tau_base: Scalar,
-  tau_scalar: LinkerScalar,
-  tau_powers: [LinkerScalar; N],
-  permutation_commitment: (Scalar, Scalar),
-  power_commitment: (Scalar, Scalar),
-  link_commitment: (Scalar, Scalar),
-  tuple_expected_product: Scalar,
-  link_value: LinkerScalar,
-  link_blinding: LinkerScalar,
-  bases: CommitmentBases,
-}
-
-struct PoseidonGrainLfsr {
-  prime_num_bits: usize,
-  state: [bool; 80],
-  head: usize,
-}
-
 static POSEIDON_CONFIG: Lazy<PoseidonConfigLocal> = Lazy::new(build_poseidon_config);
 static SCALAR_MODULUS: Lazy<BigUint> = Lazy::new(scalar_modulus);
 static LINKER_SCALAR_MODULUS: Lazy<BigUint> = Lazy::new(linker_scalar_modulus);
 static LINKER_SCALAR_MODULUS_BITS: Lazy<Vec<bool>> = Lazy::new(linker_scalar_modulus_bits);
-static LINKER_SCALAR_MODULUS_LIMBS: Lazy<[u64; EMULATED_LIMBS]> = Lazy::new(linker_scalar_modulus_limbs);
+static LINKER_SCALAR_MODULUS_LIMBS: Lazy<[u64; EMULATED_LIMBS]> =
+  Lazy::new(linker_scalar_modulus_limbs);
 static COMMITMENT_BASES: Lazy<CommitmentBases> = Lazy::new(build_commitment_bases);
 
 fn scalar_modulus() -> BigUint {
@@ -316,7 +344,8 @@ fn linker_scalar_from_biguint_checked(value: &BigUint) -> LinkerScalar {
     "value does not fit in linker field representation"
   );
   repr_bytes[..bytes.len()].copy_from_slice(&bytes);
-  Option::<LinkerScalar>::from(LinkerScalar::from_repr(repr)).expect("canonical linker field element")
+  Option::<LinkerScalar>::from(LinkerScalar::from_repr(repr))
+    .expect("canonical linker field element")
 }
 
 fn linker_scalar_from_le_bytes_mod_order(bytes: &[u8]) -> LinkerScalar {
@@ -882,7 +911,9 @@ fn alloc_bounded_num<CS: ConstraintSystem<Scalar>>(
   num_bits: usize,
 ) -> Result<(AllocatedNum<Scalar>, Vec<AllocatedBit>), SynthesisError> {
   let bit_values: Vec<Option<bool>> = if let Some(value) = value {
-    (0..num_bits).map(|bit| Some(((value >> bit) & 1) == 1)).collect()
+    (0..num_bits)
+      .map(|bit| Some(((value >> bit) & 1) == 1))
+      .collect()
   } else {
     vec![None; num_bits]
   };
@@ -937,7 +968,11 @@ fn enforce_less_than_constant_bits<CS: ConstraintSystem<Scalar>>(
     }
   }
 
-  Boolean::enforce_equal(cs.namespace(|| "lt_modulus"), &less, &Boolean::constant(true))
+  Boolean::enforce_equal(
+    cs.namespace(|| "lt_modulus"),
+    &less,
+    &Boolean::constant(true),
+  )
 }
 
 fn linker_scalar_to_biguint(value: LinkerScalar) -> BigUint {
@@ -962,7 +997,10 @@ impl EmulatedLinkerVar {
     enforce_canonical: bool,
   ) -> Result<Self, SynthesisError> {
     let bit_values: Vec<Option<bool>> = if let Some(value) = value {
-      linker_scalar_to_bits_le(value).into_iter().map(Some).collect()
+      linker_scalar_to_bits_le(value)
+        .into_iter()
+        .map(Some)
+        .collect()
     } else {
       vec![None; EMULATED_TOTAL_BITS]
     };
@@ -1070,9 +1108,11 @@ impl EmulatedLinkerVar {
       }
     }
 
-    let reduce_lc = |coeff: u64, bit: &AllocatedBit| Boolean::from(bit.clone()).lc(CS::one(), Scalar::from(coeff));
-    let signed_offset = Scalar::from(EMULATED_ADD_CARRY_BIAS as u64)
-      * Scalar::from(EMULATED_LIMB_BASE_U64 - 1);
+    let reduce_lc = |coeff: u64, bit: &AllocatedBit| {
+      Boolean::from(bit.clone()).lc(CS::one(), Scalar::from(coeff))
+    };
+    let signed_offset =
+      Scalar::from(EMULATED_ADD_CARRY_BIAS as u64) * Scalar::from(EMULATED_LIMB_BASE_U64 - 1);
     let reduce_bit = AllocatedBit::alloc(cs.namespace(|| "reduce_bit"), Some(reduce))?;
     let mut carry_in = alloc_constant(
       cs.namespace(|| "carry_init"),
@@ -1085,7 +1125,8 @@ impl EmulatedLinkerVar {
           cs.namespace(|| format!("carry_{limb_idx}")),
           Some((carry_values[limb_idx] + EMULATED_ADD_CARRY_BIAS) as u64),
           EMULATED_ADD_CARRY_BITS,
-        )?.0
+        )?
+        .0
       } else {
         alloc_constant(
           cs.namespace(|| "carry_final"),
@@ -1105,7 +1146,10 @@ impl EmulatedLinkerVar {
         |lc| {
           lc + result.limbs[limb_idx].get_variable()
             + &reduce_lc(LINKER_SCALAR_MODULUS_LIMBS[limb_idx], &reduce_bit)
-            + (Scalar::from(EMULATED_LIMB_BASE_U64), carry_out.get_variable())
+            + (
+              Scalar::from(EMULATED_LIMB_BASE_U64),
+              carry_out.get_variable(),
+            )
         },
       );
 
@@ -1146,7 +1190,12 @@ impl EmulatedLinkerVar {
           .limbs
           .iter()
           .enumerate()
-          .map(|(rhs_idx, rhs_limb)| lhs_limb.mul(cs.namespace(|| format!("prod_{lhs_idx}_{rhs_idx}")), rhs_limb))
+          .map(|(rhs_idx, rhs_limb)| {
+            lhs_limb.mul(
+              cs.namespace(|| format!("prod_{lhs_idx}_{rhs_idx}")),
+              rhs_limb,
+            )
+          })
           .collect::<Result<Vec<_>, _>>()
       })
       .collect::<Result<Vec<_>, _>>()?;
@@ -1179,8 +1228,8 @@ impl EmulatedLinkerVar {
       }
     }
 
-    let signed_offset = Scalar::from(EMULATED_MUL_CARRY_BIAS as u64)
-      * Scalar::from(EMULATED_LIMB_BASE_U64 - 1);
+    let signed_offset =
+      Scalar::from(EMULATED_MUL_CARRY_BIAS as u64) * Scalar::from(EMULATED_LIMB_BASE_U64 - 1);
     let mut carry_in = alloc_constant(
       cs.namespace(|| "carry_init"),
       &Scalar::from(EMULATED_MUL_CARRY_BIAS as u64),
@@ -1191,7 +1240,8 @@ impl EmulatedLinkerVar {
           cs.namespace(|| format!("carry_{limb_idx}")),
           Some((carry_values[limb_idx] + EMULATED_MUL_CARRY_BIAS) as u64),
           EMULATED_MUL_CARRY_BITS,
-        )?.0
+        )?
+        .0
       } else {
         alloc_constant(
           cs.namespace(|| "carry_final"),
@@ -1225,7 +1275,10 @@ impl EmulatedLinkerVar {
                 );
             }
           }
-          lc + (Scalar::from(EMULATED_LIMB_BASE_U64), carry_out.get_variable())
+          lc + (
+            Scalar::from(EMULATED_LIMB_BASE_U64),
+            carry_out.get_variable(),
+          )
         },
       );
 
@@ -1285,8 +1338,8 @@ fn enforce_base_to_emulated<CS: ConstraintSystem<Scalar>>(
     }
   }
 
-  let signed_offset = Scalar::from(EMULATED_ADD_CARRY_BIAS as u64)
-    * Scalar::from(EMULATED_LIMB_BASE_U64 - 1);
+  let signed_offset =
+    Scalar::from(EMULATED_ADD_CARRY_BIAS as u64) * Scalar::from(EMULATED_LIMB_BASE_U64 - 1);
   let mut carry_in = alloc_constant(
     cs.namespace(|| "carry_init"),
     &Scalar::from(EMULATED_ADD_CARRY_BIAS as u64),
@@ -1298,7 +1351,8 @@ fn enforce_base_to_emulated<CS: ConstraintSystem<Scalar>>(
         cs.namespace(|| format!("carry_{limb_idx}")),
         Some((carry_values[limb_idx] + EMULATED_ADD_CARRY_BIAS) as u64),
         EMULATED_ADD_CARRY_BITS,
-      )?.0
+      )?
+      .0
     } else {
       alloc_constant(
         cs.namespace(|| "carry_final"),
@@ -1312,12 +1366,18 @@ fn enforce_base_to_emulated<CS: ConstraintSystem<Scalar>>(
         lc + (signed_offset, CS::one())
           + carry_in.get_variable()
           + emulated.limbs[limb_idx].get_variable()
-          + &Boolean::from(reduce_bit.clone()).lc(CS::one(), Scalar::from(LINKER_SCALAR_MODULUS_LIMBS[limb_idx]))
+          + &Boolean::from(reduce_bit.clone()).lc(
+            CS::one(),
+            Scalar::from(LINKER_SCALAR_MODULUS_LIMBS[limb_idx]),
+          )
       },
       |lc| lc + CS::one(),
       |lc| {
         lc + base_limbs[limb_idx].get_variable()
-          + (Scalar::from(EMULATED_LIMB_BASE_U64), carry_out.get_variable())
+          + (
+            Scalar::from(EMULATED_LIMB_BASE_U64),
+            carry_out.get_variable(),
+          )
       },
     );
 
@@ -1342,20 +1402,26 @@ fn enforce_constant_link_sum<const N_LOCAL: usize, CS: ConstraintSystem<Scalar>>
         .ok_or(SynthesisError::AssignmentMissing)
     })
     .collect::<Result<Vec<_>, _>>()?;
-  let coeff_limbs: Vec<[u64; EMULATED_LIMBS]> = coeffs.iter().copied().map(linker_scalar_to_limbs).collect();
+  let coeff_limbs: Vec<[u64; EMULATED_LIMBS]> =
+    coeffs.iter().copied().map(linker_scalar_to_limbs).collect();
   let result_value = result.value.ok_or(SynthesisError::AssignmentMissing)?;
   let result_limbs = linker_scalar_to_limbs(result_value);
 
-  let lhs_big = values
-    .iter()
-    .zip(coeffs.iter())
-    .try_fold(BigUint::zero(), |acc, (value, coeff)| {
-      let value_big = linker_scalar_to_biguint(value.value.ok_or(SynthesisError::AssignmentMissing)?);
-      Ok::<_, SynthesisError>(acc + value_big * linker_scalar_to_biguint(*coeff))
-    })?;
+  let lhs_big =
+    values
+      .iter()
+      .zip(coeffs.iter())
+      .try_fold(BigUint::zero(), |acc, (value, coeff)| {
+        let value_big =
+          linker_scalar_to_biguint(value.value.ok_or(SynthesisError::AssignmentMissing)?);
+        Ok::<_, SynthesisError>(acc + value_big * linker_scalar_to_biguint(*coeff))
+      })?;
   let result_big = linker_scalar_to_biguint(result_value);
   let quotient_big = (&lhs_big - &result_big) / &*LINKER_SCALAR_MODULUS;
-  debug_assert_eq!((&lhs_big - &result_big) % &*LINKER_SCALAR_MODULUS, BigUint::zero());
+  debug_assert_eq!(
+    (&lhs_big - &result_big) % &*LINKER_SCALAR_MODULUS,
+    BigUint::zero()
+  );
   let quotient_limbs = biguint_to_u32_limbs::<LINK_LINEAR_QUOTIENT_LIMBS>(&quotient_big);
 
   let quotient_vars = quotient_limbs
@@ -1410,8 +1476,8 @@ fn enforce_constant_link_sum<const N_LOCAL: usize, CS: ConstraintSystem<Scalar>>
     }
   }
 
-  let signed_offset = Scalar::from(LINK_LINEAR_CARRY_BIAS as u64)
-    * Scalar::from(EMULATED_LIMB_BASE_U64 - 1);
+  let signed_offset =
+    Scalar::from(LINK_LINEAR_CARRY_BIAS as u64) * Scalar::from(EMULATED_LIMB_BASE_U64 - 1);
   let mut carry_in = alloc_constant(
     cs.namespace(|| "carry_init"),
     &Scalar::from(LINK_LINEAR_CARRY_BIAS as u64),
@@ -1466,7 +1532,10 @@ fn enforce_constant_link_sum<const N_LOCAL: usize, CS: ConstraintSystem<Scalar>>
               );
           }
         }
-        lc + (Scalar::from(EMULATED_LIMB_BASE_U64), carry_out.get_variable())
+        lc + (
+          Scalar::from(EMULATED_LIMB_BASE_U64),
+          carry_out.get_variable(),
+        )
       },
     );
 
@@ -1540,10 +1609,7 @@ impl PoseidonSpongeCircuit {
     x4.mul(cs.namespace(|| format!("{name}_x5")), value)
   }
 
-  fn permute<CS: ConstraintSystem<Scalar>>(
-    &mut self,
-    cs: &mut CS,
-  ) -> Result<(), SynthesisError> {
+  fn permute<CS: ConstraintSystem<Scalar>>(&mut self, cs: &mut CS) -> Result<(), SynthesisError> {
     let cfg = &*POSEIDON_CONFIG;
     let full_rounds_over_2 = POSEIDON_FULL_ROUNDS / 2;
     let permute_id = self.fresh_tag();
@@ -1588,12 +1654,11 @@ impl PoseidonSpongeCircuit {
         )?;
       }
     } else {
-      self.state[0] =
-        Self::pow5(
-          cs,
-          &self.state[0],
-          &format!("{}_sbox_p{permute_id}_r{round}_0", self.prefix),
-        )?;
+      self.state[0] = Self::pow5(
+        cs,
+        &self.state[0],
+        &format!("{}_sbox_p{permute_id}_r{round}_0", self.prefix),
+      )?;
     }
 
     let old_state = self.state.clone();
@@ -1732,14 +1797,7 @@ impl PoseidonSpongeCircuit {
       cs.namespace(|| format!("{}_point_infinity_flag_{point_id}", self.prefix)),
       &Scalar::ZERO,
     )?;
-    self.absorb_allocated_fields(
-      cs,
-      &[
-        point.x.clone(),
-        point.y.clone(),
-        infinity_flag,
-      ],
-    )
+    self.absorb_allocated_fields(cs, &[point.x.clone(), point.y.clone(), infinity_flag])
   }
 
   fn squeeze_field_elements<CS: ConstraintSystem<Scalar>>(
@@ -1816,14 +1874,7 @@ fn jacobian_double<F: PrimeField>(x: F, y: F, z: F, a: F) -> (F, F, F) {
   (x3, y3, z3)
 }
 
-fn jacobian_add_affine<F: PrimeField>(
-  x1: F,
-  y1: F,
-  z1: F,
-  x2: F,
-  y2: F,
-  curve_a: F,
-) -> (F, F, F) {
+fn jacobian_add_affine<F: PrimeField>(x1: F, y1: F, z1: F, x2: F, y2: F, curve_a: F) -> (F, F, F) {
   if z1 == F::ZERO {
     return (x2, y2, F::ONE);
   }
@@ -1861,12 +1912,7 @@ fn affine_add_safe<F: PrimeField>(x1: F, y1: F, x2: F, y2: F, a: F) -> (F, F) {
   (rx * z_inv2, ry * z_inv3)
 }
 
-fn native_scalar_mul_maybe<S, F>(
-  scalar: S,
-  point_x: F,
-  point_y: F,
-  curve_a: F,
-) -> Option<(F, F)>
+fn native_scalar_mul_maybe<S, F>(scalar: S, point_x: F, point_y: F, curve_a: F) -> Option<(F, F)>
 where
   S: PrimeFieldBits + PartialEq,
   F: PrimeField,
@@ -2028,14 +2074,22 @@ fn native_ciphertext_msm<const N_LOCAL: usize>(
     .iter()
     .zip(scalars.iter())
     .fold(None, |acc, (ct, scalar)| {
-      native_add_optional(acc, native_scalar_mul_maybe(*scalar, ct.c1_x, ct.c1_y, curve_a), curve_a)
+      native_add_optional(
+        acc,
+        native_scalar_mul_maybe(*scalar, ct.c1_x, ct.c1_y, curve_a),
+        curve_a,
+      )
     })
     .expect("ciphertext msm c1 must be non-infinity");
   let c2 = ciphertexts
     .iter()
     .zip(scalars.iter())
     .fold(None, |acc, (ct, scalar)| {
-      native_add_optional(acc, native_scalar_mul_maybe(*scalar, ct.c2_x, ct.c2_y, curve_a), curve_a)
+      native_add_optional(
+        acc,
+        native_scalar_mul_maybe(*scalar, ct.c2_x, ct.c2_y, curve_a),
+        curve_a,
+      )
     })
     .expect("ciphertext msm c2 must be non-infinity");
   NativeCiphertext::new(c1.0, c1.1, c2.0, c2.1)
@@ -2088,50 +2142,6 @@ fn rerandomize_ciphertext(
   NativeCiphertext::new(c1.0, c1.1, c2.0, c2.1)
 }
 
-fn build_sigma_inputs<const N_LOCAL: usize>(instance: &BenchInstance) -> NativeSigmaInputs<N_LOCAL> {
-  let (curve_a, _, _, _) = <CurveEngine as Engine>::GE::group_params();
-  let message_points = labeled_points(b"spartan2-bench-msg", N_LOCAL);
-  let input_randomness = derive_sigma_scalars::<N_LOCAL>(instance.seed_digest, b"input-ciphertexts");
-  let input_ciphertexts = std::array::from_fn(|i| {
-    let c1 = native_scalar_mul_maybe(
-      input_randomness[i],
-      instance.bases.generator.0,
-      instance.bases.generator.1,
-      curve_a,
-    )
-    .expect("input c1 must be non-infinity");
-    let pk_term = native_scalar_mul_maybe(
-      input_randomness[i],
-      instance.pk.0,
-      instance.pk.1,
-      curve_a,
-    )
-    .expect("input c2 pk term must be non-infinity");
-    let c2 = native_add_points(message_points[i], pk_term);
-    NativeCiphertext::new(c1.0, c1.1, c2.0, c2.1)
-  });
-
-  let rerandomization_scalars =
-    derive_sigma_scalars::<N_LOCAL>(instance.seed_digest, b"output-rerandomization");
-  let permutation: [usize; N_LOCAL] = std::array::from_fn(|i| {
-    instance.witness_trace.next_levels[LEVELS - 1][i].idx as usize
-  });
-  let output_ciphertexts = std::array::from_fn(|i| {
-    rerandomize_ciphertext(
-      &input_ciphertexts[permutation[i]],
-      rerandomization_scalars[i],
-      instance.pk,
-      instance.bases.generator,
-    )
-  });
-
-  NativeSigmaInputs {
-    input_ciphertexts,
-    output_ciphertexts,
-    rerandomization_scalars,
-  }
-}
-
 fn powers_sequence<const N_LOCAL: usize>(x: LinkerScalar) -> [LinkerScalar; N_LOCAL] {
   let mut powers = [LinkerScalar::ZERO; N_LOCAL];
   powers[0] = LinkerScalar::ONE;
@@ -2141,38 +2151,128 @@ fn powers_sequence<const N_LOCAL: usize>(x: LinkerScalar) -> [LinkerScalar; N_LO
   powers
 }
 
+fn encode_spartan_public_values<const N_LOCAL: usize>(
+  statement: &ShuffleStatement<N_LOCAL>,
+) -> Vec<Scalar> {
+  let mut out = Vec::with_capacity(2 + 1 + N_LOCAL + 1 + 1 + 1 + 2 + 2 + 2 + 1);
+  out.push(statement.pk.0);
+  out.push(statement.pk.1);
+  out.push(statement.nonce);
+  for i in 0..N_LOCAL {
+    out.push(Scalar::from(i as u64));
+  }
+  out.push(statement.seed_digest);
+  out.push(statement.power_challenge);
+  out.push(statement.tau_base);
+  out.push(statement.permutation_commitment.0);
+  out.push(statement.permutation_commitment.1);
+  out.push(statement.power_commitment.0);
+  out.push(statement.power_commitment.1);
+  out.push(statement.link_commitment.0);
+  out.push(statement.link_commitment.1);
+  out.push(statement.tuple_expected_product);
+  out
+}
+
+fn validate_public_point(
+  label: impl Into<String>,
+  point: (Scalar, Scalar),
+) -> Result<(), ShuffleVerifyError> {
+  let label = label.into();
+  let point: Option<CurveAffinePoint> = CurveAffinePoint::from_xy(point.0, point.1).into();
+  let Some(point) = point else {
+    return Err(ShuffleVerifyError::InvalidPoint { label });
+  };
+  if bool::from(point.is_identity()) {
+    return Err(ShuffleVerifyError::InvalidPoint { label });
+  }
+  Ok(())
+}
+
+fn validate_public_ciphertext(
+  label: &str,
+  index: usize,
+  ciphertext: &NativeCiphertext<CurveEngine>,
+) -> Result<(), ShuffleVerifyError> {
+  validate_public_point(
+    format!("{label}[{index}].c1"),
+    (ciphertext.c1_x, ciphertext.c1_y),
+  )
+  .map_err(|_| ShuffleVerifyError::InvalidCiphertext {
+    label: format!("{label}[{index}]"),
+  })?;
+  validate_public_point(
+    format!("{label}[{index}].c2"),
+    (ciphertext.c2_x, ciphertext.c2_y),
+  )
+  .map_err(|_| ShuffleVerifyError::InvalidCiphertext {
+    label: format!("{label}[{index}]"),
+  })?;
+  Ok(())
+}
+
+fn derive_statement_challenges<const N_LOCAL: usize>(
+  statement: &ShuffleStatement<N_LOCAL>,
+) -> Result<LinkerChallenges, ShuffleVerifyError> {
+  let derived = derive_linker_challenges::<N_LOCAL>(
+    statement.seed_digest,
+    statement.permutation_commitment,
+    statement.power_commitment,
+  )
+  .map_err(|reason| ShuffleVerifyError::InconsistentStatement { reason })?;
+
+  if derived.power_challenge != statement.power_challenge {
+    return Err(ShuffleVerifyError::InconsistentStatement {
+      reason: "power challenge x does not match transcript".to_string(),
+    });
+  }
+  if derived.tau_base != statement.tau_base {
+    return Err(ShuffleVerifyError::InconsistentStatement {
+      reason: "tau challenge does not match transcript".to_string(),
+    });
+  }
+  if derived.tuple_expected_product != statement.tuple_expected_product {
+    return Err(ShuffleVerifyError::InconsistentStatement {
+      reason: "tuple expected product does not match transcript".to_string(),
+    });
+  }
+
+  Ok(derived)
+}
+
 fn prove_native_sigma<const N_LOCAL: usize>(
-  instance: &BenchInstance,
-  sigma_inputs: &NativeSigmaInputs<N_LOCAL>,
+  statement: &ShuffleStatement<N_LOCAL>,
+  witness: &ShuffleWitness<N_LOCAL, LEVELS>,
+  bases: &CommitmentBases,
 ) -> NativeReencryptionProof<N_LOCAL> {
-  let powers = powers_sequence::<N_LOCAL>(instance.power_challenge_scalar);
-  let input_ciphertext_aggregator = native_ciphertext_msm(&sigma_inputs.input_ciphertexts, &powers);
+  let powers = powers_sequence::<N_LOCAL>(witness.power_challenge_scalar);
+  let input_ciphertext_aggregator = native_ciphertext_msm(&statement.input_ciphertexts, &powers);
 
   let blinding_factors =
-    derive_sigma_scalars::<N_LOCAL>(instance.seed_digest, b"sigma-blinding-factors");
-  let sigma_aux = derive_sigma_scalars::<2>(instance.seed_digest, b"sigma-aux");
+    derive_sigma_scalars::<N_LOCAL>(statement.seed_digest, b"sigma-blinding-factors");
+  let sigma_aux = derive_sigma_scalars::<2>(statement.seed_digest, b"sigma-aux");
   let blinding_factor_for_commitment = sigma_aux[0];
   let ciphertext_masking_rerand = sigma_aux[1];
 
   let blinding_factor_commitment = native_vector_commitment(
     &blinding_factors,
-    &instance.bases.power_bases,
+    &bases.power_bases,
     blinding_factor_for_commitment,
-    instance.bases.power_blind_base,
+    bases.power_blind_base,
   );
   let blinding_rerandomization_commitment = native_encrypt_zero_and_combine(
-    instance.pk,
+    statement.pk,
     ciphertext_masking_rerand,
-    &sigma_inputs.output_ciphertexts,
+    &statement.output_ciphertexts,
     &blinding_factors,
-    instance.bases.generator,
+    bases.generator,
   );
 
   let mut transcript = PoseidonSpongeNative::new();
   sigma_absorb_public_inputs(
     &mut transcript,
     &input_ciphertext_aggregator,
-    instance.power_commitment,
+    statement.power_commitment,
   );
   transcript.absorb_point(blinding_factor_commitment);
   transcript.absorb_point((
@@ -2185,17 +2285,16 @@ fn prove_native_sigma<const N_LOCAL: usize>(
   ));
   let challenge = nonzero_linker_scalar_from_base(transcript.squeeze_field_elements(1)[0]);
 
-  let aggregated_rerandomizer = -instance
+  let aggregated_rerandomizer = -witness
     .power_perm_vec
     .iter()
-    .zip(sigma_inputs.rerandomization_scalars.iter())
+    .zip(witness.rerandomization_scalars.iter())
     .map(|(b_i, rho_i)| *b_i * *rho_i)
     .sum::<LinkerScalar>();
 
   let sigma_response_power_permutation_vector =
-    std::array::from_fn(|i| blinding_factors[i] + challenge * instance.power_perm_vec[i]);
-  let sigma_response_blinding =
-    blinding_factor_for_commitment + challenge * instance.power_blinding;
+    std::array::from_fn(|i| blinding_factors[i] + challenge * witness.power_perm_vec[i]);
+  let sigma_response_blinding = blinding_factor_for_commitment + challenge * witness.power_blinding;
   let sigma_response_rerand = ciphertext_masking_rerand + challenge * aggregated_rerandomizer;
 
   NativeReencryptionProof {
@@ -2207,20 +2306,21 @@ fn prove_native_sigma<const N_LOCAL: usize>(
   }
 }
 
-fn verify_native_sigma<const N_LOCAL: usize>(
-  instance: &BenchInstance,
-  sigma_inputs: &NativeSigmaInputs<N_LOCAL>,
+fn verify_native_sigma_public<const N_LOCAL: usize>(
+  statement: &ShuffleStatement<N_LOCAL>,
   proof: &NativeReencryptionProof<N_LOCAL>,
-) -> bool {
+  bases: &CommitmentBases,
+) -> Result<(), ShuffleVerifyError> {
+  let derived = derive_statement_challenges(statement)?;
   let (curve_a, _, _, _) = <CurveEngine as Engine>::GE::group_params();
-  let powers = powers_sequence::<N_LOCAL>(instance.power_challenge_scalar);
-  let input_ciphertext_aggregator = native_ciphertext_msm(&sigma_inputs.input_ciphertexts, &powers);
+  let powers = powers_sequence::<N_LOCAL>(derived.power_challenge_scalar);
+  let input_ciphertext_aggregator = native_ciphertext_msm(&statement.input_ciphertexts, &powers);
 
   let mut transcript = PoseidonSpongeNative::new();
   sigma_absorb_public_inputs(
     &mut transcript,
     &input_ciphertext_aggregator,
-    instance.power_commitment,
+    statement.power_commitment,
   );
   transcript.absorb_point(proof.blinding_factor_commitment);
   transcript.absorb_point((
@@ -2235,30 +2335,32 @@ fn verify_native_sigma<const N_LOCAL: usize>(
 
   let lhs_com = native_vector_commitment(
     &proof.sigma_response_power_permutation_vector,
-    &instance.bases.power_bases,
+    &bases.power_bases,
     proof.sigma_response_blinding,
-    instance.bases.power_blind_base,
+    bases.power_blind_base,
   );
   let rhs_com = native_add_points(
     proof.blinding_factor_commitment,
     native_scalar_mul_maybe(
       challenge,
-      instance.power_commitment.0,
-      instance.power_commitment.1,
+      statement.power_commitment.0,
+      statement.power_commitment.1,
       curve_a,
     )
     .expect("power commitment scaling must be non-infinity"),
   );
   if lhs_com != rhs_com {
-    return false;
+    return Err(ShuffleVerifyError::SigmaVerification {
+      reason: "power commitment opening equation failed".to_string(),
+    });
   }
 
   let lhs_grp = native_encrypt_zero_and_combine(
-    instance.pk,
+    statement.pk,
     proof.sigma_response_rerand,
-    &sigma_inputs.output_ciphertexts,
+    &statement.output_ciphertexts,
     &proof.sigma_response_power_permutation_vector,
-    instance.bases.generator,
+    bases.generator,
   );
   let rhs_c1 = native_add_points(
     (
@@ -2287,118 +2389,122 @@ fn verify_native_sigma<const N_LOCAL: usize>(
     .expect("aggregated c2 scaling must be non-infinity"),
   );
 
-  lhs_grp.c1_x == rhs_c1.0
-    && lhs_grp.c1_y == rhs_c1.1
-    && lhs_grp.c2_x == rhs_c2.0
-    && lhs_grp.c2_y == rhs_c2.1
+  if lhs_grp.c1_x != rhs_c1.0
+    || lhs_grp.c1_y != rhs_c1.1
+    || lhs_grp.c2_x != rhs_c2.0
+    || lhs_grp.c2_y != rhs_c2.1
+  {
+    return Err(ShuffleVerifyError::SigmaVerification {
+      reason: "reencryption aggregate equation failed".to_string(),
+    });
+  }
+
+  Ok(())
 }
 
-fn ciphertext_eq(
-  lhs: &NativeCiphertext<CurveEngine>,
-  rhs: &NativeCiphertext<CurveEngine>,
-) -> bool {
-  lhs.c1_x == rhs.c1_x
-    && lhs.c1_y == rhs.c1_y
-    && lhs.c2_x == rhs.c2_x
-    && lhs.c2_y == rhs.c2_y
+fn ciphertext_eq(lhs: &NativeCiphertext<CurveEngine>, rhs: &NativeCiphertext<CurveEngine>) -> bool {
+  lhs.c1_x == rhs.c1_x && lhs.c1_y == rhs.c1_y && lhs.c2_x == rhs.c2_x && lhs.c2_y == rhs.c2_y
 }
 
-fn validate_shared_bench_relations(
-  instance: &BenchInstance,
-  sigma_inputs: &NativeSigmaInputs<N>,
+fn validate_shared_shuffle_relations(
+  statement: &ShuffleStatement<N>,
+  witness: &ShuffleWitness<N, LEVELS>,
+  bases: &CommitmentBases,
 ) {
-  let permutation: [usize; N] = std::array::from_fn(|i| {
-    instance.witness_trace.next_levels[LEVELS - 1][i].idx as usize
-  });
+  let permutation: [usize; N] =
+    std::array::from_fn(|i| witness.witness_trace.next_levels[LEVELS - 1][i].idx as usize);
   let final_indices: [LinkerScalar; N] =
     std::array::from_fn(|i| LinkerScalar::from(permutation[i] as u64));
   let expected_perm_commitment = native_vector_commitment(
     &final_indices,
-    &instance.bases.perm_bases,
-    instance.perm_blinding,
-    instance.bases.perm_blind_base,
+    &bases.perm_bases,
+    witness.perm_blinding,
+    bases.perm_blind_base,
   );
   assert_eq!(
-    expected_perm_commitment, instance.permutation_commitment,
+    expected_perm_commitment, statement.permutation_commitment,
     "C_perm does not match final RS indices"
   );
 
   let expected_power_commitment = native_vector_commitment(
-    &instance.power_perm_vec,
-    &instance.bases.power_bases,
-    instance.power_blinding,
-    instance.bases.power_blind_base,
+    &witness.power_perm_vec,
+    &bases.power_bases,
+    witness.power_blinding,
+    bases.power_blind_base,
   );
   assert_eq!(
-    expected_power_commitment, instance.power_commitment,
+    expected_power_commitment, statement.power_commitment,
     "C_power does not match power permutation vector"
   );
 
   let expected_link_value =
-    compute_link_value_from_slice(&instance.power_perm_vec, instance.tau_scalar);
+    compute_link_value_from_slice(&witness.power_perm_vec, witness.tau_scalar);
   assert_eq!(
-    expected_link_value, instance.link_value,
+    expected_link_value, witness.link_value,
     "linker scalar L does not match Horner reduction"
   );
   let expected_link_commitment = native_link_commitment(
-    instance.link_value,
-    instance.link_blinding,
-    instance.bases.link_base,
-    instance.bases.link_blind_base,
+    witness.link_value,
+    witness.link_blinding,
+    bases.link_base,
+    bases.link_blind_base,
   );
   assert_eq!(
-    expected_link_commitment, instance.link_commitment,
+    expected_link_commitment, statement.link_commitment,
     "C_link does not match linker value"
   );
 
   let derived = derive_linker_challenges::<N>(
-    instance.seed_digest,
-    instance.permutation_commitment,
-    instance.power_commitment,
+    statement.seed_digest,
+    statement.permutation_commitment,
+    statement.power_commitment,
   )
   .expect("linker challenge derivation must succeed");
   assert_eq!(
-    derived.power_challenge, instance.power_challenge,
+    derived.power_challenge, statement.power_challenge,
     "x challenge mismatch"
   );
   assert_eq!(
-    derived.power_challenge_scalar, instance.power_challenge_scalar,
+    derived.power_challenge_scalar, witness.power_challenge_scalar,
     "x scalar mismatch"
   );
-  assert_eq!(derived.tau_base, instance.tau_base, "tau base mismatch");
-  assert_eq!(derived.tau_scalar, instance.tau_scalar, "tau scalar mismatch");
+  assert_eq!(derived.tau_base, statement.tau_base, "tau base mismatch");
   assert_eq!(
-    derived.tuple_expected_product, instance.tuple_expected_product,
+    derived.tau_scalar, witness.tau_scalar,
+    "tau scalar mismatch"
+  );
+  assert_eq!(
+    derived.tuple_expected_product, statement.tuple_expected_product,
     "P_graph mismatch"
   );
 
   for i in 0..N {
     let expected = rerandomize_ciphertext(
-      &sigma_inputs.input_ciphertexts[permutation[i]],
-      sigma_inputs.rerandomization_scalars[i],
-      instance.pk,
-      instance.bases.generator,
+      &statement.input_ciphertexts[permutation[i]],
+      witness.rerandomization_scalars[i],
+      statement.pk,
+      bases.generator,
     );
     assert!(
-      ciphertext_eq(&expected, &sigma_inputs.output_ciphertexts[i]),
+      ciphertext_eq(&expected, &statement.output_ciphertexts[i]),
       "output ciphertext {i} does not match rerandomized permutation image"
     );
   }
 
-  let powers = powers_sequence::<N>(instance.power_challenge_scalar);
-  let input_aggregator = native_ciphertext_msm(&sigma_inputs.input_ciphertexts, &powers);
-  let rerand_sum = -instance
+  let powers = powers_sequence::<N>(witness.power_challenge_scalar);
+  let input_aggregator = native_ciphertext_msm(&statement.input_ciphertexts, &powers);
+  let rerand_sum = -witness
     .power_perm_vec
     .iter()
-    .zip(sigma_inputs.rerandomization_scalars.iter())
+    .zip(witness.rerandomization_scalars.iter())
     .map(|(b_i, rho_i)| *b_i * *rho_i)
     .sum::<LinkerScalar>();
   let sigma_relation_lhs = native_encrypt_zero_and_combine(
-    instance.pk,
+    statement.pk,
     rerand_sum,
-    &sigma_inputs.output_ciphertexts,
-    &instance.power_perm_vec,
-    instance.bases.generator,
+    &statement.output_ciphertexts,
+    &witness.power_perm_vec,
+    bases.generator,
   );
   assert!(
     ciphertext_eq(&sigma_relation_lhs, &input_aggregator),
@@ -2406,7 +2512,65 @@ fn validate_shared_bench_relations(
   );
 }
 
-fn validate_power_distinctness<F: PrimeField + PartialEq, const N_LOCAL: usize>(x: F) -> Result<(), String> {
+fn verify_shuffle_proof<const N_LOCAL: usize>(
+  vk: &<ShuffleSnark as R1CSSNARKTrait<PallasHyraxEngine>>::VerifierKey,
+  statement: &ShuffleStatement<N_LOCAL>,
+  proof: &ShuffleProof<N_LOCAL>,
+  bases: &CommitmentBases,
+) -> Result<Vec<Scalar>, ShuffleVerifyError> {
+  validate_public_point("pk", statement.pk)?;
+  validate_public_point("C_perm", statement.permutation_commitment)?;
+  validate_public_point("C_power", statement.power_commitment)?;
+  validate_public_point("C_link", statement.link_commitment)?;
+  for (i, ciphertext) in statement.input_ciphertexts.iter().enumerate() {
+    validate_public_ciphertext("input_ciphertexts", i, ciphertext)?;
+  }
+  for (i, ciphertext) in statement.output_ciphertexts.iter().enumerate() {
+    validate_public_ciphertext("output_ciphertexts", i, ciphertext)?;
+  }
+  validate_public_point(
+    "sigma.blinding_factor_commitment",
+    proof.sigma_proof.blinding_factor_commitment,
+  )?;
+  validate_public_ciphertext(
+    "sigma.blinding_rerandomization_commitment",
+    0,
+    &proof.sigma_proof.blinding_rerandomization_commitment,
+  )?;
+
+  let _derived = derive_statement_challenges(statement)?;
+  let expected_public_values = encode_spartan_public_values(statement);
+  let returned_public_values = proof.spartan_proof.verify(vk)?;
+  if returned_public_values != expected_public_values {
+    return Err(ShuffleVerifyError::SpartanPublicValuesMismatch);
+  }
+
+  verify_native_sigma_public(statement, &proof.sigma_proof, bases)?;
+  Ok(returned_public_values)
+}
+
+fn verify_spartan_statement_binding<const N_LOCAL: usize>(
+  vk: &<ShuffleSnark as R1CSSNARKTrait<PallasHyraxEngine>>::VerifierKey,
+  statement: &ShuffleStatement<N_LOCAL>,
+  proof: &ShuffleSnark,
+) -> Result<Vec<Scalar>, ShuffleVerifyError> {
+  validate_public_point("pk", statement.pk)?;
+  validate_public_point("C_perm", statement.permutation_commitment)?;
+  validate_public_point("C_power", statement.power_commitment)?;
+  validate_public_point("C_link", statement.link_commitment)?;
+
+  let _derived = derive_statement_challenges(statement)?;
+  let expected_public_values = encode_spartan_public_values(statement);
+  let returned_public_values = proof.verify(vk)?;
+  if returned_public_values != expected_public_values {
+    return Err(ShuffleVerifyError::SpartanPublicValuesMismatch);
+  }
+  Ok(returned_public_values)
+}
+
+fn validate_power_distinctness<F: PrimeField + PartialEq, const N_LOCAL: usize>(
+  x: F,
+) -> Result<(), String> {
   if x == F::ZERO {
     return Err("power challenge x must be non-zero".to_string());
   }
@@ -2474,7 +2638,8 @@ fn derive_linker_challenges<const N_LOCAL: usize>(
       value
     }
   };
-  let power_challenge_scalar = linker_scalar_from_le_bytes_mod_order(&scalar_to_le_bytes(power_challenge));
+  let power_challenge_scalar =
+    linker_scalar_from_le_bytes_mod_order(&scalar_to_le_bytes(power_challenge));
   validate_power_distinctness::<LinkerScalar, N_LOCAL>(power_challenge_scalar)?;
 
   transcript.absorb_field(seed_digest);
@@ -2562,14 +2727,16 @@ fn prepare_rs_witness_trace_poseidon(seed: Scalar) -> (PermutationWitnessTrace<N
   let prev: [SortedRow; N] =
     std::array::from_fn(|i| SortedRow::new_with_bucket(i as u16, N as u16, 0));
 
-  let level_results: Vec<([spartan2::rs_shuffle_bp::data_structures::UnsortedRow; N], [SortedRow; N])> =
-    (0..LEVELS)
-      .scan(prev, |prev_state, level| {
-        let (unsorted, next_rows) = build_level::<N>(prev_state, &bits_mat[level]);
-        *prev_state = next_rows;
-        Some((unsorted, next_rows))
-      })
-      .collect();
+  let level_results: Vec<(
+    [spartan2::rs_shuffle_bp::data_structures::UnsortedRow; N],
+    [SortedRow; N],
+  )> = (0..LEVELS)
+    .scan(prev, |prev_state, level| {
+      let (unsorted, next_rows) = build_level::<N>(prev_state, &bits_mat[level]);
+      *prev_state = next_rows;
+      Some((unsorted, next_rows))
+    })
+    .collect();
 
   let uns_levels = std::array::from_fn(|i| level_results[i].0);
   let next_levels = std::array::from_fn(|i| level_results[i].1);
@@ -2584,8 +2751,9 @@ fn prepare_rs_witness_trace_poseidon(seed: Scalar) -> (PermutationWitnessTrace<N
   )
 }
 
-fn build_bench_instance() -> BenchInstance {
-  let bases = COMMITMENT_BASES.clone();
+fn build_shuffle_statement_and_witness(
+  bases: &CommitmentBases,
+) -> (ShuffleStatement<N>, ShuffleWitness<N, LEVELS>) {
   let sk = LinkerScalar::from(42u64);
   let nonce = Scalar::from(123u64);
 
@@ -2606,8 +2774,12 @@ fn build_bench_instance() -> BenchInstance {
   let link_blinding = LinkerScalar::from(13u64);
 
   loop {
-    let permutation_commitment =
-      native_vector_commitment(&final_indices, &bases.perm_bases, perm_blinding, bases.perm_blind_base);
+    let permutation_commitment = native_vector_commitment(
+      &final_indices,
+      &bases.perm_bases,
+      perm_blinding,
+      bases.perm_blind_base,
+    );
     let power_challenge = derive_power_challenge_from_commitment(permutation_commitment);
     let power_challenge_scalar =
       linker_scalar_from_le_bytes_mod_order(&scalar_to_le_bytes(power_challenge));
@@ -2622,16 +2794,21 @@ fn build_bench_instance() -> BenchInstance {
       x_powers[i] = x_powers[i - 1] * power_challenge_scalar;
     }
     let power_perm_vec = std::array::from_fn(|i| x_powers[permutation[i]]);
-    let power_commitment =
-      native_vector_commitment(&power_perm_vec, &bases.power_bases, power_blinding, bases.power_blind_base);
+    let power_commitment = native_vector_commitment(
+      &power_perm_vec,
+      &bases.power_bases,
+      power_blinding,
+      bases.power_blind_base,
+    );
 
-    let challenges = match derive_linker_challenges::<N>(seed_digest, permutation_commitment, power_commitment) {
-      Ok(challenges) => challenges,
-      Err(_) => {
-        power_blinding += LinkerScalar::ONE;
-        continue;
-      }
-    };
+    let challenges =
+      match derive_linker_challenges::<N>(seed_digest, permutation_commitment, power_commitment) {
+        Ok(challenges) => challenges,
+        Err(_) => {
+          power_blinding += LinkerScalar::ONE;
+          continue;
+        }
+      };
 
     let link_value = compute_link_value_from_slice(&power_perm_vec, challenges.tau_scalar);
     if link_value == LinkerScalar::ZERO {
@@ -2653,28 +2830,59 @@ fn build_bench_instance() -> BenchInstance {
       bases.link_blind_base,
     );
 
-    return BenchInstance {
-      sk,
+    let (curve_a, _, _, _) = <CurveEngine as Engine>::GE::group_params();
+    let message_points = labeled_points(b"spartan2-bench-msg", N);
+    let input_randomness = derive_sigma_scalars::<N>(seed_digest, b"input-ciphertexts");
+    let input_ciphertexts = std::array::from_fn(|i| {
+      let c1 = native_scalar_mul_maybe(
+        input_randomness[i],
+        bases.generator.0,
+        bases.generator.1,
+        curve_a,
+      )
+      .expect("input c1 must be non-infinity");
+      let pk_term = native_scalar_mul_maybe(input_randomness[i], pk.0, pk.1, curve_a)
+        .expect("input c2 pk term must be non-infinity");
+      let c2 = native_add_points(message_points[i], pk_term);
+      NativeCiphertext::new(c1.0, c1.1, c2.0, c2.1)
+    });
+    let rerandomization_scalars = derive_sigma_scalars::<N>(seed_digest, b"output-rerandomization");
+    let output_ciphertexts = std::array::from_fn(|i| {
+      rerandomize_ciphertext(
+        &input_ciphertexts[permutation[i]],
+        rerandomization_scalars[i],
+        pk,
+        bases.generator,
+      )
+    });
+
+    let statement = ShuffleStatement {
       pk,
       nonce,
       seed_digest,
+      power_challenge: challenges.power_challenge,
+      tau_base: challenges.tau_base,
+      permutation_commitment,
+      power_commitment,
+      link_commitment,
+      tuple_expected_product: challenges.tuple_expected_product,
+      input_ciphertexts,
+      output_ciphertexts,
+    };
+    let witness = ShuffleWitness {
+      sk,
       witness_trace,
       power_perm_vec,
-      power_challenge: challenges.power_challenge,
       power_challenge_scalar: challenges.power_challenge_scalar,
-      tau_base: challenges.tau_base,
       tau_scalar: challenges.tau_scalar,
       tau_powers,
       perm_blinding,
-      permutation_commitment,
-      power_commitment,
       power_blinding,
-      link_commitment,
-      tuple_expected_product: challenges.tuple_expected_product,
       link_value,
       link_blinding,
-      bases,
+      rerandomization_scalars,
     };
+    return (statement, witness);
   }
 }
 
@@ -2907,7 +3115,8 @@ where
       &zeros_gap,
       &u.num_ones,
     )?;
-    let bit_times_inner = bit_as_num.mul(cs.namespace(|| format!("bit_times_inner_{i}")), &inner)?;
+    let bit_times_inner =
+      bit_as_num.mul(cs.namespace(|| format!("bit_times_inner_{i}")), &inner)?;
     let offset = add_nums(
       cs.namespace(|| format!("offset_{i}")),
       &u.num_zeros,
@@ -2947,7 +3156,10 @@ where
     .iter()
     .enumerate()
     .map(|(j, sr)| {
-      let pos = alloc_constant(cs.namespace(|| format!("sorted_pos_{j}")), &F::from(j as u64))?;
+      let pos = alloc_constant(
+        cs.namespace(|| format!("sorted_pos_{j}")),
+        &F::from(j as u64),
+      )?;
       Ok(IndexPositionPair::new(sr.idx.clone(), pos))
     })
     .collect::<Result<Vec<_>, SynthesisError>>()?;
@@ -2963,50 +3175,22 @@ where
 }
 
 impl FullRSShuffleCircuit {
-  fn from_instance(instance: BenchInstance) -> Self {
+  fn new(
+    statement: ShuffleStatement<N>,
+    witness: ShuffleWitness<N, LEVELS>,
+    bases: CommitmentBases,
+  ) -> Self {
     Self {
-      sk: instance.sk,
-      pk: instance.pk,
-      nonce: instance.nonce,
-      seed_digest: instance.seed_digest,
-      witness_trace: instance.witness_trace,
-      power_perm_vec: instance.power_perm_vec,
-      power_challenge: instance.power_challenge,
-      power_challenge_scalar: instance.power_challenge_scalar,
-      tau_base: instance.tau_base,
-      tau_scalar: instance.tau_scalar,
-      tau_powers: instance.tau_powers,
-      permutation_commitment: instance.permutation_commitment,
-      power_commitment: instance.power_commitment,
-      link_commitment: instance.link_commitment,
-      tuple_expected_product: instance.tuple_expected_product,
-      link_value: instance.link_value,
-      link_blinding: instance.link_blinding,
-      bases: instance.bases,
+      statement,
+      witness,
+      bases,
     }
   }
 }
 
 impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
   fn public_values(&self) -> Result<Vec<Scalar>, SynthesisError> {
-    let mut out = Vec::with_capacity(1 + 2 + N + 1 + 1 + 1 + 2 + 2 + 2 + 1);
-    out.push(self.pk.0);
-    out.push(self.pk.1);
-    out.push(self.nonce);
-    for i in 0..N {
-      out.push(Scalar::from(i as u64));
-    }
-    out.push(self.seed_digest);
-    out.push(self.power_challenge);
-    out.push(self.tau_base);
-    out.push(self.permutation_commitment.0);
-    out.push(self.permutation_commitment.1);
-    out.push(self.power_commitment.0);
-    out.push(self.power_commitment.1);
-    out.push(self.link_commitment.0);
-    out.push(self.link_commitment.1);
-    out.push(self.tuple_expected_product);
-    Ok(out)
+    Ok(encode_spartan_public_values(&self.statement))
   }
 
   fn shared<CS: ConstraintSystem<Scalar>>(
@@ -3035,9 +3219,10 @@ impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
     _precommitted: &[AllocatedNum<Scalar>],
     _challenges: Option<&[Scalar]>,
   ) -> Result<(), SynthesisError> {
-    let public_pk = alloc_point_public_input::<CurveEngine, _>(cs.namespace(|| "pk"), self.pk)?;
+    let public_pk =
+      alloc_point_public_input::<CurveEngine, _>(cs.namespace(|| "pk"), self.statement.pk)?;
     let nonce_public =
-      AllocatedNum::alloc_input(cs.namespace(|| "nonce"), || Ok(self.nonce))?;
+      AllocatedNum::alloc_input(cs.namespace(|| "nonce"), || Ok(self.statement.nonce))?;
     let initial_indices_public: Vec<AllocatedNum<Scalar>> = (0..N)
       .map(|i| {
         AllocatedNum::alloc_input(cs.namespace(|| format!("idx_init_{i}")), || {
@@ -3046,33 +3231,31 @@ impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
       })
       .collect::<Result<Vec<_>, _>>()?;
     let seed_digest_public = AllocatedNum::alloc_input(cs.namespace(|| "seed_digest"), || {
-      Ok(self.seed_digest)
+      Ok(self.statement.seed_digest)
     })?;
-    let power_challenge_public = AllocatedNum::alloc_input(cs.namespace(|| "x"), || {
-      Ok(self.power_challenge)
-    })?;
-    let tau_base_public = AllocatedNum::alloc_input(cs.namespace(|| "tau_base"), || {
-      Ok(self.tau_base)
-    })?;
+    let power_challenge_public =
+      AllocatedNum::alloc_input(cs.namespace(|| "x"), || Ok(self.statement.power_challenge))?;
+    let tau_base_public =
+      AllocatedNum::alloc_input(cs.namespace(|| "tau_base"), || Ok(self.statement.tau_base))?;
     let permutation_commitment_public = alloc_point_public_input::<CurveEngine, _>(
       cs.namespace(|| "C_perm"),
-      self.permutation_commitment,
+      self.statement.permutation_commitment,
     )?;
     let power_commitment_public = alloc_point_public_input::<CurveEngine, _>(
       cs.namespace(|| "C_power"),
-      self.power_commitment,
+      self.statement.power_commitment,
     )?;
     let link_commitment_public = alloc_point_public_input::<CurveEngine, _>(
       cs.namespace(|| "C_link"),
-      self.link_commitment,
+      self.statement.link_commitment,
     )?;
     let tuple_expected_public = AllocatedNum::alloc_input(cs.namespace(|| "P_graph"), || {
-      Ok(self.tuple_expected_product)
+      Ok(self.statement.tuple_expected_product)
     })?;
 
     let witness_var = PermutationWitnessTraceVar::<Scalar, N, LEVELS>::alloc(
       cs.namespace(|| "witness"),
-      &self.witness_trace,
+      &self.witness.witness_trace,
     )?;
 
     for (i, (expected, row)) in initial_indices_public
@@ -3087,16 +3270,18 @@ impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
       )?;
     }
 
-    let sk_witness = EmulatedLinkerVar::alloc_witness(cs.namespace(|| "sk"), Some(self.sk))?;
+    let sk_witness =
+      EmulatedLinkerVar::alloc_witness(cs.namespace(|| "sk"), Some(self.witness.sk))?;
     let power_challenge_scalar_wit = EmulatedLinkerVar::alloc_noncanonical_witness(
       cs.namespace(|| "x_scalar"),
-      Some(self.power_challenge_scalar),
+      Some(self.witness.power_challenge_scalar),
     )?;
     let tau_scalar_wit = EmulatedLinkerVar::alloc_noncanonical_witness(
       cs.namespace(|| "tau_scalar"),
-      Some(self.tau_scalar),
+      Some(self.witness.tau_scalar),
     )?;
     let power_perm_vec_wit: Vec<EmulatedLinkerVar> = self
+      .witness
       .power_perm_vec
       .iter()
       .enumerate()
@@ -3109,11 +3294,11 @@ impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
       .collect::<Result<Vec<_>, _>>()?;
     let link_value_wit = EmulatedLinkerVar::alloc_noncanonical_witness(
       cs.namespace(|| "link_value"),
-      Some(self.link_value),
+      Some(self.witness.link_value),
     )?;
     let link_blinding_wit = EmulatedLinkerVar::alloc_noncanonical_witness(
       cs.namespace(|| "link_blinding"),
-      Some(self.link_blinding),
+      Some(self.witness.link_blinding),
     )?;
 
     let generator =
@@ -3191,7 +3376,9 @@ impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
       cs.namespace(|| "final_multiset_check"),
       &initial_indices_public,
       &final_indices,
-      std::slice::from_ref(&perm_alpha).try_into().expect("single challenge"),
+      std::slice::from_ref(&perm_alpha)
+        .try_into()
+        .expect("single challenge"),
     )?;
 
     let mut link_transcript = PoseidonSpongeCircuit::new(cs, "link_transcript");
@@ -3199,8 +3386,7 @@ impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
     link_transcript.absorb_point(cs, &permutation_commitment_public)?;
     link_transcript.absorb_bytes_constant(cs, b"power-challenge")?;
     let x_squeezed = link_transcript.squeeze_field_elements(cs, 1)?;
-    let x_from_commit =
-      replace_zero_with_one(cs.namespace(|| "x_zero_fix"), &x_squeezed[0])?;
+    let x_from_commit = replace_zero_with_one(cs.namespace(|| "x_zero_fix"), &x_squeezed[0])?;
     enforce_equal_num(
       cs.namespace(|| "x_match"),
       &x_from_commit,
@@ -3209,17 +3395,14 @@ impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
     enforce_base_to_emulated(
       cs.namespace(|| "x_base_to_scalar"),
       &power_challenge_public,
-      self.power_challenge,
+      self.statement.power_challenge,
       &power_challenge_scalar_wit,
     )?;
     link_transcript.absorb_allocated_field(cs, &seed_digest_public)?;
     link_transcript.absorb_point(cs, &power_commitment_public)?;
     link_transcript.absorb_bytes_constant(cs, b"tau-challenge")?;
     let tau_squeezed = link_transcript.squeeze_field_elements(cs, 1)?;
-    let tau_from_commit = replace_zero_with_one(
-      cs.namespace(|| "tau_zero_fix"),
-      &tau_squeezed[0],
-    )?;
+    let tau_from_commit = replace_zero_with_one(cs.namespace(|| "tau_zero_fix"), &tau_squeezed[0])?;
     enforce_equal_num(
       cs.namespace(|| "tau_base_match"),
       &tau_from_commit,
@@ -3228,7 +3411,7 @@ impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
     enforce_base_to_emulated(
       cs.namespace(|| "tau_base_to_scalar"),
       &tau_base_public,
-      self.tau_base,
+      self.statement.tau_base,
       &tau_scalar_wit,
     )?;
     link_transcript.absorb_bytes_constant(cs, b"tuple-challenges")?;
@@ -3238,7 +3421,11 @@ impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
     let tuple_limb_coeffs = tuple_challenges[2..].to_vec();
 
     let mut tuple_product = alloc_constant(cs.namespace(|| "tuple_prod_init"), &Scalar::ONE)?;
-    for (i, (pi_i, b_i)) in final_indices.iter().zip(power_perm_vec_wit.iter()).enumerate() {
+    for (i, (pi_i, b_i)) in final_indices
+      .iter()
+      .zip(power_perm_vec_wit.iter())
+      .enumerate()
+    {
       let encoded_idx = tuple_index_coeff.mul(cs.namespace(|| format!("enc_idx_{i}")), pi_i)?;
       let mut encoded = encoded_idx;
       for (limb_idx, (coeff, limb)) in tuple_limb_coeffs.iter().zip(b_i.limbs.iter()).enumerate() {
@@ -3261,7 +3448,7 @@ impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
     enforce_constant_link_sum(
       cs.namespace(|| "link_sum"),
       &power_perm_vec_wit,
-      &self.tau_powers,
+      &self.witness.tau_powers,
       &link_value_wit,
     )?;
 
@@ -3286,7 +3473,8 @@ impl SpartanCircuit<PallasHyraxEngine> for FullRSShuffleCircuit {
     let zero_inf = alloc_zero(cs.namespace(|| "zero_infinity"));
     let l_term_complete: AllocatedPoint<CurveEngine> = l_term.to_allocated_point(&zero_inf)?;
     let r_term_complete: AllocatedPoint<CurveEngine> = r_term.to_allocated_point(&zero_inf)?;
-    let commitment_sum = l_term_complete.add(cs.namespace(|| "commitment_sum"), &r_term_complete)?;
+    let commitment_sum =
+      l_term_complete.add(cs.namespace(|| "commitment_sum"), &r_term_complete)?;
     enforce_equal_num(
       cs.namespace(|| "commitment_not_infinity"),
       &commitment_sum.is_infinity,
@@ -3307,7 +3495,10 @@ fn metric_group(name: &str) -> String {
     "rs_final_multiset".to_string()
   } else if top == "witness" {
     "rs_witness_alloc".to_string()
-  } else if top.starts_with("rs_bits") || top.starts_with("sample_bits_") || top.starts_with("bind_rs_bit_") {
+  } else if top.starts_with("rs_bits")
+    || top.starts_with("sample_bits_")
+    || top.starts_with("bind_rs_bit_")
+  {
     "rs_bit_binding".to_string()
   } else if top == "rs_transcript" {
     "rs_transcript".to_string()
@@ -3362,11 +3553,7 @@ fn log_subprefix_counts(entries: &[String], prefix: &str, limit: usize) {
   let mut counts = BTreeMap::<String, usize>::new();
   for entry in entries {
     if entry.starts_with(prefix) {
-      let bucket = entry
-        .split('/')
-        .take(2)
-        .collect::<Vec<_>>()
-        .join("/");
+      let bucket = entry.split('/').take(2).collect::<Vec<_>>().join("/");
       *counts.entry(bucket).or_default() += 1;
     }
   }
@@ -3416,10 +3603,14 @@ fn main() {
   );
   println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-  let sample_instance = build_bench_instance();
-  let sample_sigma_inputs = build_sigma_inputs::<N>(&sample_instance);
-  validate_shared_bench_relations(&sample_instance, &sample_sigma_inputs);
-  let circuit = FullRSShuffleCircuit::from_instance(sample_instance.clone());
+  let bases = COMMITMENT_BASES.clone();
+  let (sample_statement, sample_witness) = build_shuffle_statement_and_witness(&bases);
+  validate_shared_shuffle_relations(&sample_statement, &sample_witness, &bases);
+  let circuit = FullRSShuffleCircuit::new(
+    sample_statement.clone(),
+    sample_witness.clone(),
+    bases.clone(),
+  );
 
   println!("Checking satisfiability...");
   let mut test_cs = TestConstraintSystem::<Scalar>::new();
@@ -3469,23 +3660,23 @@ fn main() {
 
   println!("\nPreparing proving instance...");
   let witness_generation_start = Instant::now();
-  let proving_instance = build_bench_instance();
-  let proving_sigma_inputs = build_sigma_inputs::<N>(&proving_instance);
-  let proving_circuit = FullRSShuffleCircuit::from_instance(proving_instance.clone());
-  let witness_generation_time = witness_generation_start.elapsed();
-  println!(
-    "  Witness + commitments: {:?}",
-    witness_generation_time
+  let (proving_statement, proving_witness) = build_shuffle_statement_and_witness(&bases);
+  let proving_circuit = FullRSShuffleCircuit::new(
+    proving_statement.clone(),
+    proving_witness.clone(),
+    bases.clone(),
   );
+  let witness_generation_time = witness_generation_start.elapsed();
+  println!("  Witness + commitments: {:?}", witness_generation_time);
   let equivalence_check_start = Instant::now();
-  validate_shared_bench_relations(&proving_instance, &proving_sigma_inputs);
+  validate_shared_shuffle_relations(&proving_statement, &proving_witness, &bases);
   let equivalence_check_time = equivalence_check_start.elapsed();
   println!("  Equivalence checks: {:?}", equivalence_check_time);
 
   println!("\nRunning prep_prove...");
   let prep_start = Instant::now();
-  let prep = SpartanSNARK::<PallasHyraxEngine>::prep_prove(&pk, proving_circuit.clone(), false)
-    .expect("prep_prove failed");
+  let prep =
+    ShuffleSnark::prep_prove(&pk, proving_circuit.clone(), false).expect("prep_prove failed");
   let prep_time = prep_start.elapsed();
   println!("  Prep time: {:?}", prep_time);
 
@@ -3494,19 +3685,21 @@ fn main() {
   let (proof, sigma_proof, prove_time, sigma_prove_time) = std::thread::scope(|scope| {
     let sigma_handle = scope.spawn(|| {
       let sigma_prove_start = Instant::now();
-      let sigma_proof = prove_native_sigma::<N>(&proving_instance, &proving_sigma_inputs);
+      let sigma_proof = prove_native_sigma::<N>(&proving_statement, &proving_witness, &bases);
       (sigma_proof, sigma_prove_start.elapsed())
     });
 
     let prove_start = Instant::now();
-    let proof =
-      SpartanSNARK::<PallasHyraxEngine>::prove(&pk, proving_circuit, &prep, false)
-        .expect("prove failed");
+    let proof = ShuffleSnark::prove(&pk, proving_circuit, &prep, false).expect("prove failed");
     let prove_time = prove_start.elapsed();
 
     let (sigma_proof, sigma_prove_time) = sigma_handle.join().expect("sigma prove thread panicked");
     (proof, sigma_proof, prove_time, sigma_prove_time)
   });
+  let shuffle_proof = ShuffleProof {
+    spartan_proof: proof,
+    sigma_proof,
+  };
   let parallel_prove_time = parallel_prove_start.elapsed();
   let combined_prove_time = witness_generation_time + prep_time + parallel_prove_time;
   println!("  Spartan prove time: {:?}", prove_time);
@@ -3515,12 +3708,13 @@ fn main() {
 
   println!("\nRunning verify...");
   let verify_start = Instant::now();
-  let result = proof.verify(&vk);
+  let result =
+    verify_spartan_statement_binding(&vk, &proving_statement, &shuffle_proof.spartan_proof);
   let verify_time = verify_start.elapsed();
 
   match result {
     Ok(public_outputs) => {
-      println!("  Proof verified successfully");
+      println!("  Spartan proof verified successfully");
       println!("  Verify time: {:?}", verify_time);
       println!("  Public outputs: {} values", public_outputs.len());
     }
@@ -3532,16 +3726,21 @@ fn main() {
 
   println!("\nRunning native BG/Sigma verify...");
   let sigma_verify_start = Instant::now();
-  let sigma_ok = verify_native_sigma::<N>(&proving_instance, &proving_sigma_inputs, &sigma_proof);
+  let sigma_ok = verify_native_sigma_public(&proving_statement, &shuffle_proof.sigma_proof, &bases);
   let sigma_verify_time = sigma_verify_start.elapsed();
-  if !sigma_ok {
-    println!("  Sigma verification failed");
+  if let Err(err) = sigma_ok {
+    println!("  Sigma verification failed: {err}");
     std::process::exit(1);
   }
   println!("  Sigma verification succeeded");
   println!("  Sigma verify time: {:?}", sigma_verify_time);
 
   let combined_verify_time = verify_time + sigma_verify_time;
+
+  if let Err(err) = verify_shuffle_proof(&vk, &proving_statement, &shuffle_proof, &bases) {
+    println!("  Combined verifier failed: {err}");
+    std::process::exit(1);
+  }
 
   println!("\n╔══════════════════════════════════════════════════════════════╗");
   println!("║                        SUMMARY                               ║");
