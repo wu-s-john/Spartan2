@@ -28,6 +28,7 @@ use halo2curves::{CurveAffine, group::prime::PrimeCurveAffine};
 use num_bigint::BigUint;
 use num_traits::{One as _, Zero as _};
 use once_cell::sync::Lazy;
+use rayon::join;
 use std::time::Instant;
 use std::{collections::BTreeMap, fmt};
 
@@ -45,6 +46,7 @@ use spartan2::{
     },
   },
   provider::traits::DlogGroup,
+  provider::traits::DlogGroupExt,
   provider::{PallasHyraxEngine, VestaHyraxEngine, pasta::pallas},
   rs_shuffle_bp::{
     data_structures::{
@@ -73,6 +75,7 @@ type Scalar = pallas::Scalar;
 type CurveEngine = VestaHyraxEngine;
 type LinkerScalar = <CurveEngine as Engine>::Scalar;
 type ShuffleSnark = SpartanSNARK<PallasHyraxEngine>;
+type CurvePoint = <CurveEngine as Engine>::GE;
 type CurveAffinePoint = <<CurveEngine as Engine>::GE as DlogGroup>::AffineGroupElement;
 
 const EMULATED_LIMB_BITS: usize = 32;
@@ -116,13 +119,16 @@ struct PoseidonSpongeCircuit {
 #[derive(Clone)]
 struct CommitmentBases {
   generator: (Scalar, Scalar),
+  generator_affine: CurveAffinePoint,
   generator_powers: Vec<(Scalar, Scalar)>,
-  perm_bases: Vec<(Scalar, Scalar)>,
-  perm_blind_base: (Scalar, Scalar),
-  power_bases: Vec<(Scalar, Scalar)>,
-  power_blind_base: (Scalar, Scalar),
+  perm_bases_affine: Vec<CurveAffinePoint>,
+  perm_blind_base_affine: CurveAffinePoint,
+  power_bases_affine: Vec<CurveAffinePoint>,
+  power_blind_base_affine: CurveAffinePoint,
   link_base: (Scalar, Scalar),
+  link_base_affine: CurveAffinePoint,
   link_blind_base: (Scalar, Scalar),
+  link_blind_base_affine: CurveAffinePoint,
   link_base_powers: Vec<(Scalar, Scalar)>,
   link_blind_powers: Vec<(Scalar, Scalar)>,
 }
@@ -1948,95 +1954,143 @@ where
   Some((ax * z_inv2, ay * z_inv3))
 }
 
-fn native_add_optional(
-  acc: Option<(Scalar, Scalar)>,
-  point: Option<(Scalar, Scalar)>,
-  curve_a: Scalar,
-) -> Option<(Scalar, Scalar)> {
-  match (acc, point) {
-    (None, None) => None,
-    (Some(acc), None) => Some(acc),
-    (None, Some(point)) => Some(point),
-    (Some((ax, ay)), Some((px, py))) => Some(affine_add_safe(ax, ay, px, py, curve_a)),
-  }
+fn affine_from_coords(point: (Scalar, Scalar)) -> Option<CurveAffinePoint> {
+  CurveAffinePoint::from_xy(point.0, point.1).into()
 }
 
-fn coords_from_affine(
-  affine: &<<CurveEngine as Engine>::GE as DlogGroup>::AffineGroupElement,
-) -> (Scalar, Scalar) {
-  let point = <CurveEngine as Engine>::GE::group(affine);
+fn coords_from_affine(affine: &CurveAffinePoint) -> (Scalar, Scalar) {
+  let point = CurvePoint::group(affine);
   let (x, y, is_inf) = point.to_coordinates();
   assert!(!is_inf, "expected non-infinity point");
   (x, y)
 }
 
+fn coords_from_group(point: &CurvePoint) -> (Scalar, Scalar) {
+  let (x, y, is_inf) = point.to_coordinates();
+  assert!(!is_inf, "expected non-infinity point");
+  (x, y)
+}
+
+fn group_from_affine(point: &CurveAffinePoint) -> CurvePoint {
+  CurvePoint::group(point)
+}
+
+fn group_from_coords(point: (Scalar, Scalar)) -> CurvePoint {
+  group_from_affine(&affine_from_coords(point).expect("expected valid affine point"))
+}
+
+fn labeled_affine_points(label: &'static [u8], n: usize) -> Vec<CurveAffinePoint> {
+  CurvePoint::from_label(label, n)
+}
+
 fn labeled_points(label: &'static [u8], n: usize) -> Vec<(Scalar, Scalar)> {
-  <<CurveEngine as Engine>::GE as DlogGroup>::from_label(label, n)
+  labeled_affine_points(label, n)
     .iter()
     .map(coords_from_affine)
     .collect()
 }
 
+fn scalar_mul_affine_point(scalar: LinkerScalar, point: &CurveAffinePoint) -> CurvePoint {
+  group_from_affine(point) * scalar
+}
+
+fn native_ciphertext_from_groups(
+  c1: &CurvePoint,
+  c2: &CurvePoint,
+) -> NativeCiphertext<CurveEngine> {
+  let c1 = coords_from_group(c1);
+  let c2 = coords_from_group(c2);
+  NativeCiphertext::new(c1.0, c1.1, c2.0, c2.1)
+}
+
+fn ciphertext_affine_bases<const N_LOCAL: usize>(
+  ciphertexts: &[NativeCiphertext<CurveEngine>; N_LOCAL],
+) -> (Vec<CurveAffinePoint>, Vec<CurveAffinePoint>) {
+  let c1_bases = ciphertexts
+    .iter()
+    .map(|ct| affine_from_coords((ct.c1_x, ct.c1_y)).expect("expected valid c1 point"))
+    .collect();
+  let c2_bases = ciphertexts
+    .iter()
+    .map(|ct| affine_from_coords((ct.c2_x, ct.c2_y)).expect("expected valid c2 point"))
+    .collect();
+  (c1_bases, c2_bases)
+}
+
+fn native_ciphertext_msm_groups(
+  c1_bases: &[CurveAffinePoint],
+  c2_bases: &[CurveAffinePoint],
+  scalars: &[LinkerScalar],
+) -> (CurvePoint, CurvePoint) {
+  let (c1, c2) = join(
+    || {
+      CurvePoint::vartime_multiscalar_mul(scalars, c1_bases)
+        .expect("ciphertext msm c1 must succeed")
+    },
+    || {
+      CurvePoint::vartime_multiscalar_mul(scalars, c2_bases)
+        .expect("ciphertext msm c2 must succeed")
+    },
+  );
+  (c1, c2)
+}
+
 fn build_commitment_bases() -> CommitmentBases {
-  let generator = {
-    let (x, y, is_inf) = <CurveEngine as Engine>::GE::generator().to_coordinates();
-    assert!(!is_inf, "curve generator must not be infinity");
-    (x, y)
-  };
+  let generator_affine = CurvePoint::generator().affine();
+  let generator = coords_from_affine(&generator_affine);
   let num_bits = LinkerScalar::NUM_BITS as usize;
 
-  let perm_points = labeled_points(b"spartan2-bench-perm", N + 1);
-  let power_points = labeled_points(b"spartan2-bench-power", N + 1);
-  let link_points = labeled_points(b"spartan2-bench-link", 2);
+  let perm_bases_affine = labeled_affine_points(b"spartan2-bench-perm", N + 1);
+  let power_bases_affine = labeled_affine_points(b"spartan2-bench-power", N + 1);
+  let link_bases_affine = labeled_affine_points(b"spartan2-bench-link", 2);
+
+  let link_points: Vec<_> = link_bases_affine.iter().map(coords_from_affine).collect();
 
   CommitmentBases {
     generator,
+    generator_affine,
     generator_powers: precompute_native_powers::<CurveEngine>(generator, num_bits),
-    perm_bases: perm_points[..N].to_vec(),
-    perm_blind_base: perm_points[N],
-    power_bases: power_points[..N].to_vec(),
-    power_blind_base: power_points[N],
+    perm_bases_affine: perm_bases_affine[..N].to_vec(),
+    perm_blind_base_affine: perm_bases_affine[N],
+    power_bases_affine: power_bases_affine[..N].to_vec(),
+    power_blind_base_affine: power_bases_affine[N],
     link_base: link_points[0],
+    link_base_affine: link_bases_affine[0],
     link_blind_base: link_points[1],
+    link_blind_base_affine: link_bases_affine[1],
     link_base_powers: precompute_native_powers::<CurveEngine>(link_points[0], num_bits),
     link_blind_powers: precompute_native_powers::<CurveEngine>(link_points[1], num_bits),
   }
 }
 
-fn native_vector_commitment<S>(
-  values: &[S],
-  bases: &[(Scalar, Scalar)],
-  blinding: S,
-  blind_base: (Scalar, Scalar),
-) -> (Scalar, Scalar)
-where
-  S: PrimeFieldBits + PartialEq + Copy,
-{
+fn native_vector_commitment(
+  values: &[LinkerScalar],
+  bases: &[CurveAffinePoint],
+  blinding: LinkerScalar,
+  blind_base: &CurveAffinePoint,
+) -> (Scalar, Scalar) {
   assert_eq!(values.len(), bases.len(), "commitment arity mismatch");
-  let (curve_a, _, _, _) = <CurveEngine as Engine>::GE::group_params();
-  let mut acc = None;
-
-  for (value, base) in values.iter().zip(bases.iter()) {
-    let term = native_scalar_mul_maybe(*value, base.0, base.1, curve_a);
-    acc = native_add_optional(acc, term, curve_a);
-  }
-
-  let blind_term = native_scalar_mul_maybe(blinding, blind_base.0, blind_base.1, curve_a);
-  acc = native_add_optional(acc, blind_term, curve_a);
-
-  acc.expect("commitment must be non-infinity")
+  let (msm_term, blind_term) = join(
+    || {
+      CurvePoint::vartime_multiscalar_mul(values, bases)
+        .expect("vector commitment msm must succeed")
+    },
+    || scalar_mul_affine_point(blinding, blind_base),
+  );
+  coords_from_group(&(msm_term + blind_term))
 }
 
 fn native_link_commitment(
   link_value: LinkerScalar,
   link_blinding: LinkerScalar,
-  link_base: (Scalar, Scalar),
-  blind_base: (Scalar, Scalar),
+  link_base: &CurveAffinePoint,
+  blind_base: &CurveAffinePoint,
 ) -> (Scalar, Scalar) {
-  let (curve_a, _, _, _) = <CurveEngine as Engine>::GE::group_params();
-  let l_term = native_scalar_mul_maybe(link_value, link_base.0, link_base.1, curve_a);
-  let r_term = native_scalar_mul_maybe(link_blinding, blind_base.0, blind_base.1, curve_a);
-  native_add_optional(l_term, r_term, curve_a).expect("link commitment must be non-infinity")
+  let (l_term, r_term) = join(
+    || scalar_mul_affine_point(link_value, link_base),
+    || scalar_mul_affine_point(link_blinding, blind_base),
+  );
+  coords_from_group(&(l_term + r_term))
 }
 
 fn nonzero_linker_scalar_from_base(value: Scalar) -> LinkerScalar {
@@ -2069,30 +2123,9 @@ fn native_ciphertext_msm<const N_LOCAL: usize>(
   ciphertexts: &[NativeCiphertext<CurveEngine>; N_LOCAL],
   scalars: &[LinkerScalar; N_LOCAL],
 ) -> NativeCiphertext<CurveEngine> {
-  let (curve_a, _, _, _) = <CurveEngine as Engine>::GE::group_params();
-  let c1 = ciphertexts
-    .iter()
-    .zip(scalars.iter())
-    .fold(None, |acc, (ct, scalar)| {
-      native_add_optional(
-        acc,
-        native_scalar_mul_maybe(*scalar, ct.c1_x, ct.c1_y, curve_a),
-        curve_a,
-      )
-    })
-    .expect("ciphertext msm c1 must be non-infinity");
-  let c2 = ciphertexts
-    .iter()
-    .zip(scalars.iter())
-    .fold(None, |acc, (ct, scalar)| {
-      native_add_optional(
-        acc,
-        native_scalar_mul_maybe(*scalar, ct.c2_x, ct.c2_y, curve_a),
-        curve_a,
-      )
-    })
-    .expect("ciphertext msm c2 must be non-infinity");
-  NativeCiphertext::new(c1.0, c1.1, c2.0, c2.1)
+  let (c1_bases, c2_bases) = ciphertext_affine_bases(ciphertexts);
+  let (c1, c2) = native_ciphertext_msm_groups(&c1_bases, &c2_bases, scalars);
+  native_ciphertext_from_groups(&c1, &c2)
 }
 
 fn native_encrypt_zero_and_combine<const N_LOCAL: usize>(
@@ -2102,15 +2135,21 @@ fn native_encrypt_zero_and_combine<const N_LOCAL: usize>(
   scalar_factors: &[LinkerScalar; N_LOCAL],
   generator: (Scalar, Scalar),
 ) -> NativeCiphertext<CurveEngine> {
-  let (curve_a, _, _, _) = <CurveEngine as Engine>::GE::group_params();
-  let rerand_c1 = native_scalar_mul_maybe(randomness, generator.0, generator.1, curve_a)
-    .expect("rerandomization c1 must be non-infinity");
-  let rerand_c2 = native_scalar_mul_maybe(randomness, public_key.0, public_key.1, curve_a)
-    .expect("rerandomization c2 must be non-infinity");
-  let msm = native_ciphertext_msm(ciphertexts, scalar_factors);
-  let c1 = native_add_points(rerand_c1, (msm.c1_x, msm.c1_y));
-  let c2 = native_add_points(rerand_c2, (msm.c2_x, msm.c2_y));
-  NativeCiphertext::new(c1.0, c1.1, c2.0, c2.1)
+  let public_key_affine = affine_from_coords(public_key).expect("expected valid public key");
+  let generator_affine = affine_from_coords(generator).expect("expected valid generator");
+  let (c1_bases, c2_bases) = ciphertext_affine_bases(ciphertexts);
+  let (msm_terms, rerand_terms) = join(
+    || native_ciphertext_msm_groups(&c1_bases, &c2_bases, scalar_factors),
+    || {
+      join(
+        || scalar_mul_affine_point(randomness, &generator_affine),
+        || scalar_mul_affine_point(randomness, &public_key_affine),
+      )
+    },
+  );
+  let c1 = msm_terms.0 + rerand_terms.0;
+  let c2 = msm_terms.1 + rerand_terms.1;
+  native_ciphertext_from_groups(&c1, &c2)
 }
 
 fn sigma_absorb_public_inputs(
@@ -2132,14 +2171,17 @@ fn rerandomize_ciphertext(
   public_key: (Scalar, Scalar),
   generator: (Scalar, Scalar),
 ) -> NativeCiphertext<CurveEngine> {
-  let (curve_a, _, _, _) = <CurveEngine as Engine>::GE::group_params();
-  let rerand_c1 = native_scalar_mul_maybe(randomness, generator.0, generator.1, curve_a)
-    .expect("rerandomized c1 must be non-infinity");
-  let rerand_c2 = native_scalar_mul_maybe(randomness, public_key.0, public_key.1, curve_a)
-    .expect("rerandomized c2 must be non-infinity");
-  let c1 = native_add_points((ciphertext.c1_x, ciphertext.c1_y), rerand_c1);
-  let c2 = native_add_points((ciphertext.c2_x, ciphertext.c2_y), rerand_c2);
-  NativeCiphertext::new(c1.0, c1.1, c2.0, c2.1)
+  let ciphertext_c1 = group_from_coords((ciphertext.c1_x, ciphertext.c1_y));
+  let ciphertext_c2 = group_from_coords((ciphertext.c2_x, ciphertext.c2_y));
+  let public_key_affine = affine_from_coords(public_key).expect("expected valid public key");
+  let generator_affine = affine_from_coords(generator).expect("expected valid generator");
+  let (rerand_c1, rerand_c2) = join(
+    || scalar_mul_affine_point(randomness, &generator_affine),
+    || scalar_mul_affine_point(randomness, &public_key_affine),
+  );
+  let c1 = ciphertext_c1 + rerand_c1;
+  let c2 = ciphertext_c2 + rerand_c2;
+  native_ciphertext_from_groups(&c1, &c2)
 }
 
 fn powers_sequence<const N_LOCAL: usize>(x: LinkerScalar) -> [LinkerScalar; N_LOCAL] {
@@ -2174,18 +2216,25 @@ fn encode_spartan_public_values<const N_LOCAL: usize>(
   out
 }
 
-fn validate_public_point(
+fn checked_affine_from_coords(
   label: impl Into<String>,
   point: (Scalar, Scalar),
-) -> Result<(), ShuffleVerifyError> {
+) -> Result<CurveAffinePoint, ShuffleVerifyError> {
   let label = label.into();
-  let point: Option<CurveAffinePoint> = CurveAffinePoint::from_xy(point.0, point.1).into();
-  let Some(point) = point else {
+  let Some(point) = affine_from_coords(point) else {
     return Err(ShuffleVerifyError::InvalidPoint { label });
   };
   if bool::from(point.is_identity()) {
     return Err(ShuffleVerifyError::InvalidPoint { label });
   }
+  Ok(point)
+}
+
+fn validate_public_point(
+  label: impl Into<String>,
+  point: (Scalar, Scalar),
+) -> Result<(), ShuffleVerifyError> {
+  checked_affine_from_coords(label, point)?;
   Ok(())
 }
 
@@ -2247,6 +2296,8 @@ fn prove_native_sigma<const N_LOCAL: usize>(
 ) -> NativeReencryptionProof<N_LOCAL> {
   let powers = powers_sequence::<N_LOCAL>(witness.power_challenge_scalar);
   let input_ciphertext_aggregator = native_ciphertext_msm(&statement.input_ciphertexts, &powers);
+  let pk_affine = affine_from_coords(statement.pk).expect("expected valid public key");
+  let (output_c1_bases, output_c2_bases) = ciphertext_affine_bases(&statement.output_ciphertexts);
 
   let blinding_factors =
     derive_sigma_scalars::<N_LOCAL>(statement.seed_digest, b"sigma-blinding-factors");
@@ -2254,18 +2305,30 @@ fn prove_native_sigma<const N_LOCAL: usize>(
   let blinding_factor_for_commitment = sigma_aux[0];
   let ciphertext_masking_rerand = sigma_aux[1];
 
-  let blinding_factor_commitment = native_vector_commitment(
-    &blinding_factors,
-    &bases.power_bases,
-    blinding_factor_for_commitment,
-    bases.power_blind_base,
-  );
-  let blinding_rerandomization_commitment = native_encrypt_zero_and_combine(
-    statement.pk,
-    ciphertext_masking_rerand,
-    &statement.output_ciphertexts,
-    &blinding_factors,
-    bases.generator,
+  let (blinding_factor_commitment, blinding_rerandomization_commitment) = join(
+    || {
+      native_vector_commitment(
+        &blinding_factors,
+        &bases.power_bases_affine,
+        blinding_factor_for_commitment,
+        &bases.power_blind_base_affine,
+      )
+    },
+    || {
+      let (msm_terms, rerand_terms) = join(
+        || native_ciphertext_msm_groups(&output_c1_bases, &output_c2_bases, &blinding_factors),
+        || {
+          join(
+            || scalar_mul_affine_point(ciphertext_masking_rerand, &bases.generator_affine),
+            || scalar_mul_affine_point(ciphertext_masking_rerand, &pk_affine),
+          )
+        },
+      );
+      native_ciphertext_from_groups(
+        &(msm_terms.0 + rerand_terms.0),
+        &(msm_terms.1 + rerand_terms.1),
+      )
+    },
   );
 
   let mut transcript = PoseidonSpongeNative::new();
@@ -2285,15 +2348,17 @@ fn prove_native_sigma<const N_LOCAL: usize>(
   ));
   let challenge = nonzero_linker_scalar_from_base(transcript.squeeze_field_elements(1)[0]);
 
-  let aggregated_rerandomizer = -witness
-    .power_perm_vec
-    .iter()
-    .zip(witness.rerandomization_scalars.iter())
-    .map(|(b_i, rho_i)| *b_i * *rho_i)
-    .sum::<LinkerScalar>();
-
-  let sigma_response_power_permutation_vector =
-    std::array::from_fn(|i| blinding_factors[i] + challenge * witness.power_perm_vec[i]);
+  let (aggregated_rerandomizer, sigma_response_power_permutation_vector) = join(
+    || {
+      -witness
+        .power_perm_vec
+        .iter()
+        .zip(witness.rerandomization_scalars.iter())
+        .map(|(b_i, rho_i)| *b_i * *rho_i)
+        .sum::<LinkerScalar>()
+    },
+    || std::array::from_fn(|i| blinding_factors[i] + challenge * witness.power_perm_vec[i]),
+  );
   let sigma_response_blinding = blinding_factor_for_commitment + challenge * witness.power_blinding;
   let sigma_response_rerand = ciphertext_masking_rerand + challenge * aggregated_rerandomizer;
 
@@ -2312,9 +2377,43 @@ fn verify_native_sigma_public<const N_LOCAL: usize>(
   bases: &CommitmentBases,
 ) -> Result<(), ShuffleVerifyError> {
   let derived = derive_statement_challenges(statement)?;
-  let (curve_a, _, _, _) = <CurveEngine as Engine>::GE::group_params();
   let powers = powers_sequence::<N_LOCAL>(derived.power_challenge_scalar);
   let input_ciphertext_aggregator = native_ciphertext_msm(&statement.input_ciphertexts, &powers);
+  let power_commitment_affine = checked_affine_from_coords("C_power", statement.power_commitment)?;
+  let proof_blinding_factor_commitment_affine = checked_affine_from_coords(
+    "sigma.blinding_factor_commitment",
+    proof.blinding_factor_commitment,
+  )?;
+  let proof_blinding_rerand_c1 = checked_affine_from_coords(
+    "sigma.blinding_rerandomization_commitment.c1",
+    (
+      proof.blinding_rerandomization_commitment.c1_x,
+      proof.blinding_rerandomization_commitment.c1_y,
+    ),
+  )?;
+  let proof_blinding_rerand_c2 = checked_affine_from_coords(
+    "sigma.blinding_rerandomization_commitment.c2",
+    (
+      proof.blinding_rerandomization_commitment.c2_x,
+      proof.blinding_rerandomization_commitment.c2_y,
+    ),
+  )?;
+  let input_aggregator_c1 = checked_affine_from_coords(
+    "sigma.input_aggregator.c1",
+    (
+      input_ciphertext_aggregator.c1_x,
+      input_ciphertext_aggregator.c1_y,
+    ),
+  )?;
+  let input_aggregator_c2 = checked_affine_from_coords(
+    "sigma.input_aggregator.c2",
+    (
+      input_ciphertext_aggregator.c2_x,
+      input_ciphertext_aggregator.c2_y,
+    ),
+  )?;
+  let output_pk_affine = checked_affine_from_coords("pk", statement.pk)?;
+  let (output_c1_bases, output_c2_bases) = ciphertext_affine_bases(&statement.output_ciphertexts);
 
   let mut transcript = PoseidonSpongeNative::new();
   sigma_absorb_public_inputs(
@@ -2333,21 +2432,40 @@ fn verify_native_sigma_public<const N_LOCAL: usize>(
   ));
   let challenge = nonzero_linker_scalar_from_base(transcript.squeeze_field_elements(1)[0]);
 
-  let lhs_com = native_vector_commitment(
-    &proof.sigma_response_power_permutation_vector,
-    &bases.power_bases,
-    proof.sigma_response_blinding,
-    bases.power_blind_base,
+  let (lhs_com, lhs_grp) = join(
+    || {
+      native_vector_commitment(
+        &proof.sigma_response_power_permutation_vector,
+        &bases.power_bases_affine,
+        proof.sigma_response_blinding,
+        &bases.power_blind_base_affine,
+      )
+    },
+    || {
+      let (msm_terms, rerand_terms) = join(
+        || {
+          native_ciphertext_msm_groups(
+            &output_c1_bases,
+            &output_c2_bases,
+            &proof.sigma_response_power_permutation_vector,
+          )
+        },
+        || {
+          join(
+            || scalar_mul_affine_point(proof.sigma_response_rerand, &bases.generator_affine),
+            || scalar_mul_affine_point(proof.sigma_response_rerand, &output_pk_affine),
+          )
+        },
+      );
+      native_ciphertext_from_groups(
+        &(msm_terms.0 + rerand_terms.0),
+        &(msm_terms.1 + rerand_terms.1),
+      )
+    },
   );
-  let rhs_com = native_add_points(
-    proof.blinding_factor_commitment,
-    native_scalar_mul_maybe(
-      challenge,
-      statement.power_commitment.0,
-      statement.power_commitment.1,
-      curve_a,
-    )
-    .expect("power commitment scaling must be non-infinity"),
+  let rhs_com = coords_from_group(
+    &(group_from_affine(&proof_blinding_factor_commitment_affine)
+      + scalar_mul_affine_point(challenge, &power_commitment_affine)),
   );
   if lhs_com != rhs_com {
     return Err(ShuffleVerifyError::SigmaVerification {
@@ -2355,38 +2473,19 @@ fn verify_native_sigma_public<const N_LOCAL: usize>(
     });
   }
 
-  let lhs_grp = native_encrypt_zero_and_combine(
-    statement.pk,
-    proof.sigma_response_rerand,
-    &statement.output_ciphertexts,
-    &proof.sigma_response_power_permutation_vector,
-    bases.generator,
-  );
-  let rhs_c1 = native_add_points(
-    (
-      proof.blinding_rerandomization_commitment.c1_x,
-      proof.blinding_rerandomization_commitment.c1_y,
-    ),
-    native_scalar_mul_maybe(
-      challenge,
-      input_ciphertext_aggregator.c1_x,
-      input_ciphertext_aggregator.c1_y,
-      curve_a,
-    )
-    .expect("aggregated c1 scaling must be non-infinity"),
-  );
-  let rhs_c2 = native_add_points(
-    (
-      proof.blinding_rerandomization_commitment.c2_x,
-      proof.blinding_rerandomization_commitment.c2_y,
-    ),
-    native_scalar_mul_maybe(
-      challenge,
-      input_ciphertext_aggregator.c2_x,
-      input_ciphertext_aggregator.c2_y,
-      curve_a,
-    )
-    .expect("aggregated c2 scaling must be non-infinity"),
+  let (rhs_c1, rhs_c2) = join(
+    || {
+      coords_from_group(
+        &(group_from_affine(&proof_blinding_rerand_c1)
+          + scalar_mul_affine_point(challenge, &input_aggregator_c1)),
+      )
+    },
+    || {
+      coords_from_group(
+        &(group_from_affine(&proof_blinding_rerand_c2)
+          + scalar_mul_affine_point(challenge, &input_aggregator_c2)),
+      )
+    },
   );
 
   if lhs_grp.c1_x != rhs_c1.0
@@ -2417,9 +2516,9 @@ fn validate_shared_shuffle_relations(
     std::array::from_fn(|i| LinkerScalar::from(permutation[i] as u64));
   let expected_perm_commitment = native_vector_commitment(
     &final_indices,
-    &bases.perm_bases,
+    &bases.perm_bases_affine,
     witness.perm_blinding,
-    bases.perm_blind_base,
+    &bases.perm_blind_base_affine,
   );
   assert_eq!(
     expected_perm_commitment, statement.permutation_commitment,
@@ -2428,9 +2527,9 @@ fn validate_shared_shuffle_relations(
 
   let expected_power_commitment = native_vector_commitment(
     &witness.power_perm_vec,
-    &bases.power_bases,
+    &bases.power_bases_affine,
     witness.power_blinding,
-    bases.power_blind_base,
+    &bases.power_blind_base_affine,
   );
   assert_eq!(
     expected_power_commitment, statement.power_commitment,
@@ -2446,8 +2545,8 @@ fn validate_shared_shuffle_relations(
   let expected_link_commitment = native_link_commitment(
     witness.link_value,
     witness.link_blinding,
-    bases.link_base,
-    bases.link_blind_base,
+    &bases.link_base_affine,
+    &bases.link_blind_base_affine,
   );
   assert_eq!(
     expected_link_commitment, statement.link_commitment,
@@ -2776,9 +2875,9 @@ fn build_shuffle_statement_and_witness(
   loop {
     let permutation_commitment = native_vector_commitment(
       &final_indices,
-      &bases.perm_bases,
+      &bases.perm_bases_affine,
       perm_blinding,
-      bases.perm_blind_base,
+      &bases.perm_blind_base_affine,
     );
     let power_challenge = derive_power_challenge_from_commitment(permutation_commitment);
     let power_challenge_scalar =
@@ -2796,9 +2895,9 @@ fn build_shuffle_statement_and_witness(
     let power_perm_vec = std::array::from_fn(|i| x_powers[permutation[i]]);
     let power_commitment = native_vector_commitment(
       &power_perm_vec,
-      &bases.power_bases,
+      &bases.power_bases_affine,
       power_blinding,
-      bases.power_blind_base,
+      &bases.power_blind_base_affine,
     );
 
     let challenges =
@@ -2826,8 +2925,8 @@ fn build_shuffle_statement_and_witness(
     let link_commitment = native_link_commitment(
       link_value,
       link_blinding,
-      bases.link_base,
-      bases.link_blind_base,
+      &bases.link_base_affine,
+      &bases.link_blind_base_affine,
     );
 
     let (curve_a, _, _, _) = <CurveEngine as Engine>::GE::group_params();
