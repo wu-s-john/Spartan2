@@ -23,13 +23,14 @@ use bellpepper_core::{
   num::AllocatedNum,
   test_cs::TestConstraintSystem,
 };
+use clap::Parser;
 use ff::{Field, PrimeField, PrimeFieldBits};
 use halo2curves::{CurveAffine, group::prime::PrimeCurveAffine};
 use num_bigint::BigUint;
 use num_traits::{One as _, Zero as _};
 use once_cell::sync::Lazy;
 use rayon::join;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fmt};
 
 use spartan2::{
@@ -38,6 +39,7 @@ use spartan2::{
     test_r1cs::{TestSpartanShape, TestSpartanWitness},
     test_shape_cs::TestShapeCS,
   },
+  cli::SpartanBenchChoice,
   gadgets::{
     ecc::{AllocatedPoint, AllocatedPointNonInfinity},
     utils::{
@@ -58,6 +60,7 @@ use spartan2::{
     permutation::{IndexPositionPair, check_grand_product},
   },
   spartan::SpartanSNARK,
+  spartan_pp::PpSpartanSNARK,
   traits::{Engine, Group, circuit::SpartanCircuit, snark::R1CSSNARKTrait},
 };
 
@@ -75,6 +78,7 @@ type Scalar = pallas::Scalar;
 type CurveEngine = VestaHyraxEngine;
 type LinkerScalar = <CurveEngine as Engine>::Scalar;
 type ShuffleSnark = SpartanSNARK<PallasHyraxEngine>;
+type PpShuffleSnark = PpSpartanSNARK<PallasHyraxEngine>;
 type CurvePoint = <CurveEngine as Engine>::GE;
 type CurveAffinePoint = <<CurveEngine as Engine>::GE as DlogGroup>::AffineGroupElement;
 
@@ -90,6 +94,14 @@ const LINK_LINEAR_QUOTIENT_BITS: usize = EMULATED_TOTAL_BITS + 6;
 const LINK_LINEAR_QUOTIENT_LIMBS: usize = LINK_LINEAR_QUOTIENT_BITS.div_ceil(EMULATED_LIMB_BITS);
 const LINK_LINEAR_CARRY_BITS: usize = 48;
 const LINK_LINEAR_CARRY_BIAS: i64 = 1i64 << (LINK_LINEAR_CARRY_BITS - 1);
+
+#[derive(Parser, Debug)]
+#[command(name = "full_spartan_shuffle_bench")]
+struct Cli {
+  /// Which Spartan implementation to benchmark
+  #[arg(long, value_enum, default_value_t = SpartanBenchChoice::Both)]
+  snark: SpartanBenchChoice,
+}
 
 #[derive(Clone, Copy)]
 enum SpongeMode {
@@ -242,6 +254,30 @@ static LINKER_SCALAR_MODULUS_BITS: Lazy<Vec<bool>> = Lazy::new(linker_scalar_mod
 static LINKER_SCALAR_MODULUS_LIMBS: Lazy<[u64; EMULATED_LIMBS]> =
   Lazy::new(linker_scalar_modulus_limbs);
 static COMMITMENT_BASES: Lazy<CommitmentBases> = Lazy::new(build_commitment_bases);
+
+struct BaselineBenchSummary {
+  constraints: usize,
+  setup_time: Duration,
+  witness_generation_time: Duration,
+  equivalence_check_time: Duration,
+  prep_time: Duration,
+  prove_time: Duration,
+  sigma_prove_time: Duration,
+  combined_prove_time: Duration,
+  verify_time: Duration,
+  sigma_verify_time: Duration,
+  combined_verify_time: Duration,
+  proof_size: usize,
+}
+
+struct PpBenchSummary {
+  constraints: usize,
+  setup_time: Duration,
+  prep_time: Duration,
+  prove_time: Duration,
+  verify_time: Duration,
+  proof_size: usize,
+}
 
 fn scalar_modulus() -> BigUint {
   let mut value = BigUint::zero();
@@ -2653,6 +2689,17 @@ fn verify_spartan_statement_binding<const N_LOCAL: usize>(
   statement: &ShuffleStatement<N_LOCAL>,
   proof: &ShuffleSnark,
 ) -> Result<Vec<Scalar>, ShuffleVerifyError> {
+  verify_spartan_statement_binding_generic::<ShuffleSnark, N_LOCAL>(vk, statement, proof)
+}
+
+fn verify_spartan_statement_binding_generic<S, const N_LOCAL: usize>(
+  vk: &<S as R1CSSNARKTrait<PallasHyraxEngine>>::VerifierKey,
+  statement: &ShuffleStatement<N_LOCAL>,
+  proof: &S,
+) -> Result<Vec<Scalar>, ShuffleVerifyError>
+where
+  S: R1CSSNARKTrait<PallasHyraxEngine>,
+{
   validate_public_point("pk", statement.pk)?;
   validate_public_point("C_perm", statement.permutation_commitment)?;
   validate_public_point("C_power", statement.power_commitment)?;
@@ -3688,6 +3735,7 @@ fn log_constraint_profile(circuit: &FullRSShuffleCircuit) {
 }
 
 fn main() {
+  let cli = Cli::parse();
   let _ = tracing_subscriber::fmt()
     .with_target(false)
     .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -3699,6 +3747,14 @@ fn main() {
   println!(
     "║  N = {} cards, LEVELS = {}                                   ║",
     N, LEVELS
+  );
+  println!(
+    "║  SNARK mode = {:<11}                                      ║",
+    match cli.snark {
+      SpartanBenchChoice::Both => "both",
+      SpartanBenchChoice::Spartan => "spartan",
+      SpartanBenchChoice::PpSpartan => "ppspartan",
+    }
   );
   println!("╚══════════════════════════════════════════════════════════════╝\n");
 
@@ -3744,19 +3800,6 @@ fn main() {
     .expect("native witness does not satisfy circuit");
   println!("  Circuit is satisfied");
 
-  println!("Running setup...");
-  let setup_start = Instant::now();
-  let (pk, vk) = SpartanSNARK::<PallasHyraxEngine>::setup(circuit.clone()).expect("setup failed");
-  let setup_time = setup_start.elapsed();
-
-  let sizes = pk.sizes();
-  println!("  Setup time: {:?}", setup_time);
-  println!("  Constraints (unpadded): {}", sizes[0]);
-  println!("  Constraints (padded):   {}", sizes[4]);
-  println!("  Variables (shared):     {}", sizes[5]);
-  println!("  Variables (precommit):  {}", sizes[6]);
-  println!("  Variables (rest):       {}", sizes[7]);
-
   println!("\nPreparing proving instance...");
   let witness_generation_start = Instant::now();
   let (proving_statement, proving_witness) = build_shuffle_statement_and_witness(&bases);
@@ -3772,113 +3815,250 @@ fn main() {
   let equivalence_check_time = equivalence_check_start.elapsed();
   println!("  Equivalence checks: {:?}", equivalence_check_time);
 
-  println!("\nRunning prep_prove...");
-  let prep_start = Instant::now();
-  let prep =
-    ShuffleSnark::prep_prove(&pk, proving_circuit.clone(), false).expect("prep_prove failed");
-  let prep_time = prep_start.elapsed();
-  println!("  Prep time: {:?}", prep_time);
+  let baseline_summary = if cli.snark.runs_spartan() {
+    println!("\nRunning setup...");
+    let setup_start = Instant::now();
+    let (pk, vk) = SpartanSNARK::<PallasHyraxEngine>::setup(circuit.clone()).expect("setup failed");
+    let setup_time = setup_start.elapsed();
 
-  println!("\nRunning parallel prove (Spartan + native BG/Sigma)...");
-  let parallel_prove_start = Instant::now();
-  let (proof, sigma_proof, prove_time, sigma_prove_time) = std::thread::scope(|scope| {
-    let sigma_handle = scope.spawn(|| {
-      let sigma_prove_start = Instant::now();
-      let sigma_proof = prove_native_sigma::<N>(&proving_statement, &proving_witness, &bases);
-      (sigma_proof, sigma_prove_start.elapsed())
+    let sizes = pk.sizes();
+    println!("  Setup time: {:?}", setup_time);
+    println!("  Constraints (unpadded): {}", sizes[0]);
+    println!("  Constraints (padded):   {}", sizes[4]);
+    println!("  Variables (shared):     {}", sizes[5]);
+    println!("  Variables (precommit):  {}", sizes[6]);
+    println!("  Variables (rest):       {}", sizes[7]);
+
+    println!("\nRunning prep_prove...");
+    let prep_start = Instant::now();
+    let prep =
+      ShuffleSnark::prep_prove(&pk, proving_circuit.clone(), false).expect("prep_prove failed");
+    let prep_time = prep_start.elapsed();
+    println!("  Prep time: {:?}", prep_time);
+
+    println!("\nRunning parallel prove (Spartan + native BG/Sigma)...");
+    let parallel_prove_start = Instant::now();
+    let (proof, sigma_proof, prove_time, sigma_prove_time) = std::thread::scope(|scope| {
+      let sigma_handle = scope.spawn(|| {
+        let sigma_prove_start = Instant::now();
+        let sigma_proof = prove_native_sigma::<N>(&proving_statement, &proving_witness, &bases);
+        (sigma_proof, sigma_prove_start.elapsed())
+      });
+
+      let prove_start = Instant::now();
+      let proof =
+        ShuffleSnark::prove(&pk, proving_circuit.clone(), &prep, false).expect("prove failed");
+      let prove_time = prove_start.elapsed();
+
+      let (sigma_proof, sigma_prove_time) =
+        sigma_handle.join().expect("sigma prove thread panicked");
+      (proof, sigma_proof, prove_time, sigma_prove_time)
     });
+    let shuffle_proof = ShuffleProof {
+      spartan_proof: proof,
+      sigma_proof,
+    };
+    let spartan_proof_size = bincode::serialize(&shuffle_proof.spartan_proof)
+      .expect("baseline proof serialization failed")
+      .len();
+    let parallel_prove_time = parallel_prove_start.elapsed();
+    let combined_prove_time = witness_generation_time + prep_time + parallel_prove_time;
+    println!("  Spartan prove time: {:?}", prove_time);
+    println!("  Sigma prove time: {:?}", sigma_prove_time);
+    println!("  Combined parallel prove time: {:?}", parallel_prove_time);
+    println!("  Spartan proof size: {} bytes", spartan_proof_size);
 
-    let prove_start = Instant::now();
-    let proof = ShuffleSnark::prove(&pk, proving_circuit, &prep, false).expect("prove failed");
-    let prove_time = prove_start.elapsed();
+    println!("\nRunning verify...");
+    let verify_start = Instant::now();
+    let result =
+      verify_spartan_statement_binding(&vk, &proving_statement, &shuffle_proof.spartan_proof);
+    let verify_time = verify_start.elapsed();
 
-    let (sigma_proof, sigma_prove_time) = sigma_handle.join().expect("sigma prove thread panicked");
-    (proof, sigma_proof, prove_time, sigma_prove_time)
-  });
-  let shuffle_proof = ShuffleProof {
-    spartan_proof: proof,
-    sigma_proof,
-  };
-  let parallel_prove_time = parallel_prove_start.elapsed();
-  let combined_prove_time = witness_generation_time + prep_time + parallel_prove_time;
-  println!("  Spartan prove time: {:?}", prove_time);
-  println!("  Sigma prove time: {:?}", sigma_prove_time);
-  println!("  Combined parallel prove time: {:?}", parallel_prove_time);
-
-  println!("\nRunning verify...");
-  let verify_start = Instant::now();
-  let result =
-    verify_spartan_statement_binding(&vk, &proving_statement, &shuffle_proof.spartan_proof);
-  let verify_time = verify_start.elapsed();
-
-  match result {
-    Ok(public_outputs) => {
-      println!("  Spartan proof verified successfully");
-      println!("  Verify time: {:?}", verify_time);
-      println!("  Public outputs: {} values", public_outputs.len());
+    match result {
+      Ok(public_outputs) => {
+        println!("  Spartan proof verified successfully");
+        println!("  Verify time: {:?}", verify_time);
+        println!("  Public outputs: {} values", public_outputs.len());
+      }
+      Err(err) => {
+        println!("  Verification failed: {:?}", err);
+        std::process::exit(1);
+      }
     }
-    Err(err) => {
-      println!("  Verification failed: {:?}", err);
+
+    println!("\nRunning native BG/Sigma verify...");
+    let sigma_verify_start = Instant::now();
+    let sigma_ok =
+      verify_native_sigma_public(&proving_statement, &shuffle_proof.sigma_proof, &bases);
+    let sigma_verify_time = sigma_verify_start.elapsed();
+    if let Err(err) = sigma_ok {
+      println!("  Sigma verification failed: {err}");
       std::process::exit(1);
     }
-  }
+    println!("  Sigma verification succeeded");
+    println!("  Sigma verify time: {:?}", sigma_verify_time);
 
-  println!("\nRunning native BG/Sigma verify...");
-  let sigma_verify_start = Instant::now();
-  let sigma_ok = verify_native_sigma_public(&proving_statement, &shuffle_proof.sigma_proof, &bases);
-  let sigma_verify_time = sigma_verify_start.elapsed();
-  if let Err(err) = sigma_ok {
-    println!("  Sigma verification failed: {err}");
-    std::process::exit(1);
-  }
-  println!("  Sigma verification succeeded");
-  println!("  Sigma verify time: {:?}", sigma_verify_time);
+    let combined_verify_time = verify_time + sigma_verify_time;
 
-  let combined_verify_time = verify_time + sigma_verify_time;
+    if let Err(err) = verify_shuffle_proof(&vk, &proving_statement, &shuffle_proof, &bases) {
+      println!("  Combined verifier failed: {err}");
+      std::process::exit(1);
+    }
 
-  if let Err(err) = verify_shuffle_proof(&vk, &proving_statement, &shuffle_proof, &bases) {
-    println!("  Combined verifier failed: {err}");
-    std::process::exit(1);
-  }
+    Some(BaselineBenchSummary {
+      constraints: sizes[0],
+      setup_time,
+      witness_generation_time,
+      equivalence_check_time,
+      prep_time,
+      prove_time,
+      sigma_prove_time,
+      combined_prove_time,
+      verify_time,
+      sigma_verify_time,
+      combined_verify_time,
+      proof_size: spartan_proof_size,
+    })
+  } else {
+    None
+  };
+
+  let pp_summary = if cli.snark.runs_ppspartan() {
+    println!("\nRunning preprocessing Spartan setup...");
+    let pp_setup_start = Instant::now();
+    let (pp_pk, pp_vk) = PpShuffleSnark::setup(proving_circuit.clone()).expect("pp setup failed");
+    let pp_setup_time = pp_setup_start.elapsed();
+    let pp_sizes = PpShuffleSnark::pk_sizes(&pp_pk);
+    println!("  Pp setup time: {:?}", pp_setup_time);
+    println!("  Pp constraints (unpadded): {}", pp_sizes[0]);
+    println!("  Pp constraints (padded):   {}", pp_sizes[4]);
+    println!("  Pp variables (shared):     {}", pp_sizes[5]);
+    println!("  Pp variables (precommit):  {}", pp_sizes[6]);
+    println!("  Pp variables (rest):       {}", pp_sizes[7]);
+
+    println!("\nRunning preprocessing prep_prove...");
+    let pp_prep_start = Instant::now();
+    let pp_prep =
+      PpShuffleSnark::prep_prove(&pp_pk, proving_circuit.clone(), false).expect("pp prep failed");
+    let pp_prep_time = pp_prep_start.elapsed();
+    println!("  Pp prep time: {:?}", pp_prep_time);
+
+    println!("\nRunning preprocessing prove...");
+    let pp_prove_start = Instant::now();
+    let pp_proof = PpShuffleSnark::prove(&pp_pk, proving_circuit.clone(), &pp_prep, false)
+      .expect("pp prove failed");
+    let pp_prove_time = pp_prove_start.elapsed();
+    let pp_proof_size = bincode::serialize(&pp_proof)
+      .expect("pp proof serialization failed")
+      .len();
+    println!("  Pp prove time: {:?}", pp_prove_time);
+    println!("  Pp proof size: {} bytes", pp_proof_size);
+
+    println!("\nRunning preprocessing verify...");
+    let pp_verify_start = Instant::now();
+    let pp_result = verify_spartan_statement_binding_generic::<PpShuffleSnark, N>(
+      &pp_vk,
+      &proving_statement,
+      &pp_proof,
+    );
+    let pp_verify_time = pp_verify_start.elapsed();
+    match pp_result {
+      Ok(public_outputs) => {
+        println!("  Pp Spartan proof verified successfully");
+        println!("  Pp verify time: {:?}", pp_verify_time);
+        println!("  Pp public outputs: {} values", public_outputs.len());
+      }
+      Err(err) => {
+        println!("  Pp verification failed: {:?}", err);
+        std::process::exit(1);
+      }
+    }
+
+    Some(PpBenchSummary {
+      constraints: pp_sizes[0],
+      setup_time: pp_setup_time,
+      prep_time: pp_prep_time,
+      prove_time: pp_prove_time,
+      verify_time: pp_verify_time,
+      proof_size: pp_proof_size,
+    })
+  } else {
+    None
+  };
 
   println!("\n╔══════════════════════════════════════════════════════════════╗");
   println!("║                        SUMMARY                               ║");
   println!("╠══════════════════════════════════════════════════════════════╣");
-  println!(
-    "║  Constraints:    {:>10}                               ║",
-    sizes[0]
-  );
-  println!(
-    "║  Setup time:     {:>10.2?}                             ║",
-    setup_time
-  );
-  println!(
-    "║  Prove time:     {:>10.2?}                             ║",
-    witness_generation_time + prep_time + prove_time
-  );
-  println!(
-    "║  Equiv checks:   {:>10.2?}                             ║",
-    equivalence_check_time
-  );
-  println!(
-    "║  Verify time:    {:>10.2?}                             ║",
-    verify_time
-  );
-  println!(
-    "║  Sigma prove:    {:>10.2?}                             ║",
-    sigma_prove_time
-  );
-  println!(
-    "║  Sigma verify:   {:>10.2?}                             ║",
-    sigma_verify_time
-  );
-  println!(
-    "║  Combined prove: {:>10.2?}                             ║",
-    combined_prove_time
-  );
-  println!(
-    "║  Combined verify:{:>10.2?}                             ║",
-    combined_verify_time
-  );
+  if let Some(summary) = &baseline_summary {
+    println!(
+      "║  Spartan constraints: {:>8}                            ║",
+      summary.constraints
+    );
+    println!(
+      "║  Spartan setup:       {:>8.2?}                          ║",
+      summary.setup_time
+    );
+    println!(
+      "║  Spartan prove:       {:>8.2?}                          ║",
+      summary.witness_generation_time + summary.prep_time + summary.prove_time
+    );
+    println!(
+      "║  Spartan equiv:       {:>8.2?}                          ║",
+      summary.equivalence_check_time
+    );
+    println!(
+      "║  Spartan verify:      {:>8.2?}                          ║",
+      summary.verify_time
+    );
+    println!(
+      "║  Spartan sigma prove: {:>8.2?}                          ║",
+      summary.sigma_prove_time
+    );
+    println!(
+      "║  Spartan sigma verify:{:>8.2?}                          ║",
+      summary.sigma_verify_time
+    );
+    println!(
+      "║  Spartan combined:    {:>8.2?}                          ║",
+      summary.combined_prove_time
+    );
+    println!(
+      "║  Spartan total verify:{:>8.2?}                          ║",
+      summary.combined_verify_time
+    );
+    println!(
+      "║  Spartan proof size:  {:>8} bytes                     ║",
+      summary.proof_size
+    );
+    if pp_summary.is_some() {
+      println!("╠══════════════════════════════════════════════════════════════╣");
+    }
+  }
+  if let Some(summary) = &pp_summary {
+    println!(
+      "║  Pp constraints:      {:>8}                            ║",
+      summary.constraints
+    );
+    println!(
+      "║  Pp setup:            {:>8.2?}                          ║",
+      summary.setup_time
+    );
+    println!(
+      "║  Pp prep:             {:>8.2?}                          ║",
+      summary.prep_time
+    );
+    println!(
+      "║  Pp prove:            {:>8.2?}                          ║",
+      summary.prove_time
+    );
+    println!(
+      "║  Pp verify:           {:>8.2?}                          ║",
+      summary.verify_time
+    );
+    println!(
+      "║  Pp proof size:       {:>8} bytes                     ║",
+      summary.proof_size
+    );
+  }
   println!("╚══════════════════════════════════════════════════════════════╝");
 }
