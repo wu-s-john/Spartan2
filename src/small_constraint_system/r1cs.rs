@@ -92,6 +92,13 @@ pub fn small_r1cs_shape<E: Engine, Coeff: SmallCoeff, Circuit: SmallSpartanCircu
   circuit: &Circuit,
 ) -> Result<SplitR1CSShape<E, Coeff>, SpartanError> {
   let num_challenges = circuit.num_challenges();
+  if num_challenges != 0 {
+    return Err(SpartanError::SynthesisError {
+      reason: format!(
+        "small_r1cs_shape: verifier challenges are not supported on the pure-integer path (got {num_challenges})"
+      ),
+    });
+  }
   let mut cs = SmallShapeCS::<Coeff>::new();
 
   let shared = circuit
@@ -167,8 +174,13 @@ where
 
     let num_vars = S.num_shared + S.num_precommitted + S.num_rest;
     let mut witness = vec![W::default(); num_vars];
-    let shared_copy = cs.aux_assignment.len().min(S.num_shared_unpadded);
-    witness[..shared_copy].copy_from_slice(&cs.aux_assignment[..shared_copy]);
+    ensure_aux_len(
+      "shared_witness",
+      cs.aux_assignment.len(),
+      S.num_shared_unpadded,
+    )?;
+    ensure_binary_values("shared_witness", &cs.aux_assignment)?;
+    witness[..S.num_shared_unpadded].copy_from_slice(&cs.aux_assignment[..S.num_shared_unpadded]);
 
     let zero_w = W::default();
     let comm_shared = if S.num_shared_unpadded > 0 {
@@ -210,16 +222,19 @@ where
       })?;
 
     let precommitted_start_aux = S.num_shared_unpadded;
-    let precommitted_copy = (prep
-      .cs
-      .aux_assignment
-      .len()
-      .saturating_sub(precommitted_start_aux))
-    .min(S.num_precommitted_unpadded);
+    let precommitted_end_aux = precommitted_start_aux + S.num_precommitted_unpadded;
+    ensure_aux_len(
+      "precommitted_witness",
+      prep.cs.aux_assignment.len(),
+      precommitted_end_aux,
+    )?;
+    ensure_binary_values(
+      "precommitted_witness",
+      &prep.cs.aux_assignment[precommitted_start_aux..precommitted_end_aux],
+    )?;
     let dst_start = S.num_shared;
-    prep.W[dst_start..dst_start + precommitted_copy].copy_from_slice(
-      &prep.cs.aux_assignment[precommitted_start_aux..precommitted_start_aux + precommitted_copy],
-    );
+    prep.W[dst_start..dst_start + S.num_precommitted_unpadded]
+      .copy_from_slice(&prep.cs.aux_assignment[precommitted_start_aux..precommitted_end_aux]);
 
     info!(elapsed_ms = %synth_t.elapsed().as_millis(), "precommitted_witness_synthesize");
 
@@ -253,6 +268,24 @@ where
   ) -> Result<(SplitR1CSInstance<E>, Blind<E>), SpartanError> {
     let (_sat_span, sat_t) = start_span!("r1cs_instance_and_witness");
     let zero_w = W::default();
+    if S.num_challenges != 0 || C::num_challenges(circuit) != 0 {
+      return Err(SpartanError::SynthesisError {
+        reason: format!(
+          "r1cs_instance_and_witness: verifier challenges are not supported on the pure-integer path (shape={}, circuit={})",
+          S.num_challenges,
+          C::num_challenges(circuit)
+        ),
+      });
+    }
+    if public_values_field.len() != S.num_public {
+      return Err(SpartanError::SynthesisError {
+        reason: format!(
+          "r1cs_instance_and_witness: public value length mismatch: expected {}, got {}",
+          S.num_public,
+          public_values_field.len()
+        ),
+      });
+    }
 
     // Absorb shared/precommitted commitments into transcript
     if let Some(ref wc) = prep.comm_shared {
@@ -262,10 +295,7 @@ where
       transcript.absorb(b"comm_W_precommitted", &wc.comm);
     }
 
-    // Squeeze challenges from transcript
-    let challenges: Vec<E::Scalar> = (0..C::num_challenges(circuit))
-      .map(|_| transcript.squeeze(b"c"))
-      .collect::<Result<Vec<_>, _>>()?;
+    let challenges = vec![];
 
     // Synthesize rest of the circuit
     circuit
@@ -281,11 +311,28 @@ where
 
     // Copy rest witness into W
     let rest_start_aux = S.num_shared_unpadded + S.num_precommitted_unpadded;
-    let rest_copy =
-      (prep.cs.aux_assignment.len().saturating_sub(rest_start_aux)).min(S.num_rest_unpadded);
+    let rest_end_aux = rest_start_aux + S.num_rest_unpadded;
+    ensure_aux_len(
+      "r1cs_instance_and_witness",
+      prep.cs.aux_assignment.len(),
+      rest_end_aux,
+    )?;
+    ensure_input_len(
+      "r1cs_instance_and_witness",
+      prep.cs.input_assignment.len(),
+      1 + S.num_public,
+    )?;
+    ensure_binary_values(
+      "r1cs_instance_and_witness rest",
+      &prep.cs.aux_assignment[rest_start_aux..rest_end_aux],
+    )?;
+    ensure_binary_values(
+      "r1cs_instance_and_witness inputs",
+      &prep.cs.input_assignment,
+    )?;
     let dst_rest = S.num_shared + S.num_precommitted;
-    prep.W[dst_rest..dst_rest + rest_copy]
-      .copy_from_slice(&prep.cs.aux_assignment[rest_start_aux..rest_start_aux + rest_copy]);
+    prep.W[dst_rest..dst_rest + S.num_rest_unpadded]
+      .copy_from_slice(&prep.cs.aux_assignment[rest_start_aux..rest_end_aux]);
     info!(elapsed_ms = %sat_t.elapsed().as_millis(), "r1cs_instance_and_witness");
 
     // Commit rest segment
@@ -321,4 +368,40 @@ where
 
     Ok((U, r_W))
   }
+}
+
+fn ensure_aux_len(context: &str, actual: usize, expected: usize) -> Result<(), SpartanError> {
+  if actual != expected {
+    return Err(SpartanError::SynthesisError {
+      reason: format!(
+        "{context}: shape/witness aux allocation mismatch: expected {expected}, got {actual}"
+      ),
+    });
+  }
+  Ok(())
+}
+
+fn ensure_input_len(context: &str, actual: usize, expected: usize) -> Result<(), SpartanError> {
+  if actual != expected {
+    return Err(SpartanError::SynthesisError {
+      reason: format!(
+        "{context}: shape/witness input allocation mismatch: expected {expected}, got {actual}"
+      ),
+    });
+  }
+  Ok(())
+}
+
+fn ensure_binary_values<W>(context: &str, values: &[W]) -> Result<(), SpartanError>
+where
+  W: Copy + Default + PartialEq + From<bool>,
+{
+  let zero = W::default();
+  let one = W::from(true);
+  if values.iter().any(|value| *value != zero && *value != one) {
+    return Err(SpartanError::SynthesisError {
+      reason: format!("{context}: pure-integer path currently supports only binary witnesses"),
+    });
+  }
+  Ok(())
 }

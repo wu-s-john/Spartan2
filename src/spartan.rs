@@ -727,6 +727,16 @@ impl<E: Engine> SpartanSNARK<E> {
   {
     use crate::small_constraint_system::SmallSatisfyingAssignment;
 
+    if pk.S.num_challenges != 0 || C::num_challenges(circuit) != 0 {
+      return Err(SpartanError::SynthesisError {
+        reason: format!(
+          "prep_prove_small: verifier challenges are not supported on the pure-integer path (shape={}, circuit={})",
+          pk.S.num_challenges,
+          C::num_challenges(circuit)
+        ),
+      });
+    }
+
     let mut prep = SmallSatisfyingAssignment::<W>::shared_witness(&pk.S, &pk.ck, circuit)?;
     SmallSatisfyingAssignment::<W>::precommitted_witness(&mut prep, &pk.S, &pk.ck, circuit)?;
     Ok(prep)
@@ -761,9 +771,23 @@ impl<E: Engine> SpartanSNARK<E> {
       + MontgomeryLimbs,
   {
     let (_prove_span, prove_t) = start_span!("spartan_snark_prove");
+    if pk.S.num_challenges != 0
+      || <C as SmallSpartanCircuit<E, Coeff>>::num_challenges(&circuit) != 0
+      || <C as SmallSpartanCircuit<E, W>>::num_challenges(&circuit) != 0
+    {
+      return Err(SpartanError::SynthesisError {
+        reason: format!(
+          "prove_small_value: verifier challenges are not supported on the pure-integer path (shape={}, coeff_circuit={}, witness_circuit={})",
+          pk.S.num_challenges,
+          <C as SmallSpartanCircuit<E, Coeff>>::num_challenges(&circuit),
+          <C as SmallSpartanCircuit<E, W>>::num_challenges(&circuit)
+        ),
+      });
+    }
 
     // Transcript setup
     let zero_w = W::default();
+    let one_w = W::from(true);
     let mut transcript = E::TE::new(b"SpartanSNARK");
     transcript.absorb(b"vk", &pk.vk_digest);
     let pub_w: Vec<W> = <C as SmallSpartanCircuit<E, W>>::public_values(&circuit).map_err(|e| {
@@ -771,6 +795,24 @@ impl<E: Engine> SpartanSNARK<E> {
         reason: format!("prove_small_value: public_values: {e}"),
       }
     })?;
+    if pub_w
+      .iter()
+      .any(|value| *value != zero_w && *value != one_w)
+    {
+      return Err(SpartanError::SynthesisError {
+        reason: "prove_small_value: pure-integer path currently supports only binary public values"
+          .to_string(),
+      });
+    }
+    if pub_w.len() != pk.S.num_public {
+      return Err(SpartanError::SynthesisError {
+        reason: format!(
+          "prove_small_value: public value length mismatch: expected {}, got {}",
+          pk.S.num_public,
+          pub_w.len()
+        ),
+      });
+    }
     let pub_field: Vec<E::Scalar> = pub_w
       .iter()
       .map(|v| {
@@ -793,9 +835,9 @@ impl<E: Engine> SpartanSNARK<E> {
       &mut transcript,
     )?;
 
-    // Build z_w for mat-vec
-    let challenges_w = vec![W::default(); U.challenges.len()];
-    let z_w = Self::build_z_small(&prep.W, &pub_w, &challenges_w);
+    // Build z_w for mat-vec. The pure-integer path rejects verifier challenges
+    // above, so there are no mixed field/small columns to represent here.
+    let z_w = Self::build_z_small(&prep.W, &pub_w, &[]);
 
     let num_vars = pk.S.num_shared + pk.S.num_precommitted + pk.S.num_rest;
     let num_rounds_x =
