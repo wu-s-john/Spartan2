@@ -22,7 +22,9 @@
 //! `NoBatchEq` keeps coefficients bounded at 2^18 (max from limbed addition).
 
 use super::{addmany, small_uint32::SmallUInt32};
-use crate::small_constraint_system::{SmallConstraintSystem, SmallLinearCombination, SmallNamespace};
+use crate::small_constraint_system::{
+  SmallConstraintSystem, SmallLinearCombination, SmallNamespace,
+};
 use bellpepper_core::SynthesisError;
 
 // ============================================================================
@@ -143,7 +145,11 @@ impl<CS: SmallConstraintSystem<i32>> SmallMultiEq<i32> for NoBatchEq<'_, i32, CS
 impl<V: Copy, CS: SmallConstraintSystem<V>> SmallConstraintSystem<V> for NoBatchEq<'_, V, CS> {
   type Root = CS::Root;
 
-  fn alloc<A, AR, F>(&mut self, annotation: A, f: F) -> Result<bellpepper_core::Variable, SynthesisError>
+  fn alloc<A, AR, F>(
+    &mut self,
+    annotation: A,
+    f: F,
+  ) -> Result<bellpepper_core::Variable, SynthesisError>
   where
     A: FnOnce() -> AR,
     AR: Into<String>,
@@ -242,7 +248,12 @@ fn try_constant_sum(operands: &[SmallUInt32]) -> Option<u32> {
 ///
 /// This is retained for any code still using the old bellpepper-based path.
 /// For the pure-integer small-value path, use `NoBatchEq` instead.
-pub struct BatchingEq<'a, Scalar: ff::PrimeField, CS: bellpepper_core::ConstraintSystem<Scalar>, const K: usize> {
+pub struct BatchingEq<
+  'a,
+  Scalar: ff::PrimeField,
+  CS: bellpepper_core::ConstraintSystem<Scalar>,
+  const K: usize,
+> {
   cs: &'a mut CS,
   ops: usize,
   #[allow(dead_code)]
@@ -303,7 +314,11 @@ impl<Scalar: ff::PrimeField, CS: bellpepper_core::ConstraintSystem<Scalar>, cons
     CS::one()
   }
 
-  fn alloc<F, A, AR>(&mut self, annotation: A, f: F) -> Result<bellpepper_core::Variable, SynthesisError>
+  fn alloc<F, A, AR>(
+    &mut self,
+    annotation: A,
+    f: F,
+  ) -> Result<bellpepper_core::Variable, SynthesisError>
   where
     F: FnOnce() -> Result<Scalar, SynthesisError>,
     A: FnOnce() -> AR,
@@ -329,9 +344,15 @@ impl<Scalar: ff::PrimeField, CS: bellpepper_core::ConstraintSystem<Scalar>, cons
   where
     A: FnOnce() -> AR,
     AR: Into<String>,
-    LA: FnOnce(bellpepper_core::LinearCombination<Scalar>) -> bellpepper_core::LinearCombination<Scalar>,
-    LB: FnOnce(bellpepper_core::LinearCombination<Scalar>) -> bellpepper_core::LinearCombination<Scalar>,
-    LC: FnOnce(bellpepper_core::LinearCombination<Scalar>) -> bellpepper_core::LinearCombination<Scalar>,
+    LA: FnOnce(
+      bellpepper_core::LinearCombination<Scalar>,
+    ) -> bellpepper_core::LinearCombination<Scalar>,
+    LB: FnOnce(
+      bellpepper_core::LinearCombination<Scalar>,
+    ) -> bellpepper_core::LinearCombination<Scalar>,
+    LC: FnOnce(
+      bellpepper_core::LinearCombination<Scalar>,
+    ) -> bellpepper_core::LinearCombination<Scalar>,
   {
     self.cs.enforce(annotation, a, b, c);
   }
@@ -364,11 +385,7 @@ impl<Scalar: ff::PrimeField, CS: bellpepper_core::ConstraintSystem<Scalar>, cons
     self.cs.extend_aux(aux);
   }
 
-  fn allocate_empty(
-    &mut self,
-    aux_n: usize,
-    inputs_n: usize,
-  ) -> (&mut [Scalar], &mut [Scalar]) {
+  fn allocate_empty(&mut self, aux_n: usize, inputs_n: usize) -> (&mut [Scalar], &mut [Scalar]) {
     self.cs.allocate_empty(aux_n, inputs_n)
   }
 

@@ -196,8 +196,7 @@ fn verify_snark<E: Engine>(
   let mode = if l0 > 0 { "small-value" } else { "large-value" };
   let prep =
     NeutronNovaZkSNARK::<E>::prep_prove(pk, circuits, core_circuit, l0).expect("prep_prove");
-  let snark =
-    NeutronNovaZkSNARK::<E>::prove(pk, circuits, core_circuit, &prep, l0).expect("prove");
+  let snark = NeutronNovaZkSNARK::<E>::prove(pk, circuits, core_circuit, &prep, l0).expect("prove");
   let res = snark.verify(vk, num_instances);
   assert!(res.is_ok(), "Verification failed: {:?}", res.err());
   eprintln!("  verified: yes ({})", mode);
@@ -249,8 +248,8 @@ fn benchmark_nifs_prove<E: Engine>(
     let t_total = Instant::now();
 
     // Witness generation: prep_prove
-    let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0)
-      .expect("prep_prove");
+    let prep =
+      NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0).expect("prep_prove");
 
     // Witness generation: synthesize instances
     let is_small = l0 > 0;
@@ -320,10 +319,10 @@ fn benchmark_zk_prove<E: Engine>(
   let t_total = Instant::now();
 
   // Full ZK prove
-  let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0)
-    .expect("prep_prove");
-  let snark = NeutronNovaZkSNARK::<E>::prove(&pk, &circuits, &core_circuit, &prep, l0)
-    .expect("prove");
+  let prep =
+    NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0).expect("prep_prove");
+  let snark =
+    NeutronNovaZkSNARK::<E>::prove(&pk, &circuits, &core_circuit, &prep, l0).expect("prove");
 
   let total_ms = t_total.elapsed().as_millis();
   info!(elapsed_ms = total_ms as u64, "end_to_end_total");
@@ -402,8 +401,8 @@ fn benchmark_decoupled<E: Engine>(
   let t_total = Instant::now();
 
   // Witness generation: prep_prove (l0 > 0 requires small-value compatible witnesses)
-  let prep = NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0)
-    .expect("prep_prove");
+  let prep =
+    NeutronNovaZkSNARK::<E>::prep_prove(&pk, &circuits, &core_circuit, l0).expect("prep_prove");
 
   // Witness generation: synthesize instances
   let is_small = l0 > 0;

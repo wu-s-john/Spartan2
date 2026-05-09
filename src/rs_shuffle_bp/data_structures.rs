@@ -4,9 +4,7 @@
 //! the shuffle witness data and ElGamal ciphertexts.
 
 use crate::{gadgets::ecc::AllocatedPointNonInfinity, traits::Engine};
-use bellpepper_core::{
-  boolean::AllocatedBit, num::AllocatedNum, ConstraintSystem, SynthesisError,
-};
+use bellpepper_core::{ConstraintSystem, SynthesisError, boolean::AllocatedBit, num::AllocatedNum};
 use ff::PrimeField;
 
 // ============================================================================
@@ -71,7 +69,11 @@ pub struct SortedRow {
 
 impl SortedRow {
   pub fn new_with_bucket(idx: u16, length: u16, bucket: u16) -> Self {
-    Self { idx, length, bucket }
+    Self {
+      idx,
+      length,
+      bucket,
+    }
   }
 }
 
@@ -303,14 +305,8 @@ impl<E: Engine> ElGamalCiphertextVar<E> {
     mut cs: CS,
     ct: &ElGamalCiphertext<E>,
   ) -> Result<Self, SynthesisError> {
-    let c1 = AllocatedPointNonInfinity::alloc(
-      cs.namespace(|| "c1"),
-      Some((ct.c1_x, ct.c1_y)),
-    )?;
-    let c2 = AllocatedPointNonInfinity::alloc(
-      cs.namespace(|| "c2"),
-      Some((ct.c2_x, ct.c2_y)),
-    )?;
+    let c1 = AllocatedPointNonInfinity::alloc(cs.namespace(|| "c1"), Some((ct.c1_x, ct.c1_y)))?;
+    let c2 = AllocatedPointNonInfinity::alloc(cs.namespace(|| "c2"), Some((ct.c2_x, ct.c2_y)))?;
     Ok(Self::new(c1, c2))
   }
 
@@ -319,14 +315,8 @@ impl<E: Engine> ElGamalCiphertextVar<E> {
     mut cs: CS,
     ct: &ElGamalCiphertext<E>,
   ) -> Result<Self, SynthesisError> {
-    let c1 = AllocatedPointNonInfinity::alloc(
-      cs.namespace(|| "c1"),
-      Some((ct.c1_x, ct.c1_y)),
-    )?;
-    let c2 = AllocatedPointNonInfinity::alloc(
-      cs.namespace(|| "c2"),
-      Some((ct.c2_x, ct.c2_y)),
-    )?;
+    let c1 = AllocatedPointNonInfinity::alloc(cs.namespace(|| "c1"), Some((ct.c1_x, ct.c1_y)))?;
+    let c2 = AllocatedPointNonInfinity::alloc(cs.namespace(|| "c2"), Some((ct.c2_x, ct.c2_y)))?;
 
     // Inputize the coordinates
     c1.x.inputize(cs.namespace(|| "c1_x_input"))?;

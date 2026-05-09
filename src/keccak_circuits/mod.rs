@@ -5,18 +5,23 @@
 //!
 //! Uses bellpepper-keccak which already has small coefficients (0, 1, -1, 2).
 
-use bellpepper_core::{
-  Circuit, ConstraintSystem, SynthesisError,
-  num::AllocatedNum,
-};
+use bellpepper_core::{Circuit, ConstraintSystem, SynthesisError, num::AllocatedNum};
 use ff::{Field, PrimeField, PrimeFieldBits};
 use sha3::{Digest, Keccak256};
 use std::marker::PhantomData;
 
-use crate::traits::{Engine, circuit::{SmallSpartanCircuit, SpartanCircuit}};
-use crate::gadgets::{SmallBoolean, small_keccak256};
-use crate::gadgets::small_boolean::{Double, NegOne, SmallBit};
-use crate::small_constraint_system::{SmallConstraintSystem, SmallToBellpepperCS};
+use crate::{
+  gadgets::{
+    SmallBoolean,
+    small_boolean::{Double, NegOne, SmallBit},
+    small_keccak256,
+  },
+  small_constraint_system::{SmallConstraintSystem, SmallToBellpepperCS},
+  traits::{
+    Engine,
+    circuit::{SmallSpartanCircuit, SpartanCircuit},
+  },
+};
 
 /// Keccak-256 chain circuit using bellpepper-keccak.
 ///
@@ -182,7 +187,10 @@ where
   }
   for bit in &current_bits[..256] {
     let val = bit.get_value().map(V::from);
-    cs.alloc_input(|| "hash_bit", || val.ok_or(SynthesisError::AssignmentMissing))?;
+    cs.alloc_input(
+      || "hash_bit",
+      || val.ok_or(SynthesisError::AssignmentMissing),
+    )?;
   }
   Ok(vec![])
 }
@@ -215,9 +223,7 @@ where
 fn bytes_to_public_small<V: From<bool>>(bytes: &[u8]) -> Vec<V> {
   bytes
     .iter()
-    .flat_map(|&byte| {
-      (0..8).map(move |i| V::from((byte >> i) & 1 == 1))
-    })
+    .flat_map(|&byte| (0..8).map(move |i| V::from((byte >> i) & 1 == 1)))
     .collect()
 }
 
@@ -247,7 +253,9 @@ where
     keccak_chain_precommitted::<i8, _>(cs, &self.input, self.chain_length)
   }
 
-  fn num_challenges(&self) -> usize { 0 }
+  fn num_challenges(&self) -> usize {
+    0
+  }
 
   fn synthesize<CS: SmallConstraintSystem<i8>>(
     &self,
@@ -292,7 +300,9 @@ where
     keccak_chain_precommitted::<bool, _>(cs, &self.input, self.chain_length)
   }
 
-  fn num_challenges(&self) -> usize { 0 }
+  fn num_challenges(&self) -> usize {
+    0
+  }
 
   fn synthesize<CS: SmallConstraintSystem<bool>>(
     &self,

@@ -10,6 +10,8 @@ use crate::{
   VerifierKey,
   digest::SimpleDigestible,
   errors::SpartanError,
+  small_constraint_system::SmallCoeff,
+  small_field::montgomery::MontgomeryLimbs,
   start_span,
   traits::{
     Engine,
@@ -17,8 +19,6 @@ use crate::{
     transcript::{TranscriptEngineTrait, TranscriptReprTrait},
   },
 };
-use crate::small_constraint_system::SmallCoeff;
-use crate::small_field::montgomery::MontgomeryLimbs;
 use core::cmp::max;
 use ff::Field;
 use once_cell::sync::OnceCell;
@@ -206,13 +206,19 @@ fn dispatch_abc_columns<F: ff::PrimeField, V: CscCoeff<F>>(
     let col = col_start + i;
 
     macro_rules! acc_a {
-      () => { accumulate_column(rx, a.0, a.1, a.2, a.3, col) };
+      () => {
+        accumulate_column(rx, a.0, a.1, a.2, a.3, col)
+      };
     }
     macro_rules! acc_b {
-      () => { accumulate_column(rx, b.0, b.1, b.2, b.3, col) };
+      () => {
+        accumulate_column(rx, b.0, b.1, b.2, b.3, col)
+      };
     }
     macro_rules! acc_c {
-      () => { accumulate_column(rx, c.0, c.1, c.2, c.3, col) };
+      () => {
+        accumulate_column(rx, c.0, c.1, c.2, c.3, col)
+      };
     }
 
     *slot = match col_presence[col] {
@@ -320,7 +326,12 @@ fn build_column_remap_and_csc<V: Copy + Default>(
 ) -> ColumnRemapData<V> {
   // Scan which columns are touched
   let mut touched = vec![false; num_buf_cols];
-  for &col in a.indices.iter().chain(b.indices.iter()).chain(c.indices.iter()) {
+  for &col in a
+    .indices
+    .iter()
+    .chain(b.indices.iter())
+    .chain(c.indices.iter())
+  {
     if col < num_buf_cols {
       touched[col] = true;
     }
@@ -1095,7 +1106,6 @@ pub struct SplitR1CSShape<E: Engine, V = <E as Engine>::Scalar> {
 
 impl<E: Engine, V: Serialize + for<'a> Deserialize<'a>> SimpleDigestible for SplitR1CSShape<E, V> {}
 
-
 impl<E: Engine, V> SplitR1CSShape<E, V> {
   /// Returns sizes associated with the SplitR1CSShape.
   pub fn sizes(&self) -> [usize; 10] {
@@ -1207,8 +1217,11 @@ impl<E: Engine> SplitR1CSShape<E> {
 
     let num_buf_cols = 2 * num_vars_padded;
     let remap = build_column_remap_and_csc(
-      &A_padded, &B_padded, &C_padded,
-      num_buf_cols, num_cons,
+      &A_padded,
+      &B_padded,
+      &C_padded,
+      num_buf_cols,
+      num_cons,
       |v: &E::Scalar| *v == E::Scalar::ONE || *v == -E::Scalar::ONE,
     );
 
@@ -1255,8 +1268,11 @@ impl<E: Engine> SplitR1CSShape<E> {
     let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
     let num_buf_cols = 2 * num_vars;
     let remap = build_column_remap_and_csc(
-      &self.A, &self.B, &self.C,
-      num_buf_cols, self.num_cons_unpadded,
+      &self.A,
+      &self.B,
+      &self.C,
+      num_buf_cols,
+      self.num_cons_unpadded,
       |v: &E::Scalar| *v == E::Scalar::ONE || *v == -E::Scalar::ONE,
     );
     self.dense_to_col = remap.dense_to_col;
@@ -1475,15 +1491,38 @@ impl<E: Engine> SplitR1CSShape<E> {
     let col_chunk = std::cmp::min(CSC_COL_CHUNK, num_dense);
     let mut compact = vec![E::Scalar::ZERO; num_dense];
 
-    compact.par_chunks_mut(col_chunk).enumerate().for_each(|(tid, chunk)| {
-      let col_start = tid * col_chunk;
-      dispatch_abc_columns(
-        chunk, col_start, &self.col_presence, r, r_sq, rx,
-        (&self.A_csc_col_ptr, &self.A_csc_row, &self.A_csc_data, &self.A_csc_unit_end),
-        (&self.B_csc_col_ptr, &self.B_csc_row, &self.B_csc_data, &self.B_csc_unit_end),
-        (&self.C_csc_col_ptr, &self.C_csc_row, &self.C_csc_data, &self.C_csc_unit_end),
-      );
-    });
+    compact
+      .par_chunks_mut(col_chunk)
+      .enumerate()
+      .for_each(|(tid, chunk)| {
+        let col_start = tid * col_chunk;
+        dispatch_abc_columns(
+          chunk,
+          col_start,
+          &self.col_presence,
+          r,
+          r_sq,
+          rx,
+          (
+            &self.A_csc_col_ptr,
+            &self.A_csc_row,
+            &self.A_csc_data,
+            &self.A_csc_unit_end,
+          ),
+          (
+            &self.B_csc_col_ptr,
+            &self.B_csc_row,
+            &self.B_csc_data,
+            &self.B_csc_unit_end,
+          ),
+          (
+            &self.C_csc_col_ptr,
+            &self.C_csc_row,
+            &self.C_csc_data,
+            &self.C_csc_unit_end,
+          ),
+        );
+      });
 
     // Expand compact buffer → full-size output
     let mut result = vec![E::Scalar::ZERO; num_cols];
@@ -1570,8 +1609,11 @@ impl<E: Engine, C: SmallCoeff> SplitR1CSShape<E, C> {
 
     let num_buf_cols = 2 * num_vars_padded;
     let remap = build_column_remap_and_csc(
-      &A_padded, &B_padded, &C_padded,
-      num_buf_cols, num_cons,
+      &A_padded,
+      &B_padded,
+      &C_padded,
+      num_buf_cols,
+      num_cons,
       |v: &C| v.is_unit(),
     );
 
@@ -1628,9 +1670,7 @@ impl<E: Engine, C: SmallCoeff> SplitR1CSShape<E, C> {
         .enumerate()
         .map(|(row_idx, ptrs)| {
           M.get_row_unchecked(ptrs.try_into().unwrap())
-            .map(|(val, col_idx)| {
-              SmallCoeff::mul_field(*val, &(T_x[row_idx] * T_y[*col_idx]))
-            })
+            .map(|(val, col_idx)| SmallCoeff::mul_field(*val, &(T_x[row_idx] * T_y[*col_idx])))
             .sum::<E::Scalar>()
         })
         .sum()
@@ -1711,15 +1751,38 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
     let col_chunk = std::cmp::min(CSC_COL_CHUNK, num_dense);
     let mut compact = vec![E::Scalar::ZERO; num_dense];
 
-    compact.par_chunks_mut(col_chunk).enumerate().for_each(|(tid, chunk)| {
-      let col_start = tid * col_chunk;
-      dispatch_abc_columns(
-        chunk, col_start, &self.col_presence, r, r_sq, rx,
-        (&self.A_csc_col_ptr, &self.A_csc_row, &self.A_csc_data, &self.A_csc_unit_end),
-        (&self.B_csc_col_ptr, &self.B_csc_row, &self.B_csc_data, &self.B_csc_unit_end),
-        (&self.C_csc_col_ptr, &self.C_csc_row, &self.C_csc_data, &self.C_csc_unit_end),
-      );
-    });
+    compact
+      .par_chunks_mut(col_chunk)
+      .enumerate()
+      .for_each(|(tid, chunk)| {
+        let col_start = tid * col_chunk;
+        dispatch_abc_columns(
+          chunk,
+          col_start,
+          &self.col_presence,
+          r,
+          r_sq,
+          rx,
+          (
+            &self.A_csc_col_ptr,
+            &self.A_csc_row,
+            &self.A_csc_data,
+            &self.A_csc_unit_end,
+          ),
+          (
+            &self.B_csc_col_ptr,
+            &self.B_csc_row,
+            &self.B_csc_data,
+            &self.B_csc_unit_end,
+          ),
+          (
+            &self.C_csc_col_ptr,
+            &self.C_csc_row,
+            &self.C_csc_data,
+            &self.C_csc_unit_end,
+          ),
+        );
+      });
 
     // Expand compact buffer → full-size output
     let mut result = vec![E::Scalar::ZERO; num_cols];
@@ -1730,11 +1793,7 @@ impl<E: Engine, Coeff: SmallCoeff> SplitR1CSShape<E, Coeff> {
   }
 
   /// Fallback without column remapping (used when remap tables are not populated).
-  fn bind_row_vars_combined_small_no_remap(
-    &self,
-    rx: &[E::Scalar],
-    r: E::Scalar,
-  ) -> Vec<E::Scalar>
+  fn bind_row_vars_combined_small_no_remap(&self, rx: &[E::Scalar], r: E::Scalar) -> Vec<E::Scalar>
   where
     E::Scalar: MontgomeryLimbs,
   {

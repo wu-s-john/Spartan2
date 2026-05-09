@@ -40,11 +40,10 @@ impl SmallBit {
     V: Copy + From<bool> + NegOne,
     CS: SmallConstraintSystem<V>,
   {
-    let var = cs.alloc(|| "bit", || {
-      value
-        .map(V::from)
-        .ok_or(SynthesisError::AssignmentMissing)
-    })?;
+    let var = cs.alloc(
+      || "bit",
+      || value.map(V::from).ok_or(SynthesisError::AssignmentMissing),
+    )?;
 
     // Enforce: bit * (1 - bit) = 0
     // a = 1 * bit
@@ -73,10 +72,13 @@ impl SmallBit {
       || "bit_boolean",
       SmallLinearCombination::from_variable(var, V::from(true)), // a = bit
       boolean_not_lc(var, V::from(true)),                        // b = 1 - bit (needs -1 coeff)
-      SmallLinearCombination::zero(),                             // c = 0
+      SmallLinearCombination::zero(),                            // c = 0
     );
 
-    Ok(SmallBit { variable: var, value })
+    Ok(SmallBit {
+      variable: var,
+      value,
+    })
   }
 
   /// Get the underlying variable.
@@ -197,10 +199,18 @@ impl SmallBoolean {
   {
     match (a, b) {
       (SmallBoolean::Constant(a_val), _) => {
-        if *a_val { Ok(b.not()) } else { Ok(b.clone()) }
+        if *a_val {
+          Ok(b.not())
+        } else {
+          Ok(b.clone())
+        }
       }
       (_, SmallBoolean::Constant(b_val)) => {
-        if *b_val { Ok(a.not()) } else { Ok(a.clone()) }
+        if *b_val {
+          Ok(a.not())
+        } else {
+          Ok(a.clone())
+        }
       }
       _ => {
         let result_val = a.get_value().and_then(|av| b.get_value().map(|bv| av ^ bv));
@@ -260,12 +270,7 @@ impl SmallBoolean {
   /// SHA-256 CH function: (a AND b) XOR ((NOT a) AND c)
   ///
   /// Uses bellpepper's single-constraint form: (a - c) * b = result - c
-  pub fn sha256_ch<V, CS>(
-    cs: &mut CS,
-    a: &Self,
-    b: &Self,
-    c: &Self,
-  ) -> Result<Self, SynthesisError>
+  pub fn sha256_ch<V, CS>(cs: &mut CS, a: &Self, b: &Self, c: &Self) -> Result<Self, SynthesisError>
   where
     V: Copy + From<bool> + NegOne,
     CS: SmallConstraintSystem<V>,
@@ -354,7 +359,11 @@ impl Double for bool {
 
 fn double_lc<V: Copy + Double>(lc: SmallLinearCombination<V>) -> SmallLinearCombination<V> {
   SmallLinearCombination {
-    terms: lc.terms.into_iter().map(|(var, coeff)| (var, coeff.double())).collect(),
+    terms: lc
+      .terms
+      .into_iter()
+      .map(|(var, coeff)| (var, coeff.double()))
+      .collect(),
   }
 }
 

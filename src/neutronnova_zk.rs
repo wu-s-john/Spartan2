@@ -387,9 +387,7 @@ where
             &W_lo.W[j],
           );
           <E::Scalar as DelayedReduction<E::Scalar>>::unreduced_multiply_accumulate(
-            &mut acc,
-            &r,
-            &W_hi.W[j],
+            &mut acc, &r, &W_hi.W[j],
           );
           <E::Scalar as DelayedReduction<E::Scalar>>::reduce(&acc)
         })
@@ -649,7 +647,8 @@ where
 
     // 1. Build accumulators (takes pre-computed E_eq, not tau)
     let (_acc_span, acc_t) = start_span!("build_accumulators_neutronnova");
-    let accumulators = build_accumulators_neutronnova(a_layers, b_layers, e_eq, left, right, rhos, ell_b);
+    let accumulators =
+      build_accumulators_neutronnova(a_layers, b_layers, e_eq, left, right, rhos, ell_b);
     info!(
       elapsed_ms = %acc_t.elapsed().as_millis(),
       "build_accumulators_neutronnova"
@@ -1183,31 +1182,44 @@ where
 
     // === MATRIX-VECTOR MULTIPLY (small values) ===
     // NOTE: Use .collect() to preserve index order (fold+reduce doesn't preserve order!)
-    let (_matrix_span, matrix_t) = start_span!("matrix_vector_multiply_small", instances = n_padded);
+    let (_matrix_span, matrix_t) =
+      start_span!("matrix_vector_multiply_small", instances = n_padded);
     let triples: Vec<_> = (0..n_padded)
       .into_par_iter()
       .map(|i| {
         let z_small = build_z_small(&ws_small[i], &xs_small[i]);
-        let az = S.A.multiply_vec_small::<2, SmallValue>(&z_small, l0).unwrap();
-        let bz = S.B.multiply_vec_small::<2, SmallValue>(&z_small, l0).unwrap();
-        let cz = S.C.multiply_vec_small::<2, SmallValue>(&z_small, l0).unwrap();
+        let az = S
+          .A
+          .multiply_vec_small::<2, SmallValue>(&z_small, l0)
+          .unwrap();
+        let bz = S
+          .B
+          .multiply_vec_small::<2, SmallValue>(&z_small, l0)
+          .unwrap();
+        let cz = S
+          .C
+          .multiply_vec_small::<2, SmallValue>(&z_small, l0)
+          .unwrap();
         (az, bz, cz)
       })
       .collect();
-    let (a_small, b_small, c_small): (Vec<Vec<SmallValue>>, Vec<Vec<SmallValue>>, Vec<Vec<SmallValue>>) =
-      triples.into_iter().fold(
-        (
-          Vec::with_capacity(n_padded),
-          Vec::with_capacity(n_padded),
-          Vec::with_capacity(n_padded),
-        ),
-        |(mut a, mut b, mut c), (az, bz, cz)| {
-          a.push(az);
-          b.push(bz);
-          c.push(cz);
-          (a, b, c)
-        },
-      );
+    let (a_small, b_small, c_small): (
+      Vec<Vec<SmallValue>>,
+      Vec<Vec<SmallValue>>,
+      Vec<Vec<SmallValue>>,
+    ) = triples.into_iter().fold(
+      (
+        Vec::with_capacity(n_padded),
+        Vec::with_capacity(n_padded),
+        Vec::with_capacity(n_padded),
+      ),
+      |(mut a, mut b, mut c), (az, bz, cz)| {
+        a.push(az);
+        b.push(bz);
+        c.push(cz);
+        (a, b, c)
+      },
+    );
     info!(elapsed_ms = %matrix_t.elapsed().as_millis(), instances = n_padded, "matrix_vector_multiply_small");
 
     // === PHASE 1: SMALL-VALUE SUMCHECK (l0 rounds) ===
@@ -1215,15 +1227,8 @@ where
 
     // Build accumulators for l0 rounds
     // Pass full rhos (length ℓ_b) and l0 to enable eq-weighted folding of suffix instances
-    let accumulators = build_accumulators_neutronnova(
-      &a_small,
-      &b_small,
-      &E_eq,
-      left,
-      right,
-      &rhos,
-      l0,
-    );
+    let accumulators =
+      build_accumulators_neutronnova(&a_small, &b_small, &E_eq, left, right, &rhos, l0);
 
     // Run l0 rounds of small-value sumcheck
     let mut small_value = SmallValueSumCheck::<E::Scalar, 2>::from_accumulators(accumulators);
@@ -1290,9 +1295,13 @@ where
     // Each intermediate instance j gets contribution from instances j*2^l0..(j+1)*2^l0
     // NOTE: Use .collect() to preserve index order (fold+reduce doesn't preserve order!)
     let fold_az_bz_cz = |a_small: &[Vec<SmallValue>],
-                          b_small: &[Vec<SmallValue>],
-                          c_small: &[Vec<SmallValue>]|
-     -> (Vec<Vec<E::Scalar>>, Vec<Vec<E::Scalar>>, Vec<Vec<E::Scalar>>) {
+                         b_small: &[Vec<SmallValue>],
+                         c_small: &[Vec<SmallValue>]|
+     -> (
+      Vec<Vec<E::Scalar>>,
+      Vec<Vec<E::Scalar>>,
+      Vec<Vec<E::Scalar>>,
+    ) {
       let group_size = 1 << l0;
       let triples: Vec<_> = (0..n_intermediate)
         .into_par_iter()
@@ -1303,9 +1312,12 @@ where
           let group_b = &b_small[start..start + group_size];
           let group_c = &c_small[start..start + group_size];
 
-          let az_folded = small_value_eq_weighted_fold::<E, SmallValue>(group_eq, group_a, num_cons);
-          let bz_folded = small_value_eq_weighted_fold::<E, SmallValue>(group_eq, group_b, num_cons);
-          let cz_folded = small_value_eq_weighted_fold::<E, SmallValue>(group_eq, group_c, num_cons);
+          let az_folded =
+            small_value_eq_weighted_fold::<E, SmallValue>(group_eq, group_a, num_cons);
+          let bz_folded =
+            small_value_eq_weighted_fold::<E, SmallValue>(group_eq, group_b, num_cons);
+          let cz_folded =
+            small_value_eq_weighted_fold::<E, SmallValue>(group_eq, group_c, num_cons);
 
           (az_folded, bz_folded, cz_folded)
         })
@@ -1769,13 +1781,7 @@ where
     let mut ps_step = prep_snark
       .ps_step
       .par_iter()
-      .map(|ps_i| {
-        ps_i.rerandomize_with_shared(
-          &pk.ck,
-          &pk.S_step,
-          &ps_core.comm_shared,
-        )
-      })
+      .map(|ps_i| ps_i.rerandomize_with_shared(&pk.ck, &pk.S_step, &ps_core.comm_shared))
       .collect::<Result<Vec<_>, _>>()?;
     info!(elapsed_ms = %rerandomize_t.elapsed().as_millis(), "rerandomize_prep_state");
 

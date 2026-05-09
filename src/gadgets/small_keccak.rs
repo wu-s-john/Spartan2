@@ -18,8 +18,10 @@
 //! | ROT       | 0 (index shuffle)   | —            |
 //! | Permute   | 0 (index shuffle)   | —            |
 
-use crate::gadgets::small_boolean::{Double, NegOne, SmallBoolean};
-use crate::small_constraint_system::SmallConstraintSystem;
+use crate::{
+  gadgets::small_boolean::{Double, NegOne, SmallBoolean},
+  small_constraint_system::SmallConstraintSystem,
+};
 use bellpepper_core::SynthesisError;
 
 /// Keccak-f[1600] round constants (24 rounds).
@@ -88,20 +90,13 @@ where
 {
   // First compute (!b) & c
   let not_b = b.not();
-  let t = SmallBoolean::and(
-    cs.namespace(|| format!("{prefix}_andnot")).inner,
-    &not_b,
-    c,
-  )?;
+  let t = SmallBoolean::and(cs.namespace(|| format!("{prefix}_andnot")).inner, &not_b, c)?;
   // Then XOR with a
   SmallBoolean::xor(cs.namespace(|| format!("{prefix}_xor")).inner, a, &t)
 }
 
 /// Keccak-f[1600] permutation over SmallBoolean state.
-fn keccak_f<V, CS>(
-  cs: &mut CS,
-  state: &mut Vec<SmallBoolean>,
-) -> Result<(), SynthesisError>
+fn keccak_f<V, CS>(cs: &mut CS, state: &mut Vec<SmallBoolean>) -> Result<(), SynthesisError>
 where
   V: KeccakValue,
   CS: SmallConstraintSystem<V>,
@@ -157,7 +152,8 @@ where
       let mut acc = state[idx(x, 0, z)].clone();
       for y in 1..5 {
         acc = SmallBoolean::xor(
-          cs.namespace(|| format!("r{round}_theta_c_{x}_{z}_y{y}")).inner,
+          cs.namespace(|| format!("r{round}_theta_c_{x}_{z}_y{y}"))
+            .inner,
           &acc,
           &state[idx(x, y, z)],
         )?;
@@ -188,7 +184,8 @@ where
     for y in 0..5 {
       for z in 0..64 {
         state[idx(x, y, z)] = SmallBoolean::xor(
-          cs.namespace(|| format!("r{round}_theta_apply_{x}_{y}_{z}")).inner,
+          cs.namespace(|| format!("r{round}_theta_apply_{x}_{y}_{z}"))
+            .inner,
           &state[idx(x, y, z)],
           &d[x][z],
         )?;
@@ -201,9 +198,7 @@ where
 
 /// ρ (rotation) and π (permutation) steps combined. No constraints.
 fn rho_pi(state: &mut Vec<SmallBoolean>) {
-  let mut new_state: Vec<SmallBoolean> = (0..1600)
-    .map(|_| SmallBoolean::Constant(false))
-    .collect();
+  let mut new_state: Vec<SmallBoolean> = (0..1600).map(|_| SmallBoolean::Constant(false)).collect();
   for x in 0..5 {
     for y in 0..5 {
       let new_x = y;
@@ -233,9 +228,7 @@ where
   // Process one row (y-plane) at a time
   for y in 0..5 {
     // Snapshot the row before modification
-    let mut row: Vec<SmallBoolean> = (0..320)
-      .map(|_| SmallBoolean::Constant(false))
-      .collect();
+    let mut row: Vec<SmallBoolean> = (0..320).map(|_| SmallBoolean::Constant(false)).collect();
     for x in 0..5 {
       for z in 0..64 {
         row[x * 64 + z] = state[idx(x, y, z)].clone();
@@ -282,7 +275,10 @@ where
   V: KeccakValue,
   CS: SmallConstraintSystem<V>,
 {
-  assert!(input.len() % 8 == 0, "Keccak-256 input must be byte-aligned");
+  assert!(
+    input.len() % 8 == 0,
+    "Keccak-256 input must be byte-aligned"
+  );
 
   let rate = 1088; // Keccak-256 rate in bits
   let input_bits = input.len();
@@ -299,9 +295,7 @@ where
   padded[padded_len - 1] = padded[padded_len - 1].not();
 
   // Initialize 1600-bit state to zero
-  let mut state: Vec<SmallBoolean> = (0..1600)
-    .map(|_| SmallBoolean::Constant(false))
-    .collect();
+  let mut state: Vec<SmallBoolean> = (0..1600).map(|_| SmallBoolean::Constant(false)).collect();
 
   let num_blocks = padded_len / rate;
   for block_idx in 0..num_blocks {
@@ -346,9 +340,7 @@ mod tests {
   fn bytes_to_small_bits_lsb(bytes: &[u8]) -> Vec<SmallBoolean> {
     bytes
       .iter()
-      .flat_map(|byte| {
-        (0..8).map(move |i| SmallBoolean::constant((byte >> i) & 1 == 1))
-      })
+      .flat_map(|byte| (0..8).map(move |i| SmallBoolean::constant((byte >> i) & 1 == 1)))
       .collect()
   }
 
@@ -369,9 +361,7 @@ mod tests {
   #[test]
   fn test_small_keccak256_shape() {
     let mut cs = SmallShapeCS::<i8>::new();
-    let input: Vec<SmallBoolean> = (0..512)
-      .map(|_| SmallBoolean::constant(false))
-      .collect();
+    let input: Vec<SmallBoolean> = (0..512).map(|_| SmallBoolean::constant(false)).collect();
     let hash_bits = small_keccak256::<i8, _>(&mut cs, &input).unwrap();
     assert_eq!(hash_bits.len(), 256);
   }

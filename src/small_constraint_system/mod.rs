@@ -16,15 +16,19 @@ pub mod bridge;
 pub mod circuit;
 pub mod r1cs;
 
-use std::marker::PhantomData;
-use std::ops::{Add, AddAssign, Neg, Sub};
+use std::{
+  marker::PhantomData,
+  ops::{Add, AddAssign, Neg, Sub},
+};
 
 pub use bridge::SmallToBellpepperCS;
 
 use bellpepper_core::{Index, SynthesisError, Variable};
 
-use crate::r1cs::SparseMatrix;
-use crate::small_field::{WideMul, montgomery::MontgomeryLimbs};
+use crate::{
+  r1cs::SparseMatrix,
+  small_field::{WideMul, montgomery::MontgomeryLimbs},
+};
 
 // ── SmallCoeff ───────────────────────────────────────────────────────────
 
@@ -68,8 +72,7 @@ impl SmallCoeff for i8 {
       2 => x.double(),
       _ => {
         // General fallback for arbitrary i8 values
-        use crate::small_field::barrett::barrett_reduce_5;
-        use crate::small_field::limbs::mac;
+        use crate::small_field::{barrett::barrett_reduce_5, limbs::mac};
         let a = x.to_limbs();
         let mag = self.unsigned_abs() as u64;
         let (r0, c) = mac(0, a[0], mag, 0);
@@ -96,8 +99,7 @@ impl SmallCoeff for i8 {
 impl SmallCoeff for i32 {
   #[inline(always)]
   fn mul_field<F: ff::PrimeField + MontgomeryLimbs>(self, x: &F) -> F {
-    use crate::small_field::barrett::barrett_reduce_5;
-    use crate::small_field::limbs::mac;
+    use crate::small_field::{barrett::barrett_reduce_5, limbs::mac};
     let a = x.to_limbs();
     let mag = self.unsigned_abs() as u64;
     let (r0, c) = mac(0, a[0], mag, 0);

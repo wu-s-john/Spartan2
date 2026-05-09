@@ -27,8 +27,10 @@
 //! ```
 
 use super::{SmallMultiEq, SmallUInt32};
-use crate::gadgets::small_boolean::{Double, NegOne, SmallBoolean};
-use crate::small_constraint_system::SmallConstraintSystem;
+use crate::{
+  gadgets::small_boolean::{Double, NegOne, SmallBoolean},
+  small_constraint_system::SmallConstraintSystem,
+};
 use bellpepper_core::SynthesisError;
 
 /// SHA-256 round constants K[0..63].
@@ -129,7 +131,12 @@ where
       cs.namespace(|| format!("{prefix}b{block_idx}_w{i}_s0")),
       &w_expanded[i - 15],
     )?;
-    let wi = cs.addmany(&[s1, w_expanded[i - 7].clone(), s0, w_expanded[i - 16].clone()])?;
+    let wi = cs.addmany(&[
+      s1,
+      w_expanded[i - 7].clone(),
+      s0,
+      w_expanded[i - 16].clone(),
+    ])?;
     w_expanded.push(wi);
   }
 
@@ -198,7 +205,10 @@ where
 /// # Shape extraction (V = i32)
 /// Pass a `SmallShapeCS` or `NoBatchEq<i32, SmallShapeCS>`.
 /// All constraints use i32 coefficients.
-pub fn small_sha256_int<V, M>(cs: &mut M, input: &[SmallBoolean]) -> Result<Vec<SmallBoolean>, SynthesisError>
+pub fn small_sha256_int<V, M>(
+  cs: &mut M,
+  input: &[SmallBoolean],
+) -> Result<Vec<SmallBoolean>, SynthesisError>
 where
   V: Sha256Value,
   M: SmallMultiEq<V>,
@@ -325,8 +335,7 @@ where
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::gadgets::NoBatchEq;
-  use crate::small_constraint_system::SmallShapeCS;
+  use crate::{gadgets::NoBatchEq, small_constraint_system::SmallShapeCS};
 
   /// Convert bytes to SmallBoolean bits (big-endian per byte).
   fn bytes_to_small_bits(bytes: &[u8]) -> Vec<SmallBoolean> {
@@ -374,7 +383,9 @@ mod tests {
     // 8 allocated bit inputs → should produce constraints
     let input: Vec<SmallBoolean> = (0..8)
       .map(|i| {
-        SmallBoolean::Is(SmallBit::alloc(&mut eq.namespace(|| format!("in{i}")), Some(false)).unwrap())
+        SmallBoolean::Is(
+          SmallBit::alloc(&mut eq.namespace(|| format!("in{i}")), Some(false)).unwrap(),
+        )
       })
       .collect();
     let hash_bits = small_sha256_int::<i32, _>(&mut eq, &input).unwrap();

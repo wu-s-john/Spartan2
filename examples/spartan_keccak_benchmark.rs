@@ -52,7 +52,9 @@ fn main() {
   let circuit = KeccakChainCircuit::<F>::new(input, chain_length);
 
   let _root = info_span!("keccak_bench", input_bytes, chain_length).entered();
-  info!("===== Keccak-256 Spartan SNARK Benchmark (input_bytes={input_bytes}, chain_length={chain_length}) =====");
+  info!(
+    "===== Keccak-256 Spartan SNARK Benchmark (input_bytes={input_bytes}, chain_length={chain_length}) ====="
+  );
 
   // ─── FIELD-ELEMENT PATH (baseline) ───
 
@@ -87,7 +89,8 @@ fn main() {
   clear_timings(&timing_data);
 
   let t0 = Instant::now();
-  let pk_small = SpartanSNARK::<E>::setup_small::<i8, _>(&circuit, &vk).expect("setup_small failed");
+  let pk_small =
+    SpartanSNARK::<E>::setup_small::<i8, _>(&circuit, &vk).expect("setup_small failed");
   let setup_small_ms = t0.elapsed().as_millis();
   info!(elapsed_ms = setup_small_ms, "setup_small");
 
@@ -98,8 +101,9 @@ fn main() {
   info!(elapsed_ms = small_prep_ms, "prep_prove_small");
 
   let t0 = Instant::now();
-  let proof_small = SpartanSNARK::<E>::prove_small_value(&pk_small, circuit.clone(), &mut prep_small)
-    .expect("prove_small_value failed");
+  let proof_small =
+    SpartanSNARK::<E>::prove_small_value(&pk_small, circuit.clone(), &mut prep_small)
+      .expect("prove_small_value failed");
   let small_prove_ms = t0.elapsed().as_millis();
   info!(elapsed_ms = small_prove_ms, "prove_small_value");
 
@@ -117,9 +121,7 @@ fn main() {
     Some(c) => format!(
       "===== Keccak input_bytes={input_bytes}, chain_length={chain_length}, constraints={c} ====="
     ),
-    None => format!(
-      "===== Keccak input_bytes={input_bytes}, chain_length={chain_length} ====="
-    ),
+    None => format!("===== Keccak input_bytes={input_bytes}, chain_length={chain_length} ====="),
   };
   print_table(&header, SPARTAN_PHASES, &small_timings, &large_timings);
 

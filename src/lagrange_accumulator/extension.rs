@@ -243,15 +243,25 @@ where
 {
   let base: usize = D + 1;
   let num_vars = prefix_size.trailing_zeros() as usize;
-  debug_assert_eq!(prefix_size, 1 << num_vars, "prefix_size must be a power of 2");
+  debug_assert_eq!(
+    prefix_size,
+    1 << num_vars,
+    "prefix_size must be a power of 2"
+  );
 
   if num_vars == 0 {
     return 1;
   }
 
   let final_size = base.pow(num_vars as u32);
-  debug_assert!(buf_curr.len() >= final_size, "buf_curr too small for in-place extension");
-  debug_assert!(buf_scratch.len() >= final_size, "buf_scratch too small for in-place extension");
+  debug_assert!(
+    buf_curr.len() >= final_size,
+    "buf_curr too small for in-place extension"
+  );
+  debug_assert!(
+    buf_scratch.len() >= final_size,
+    "buf_scratch too small for in-place extension"
+  );
 
   for j in 1..=num_vars {
     let prefix_count = base.pow((j - 1) as u32);

@@ -8,8 +8,7 @@
 
 use bellpepper_core::{SynthesisError, Variable};
 
-use crate::small_constraint_system::SmallConstraintSystem;
-use crate::traits::Engine;
+use crate::{small_constraint_system::SmallConstraintSystem, traits::Engine};
 
 /// A helper trait for circuits that use the pure-integer small-value path.
 ///
