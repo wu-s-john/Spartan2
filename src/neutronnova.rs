@@ -4,15 +4,22 @@
 //!
 //! Batch variables bind least-significant bit first. Spartan row/column
 //! variables bind most-significant bit first, matching Hyrax's MLE convention.
-//! Round messages are public; there is no recursive or ZK verifier circuit.
+//! Uses the folding and sumcheck kernels shared with `neutronnova_zk`.
+//! This module supplies public round messages and native verification, with no ZK verifier circuit.
 
 use crate::{
   CommitmentKey, VerifierKey,
   bellpepper::{r1cs::add_constraint, shape_cs::ShapeCS, solver::SatisfyingAssignment},
   errors::SpartanError,
-  polys::{eq::EqPolynomial, multilinear::SparsePolynomial, power::PowPolynomial},
+  neutronnova_zk::{NeutronNovaNIFS, small_matvec_cache},
+  polys::{
+    eq::EqPolynomial,
+    multilinear::{MultilinearPolynomial, SparsePolynomial},
+    power::PowPolynomial,
+  },
   provider::T256HyraxEngine,
-  r1cs::{R1CSInstance, R1CSWitness, SparseMatrix, SplitR1CSShape, weights_from_r},
+  r1cs::{R1CSInstance, R1CSWitness, SparseMatrix, SplitR1CSShape},
+  sumcheck::SumcheckProof,
   traits::{
     Engine,
     pcs::{FoldingEngineTrait, PCSEngineTrait},
@@ -34,7 +41,7 @@ pub type Scalar = <E as Engine>::Scalar;
 type F = Scalar;
 type Pcs = <E as Engine>::PCS;
 type Transcript = <E as Engine>::TE;
-type Products = [Vec<F>; 3];
+type Products = (Vec<F>, Vec<F>, Vec<F>);
 /// Protocol result with structured Spartan errors.
 pub type Result<T> = std::result::Result<T, SpartanError>;
 
@@ -327,7 +334,7 @@ fn transcript(
   steps: &[R1CSInstance<E>],
   core: &R1CSInstance<E>,
 ) -> Transcript {
-  let mut t = Transcript::new(b"non-zk-mc/v1");
+  let mut t = Transcript::new(b"non-zk-mc/v2");
   t.absorb(b"vk", &Bytes(digest));
   t.absorb(b"statement", &Bytes(binding));
   for u in steps {
@@ -341,8 +348,7 @@ fn products(s: &SplitR1CSShape<E>, u: &R1CSInstance<E>, w: &R1CSWitness<E>) -> R
   let mut z = w.W.clone();
   z.push(F::ONE);
   z.extend_from_slice(&u.X);
-  let (a, b, c) = s.multiply_vec(&z)?;
-  Ok([a, b, c])
+  s.multiply_vec(&z)
 }
 
 fn eval<const N: usize>(p: &[F; N], x: F) -> F {
@@ -355,98 +361,6 @@ fn round<const N: usize>(t: &mut Transcript, p: &[F; N], claim: F) -> Result<()>
   }
   t.absorb(b"polynomial", &p.as_slice());
   Ok(())
-}
-
-fn bind(v: &mut Vec<F>, r: F) {
-  let half = v.len() / 2;
-  let (lo, hi) = v.split_at_mut(half);
-  lo.par_iter_mut()
-    .zip(hi.par_iter())
-    .for_each(|(a, b)| *a += r * (*b - *a));
-  v.truncate(half);
-}
-
-fn add<const N: usize>(mut a: [F; N], b: [F; N]) -> [F; N] {
-  for i in 0..N {
-    a[i] += b[i];
-  }
-  a
-}
-
-fn outer_poly(p: &Products, weights: &[F]) -> [F; 4] {
-  let n = weights.len() / 2;
-  (0..n)
-    .into_par_iter()
-    .map(|i| {
-      let [a, b, c] = [p[0][i], p[1][i], p[2][i]];
-      let [da, db, dc] = [p[0][i + n] - a, p[1][i + n] - b, p[2][i + n] - c];
-      let w = weights[i];
-      let dw = weights[i + n] - w;
-      let q = [a * b - c, a * db + da * b - dc, da * db];
-      [
-        w * q[0],
-        w * q[1] + dw * q[0],
-        w * q[2] + dw * q[1],
-        dw * q[2],
-      ]
-    })
-    .reduce(|| [F::ZERO; 4], add)
-}
-
-fn inner_poly(a: &[F], z: &[F]) -> [F; 3] {
-  let n = a.len() / 2;
-  (0..n)
-    .into_par_iter()
-    .map(|i| {
-      let da = a[i + n] - a[i];
-      let dz = z[i + n] - z[i];
-      [a[i] * z[i], a[i] * dz + da * z[i], da * dz]
-    })
-    .reduce(|| [F::ZERO; 3], add)
-}
-
-fn residual(p: &Products, w: &[F]) -> F {
-  (0..w.len())
-    .into_par_iter()
-    .map(|i| w[i] * (p[0][i] * p[1][i] - p[2][i]))
-    .sum()
-}
-
-fn fold_layers(layers: Vec<Products>, r: F) -> Vec<Products> {
-  layers
-    .par_chunks(2)
-    .map(|pair| {
-      std::array::from_fn(|j| {
-        pair[0][j]
-          .iter()
-          .zip(&pair[1][j])
-          .map(|(a, b)| *a + r * (*b - *a))
-          .collect()
-      })
-    })
-    .collect()
-}
-
-fn folding_poly(layers: &[Products], row_weights: &[F], rho: F, suffix: &[F], prefix: F) -> [F; 4] {
-  let weights = weights_from_r(suffix, layers.len() / 2);
-  let g = layers
-    .par_chunks(2)
-    .zip(weights.par_iter())
-    .map(|(pair, weight)| {
-      let mut q = [F::ZERO; 3];
-      for (i, w) in row_weights.iter().enumerate() {
-        let [a, b, c] = [pair[0][0][i], pair[0][1][i], pair[0][2][i]];
-        let [da, db, dc] = [pair[1][0][i] - a, pair[1][1][i] - b, pair[1][2][i] - c];
-        q[0] += *w * (a * b - c);
-        q[1] += *w * (a * db + da * b - dc);
-        q[2] += *w * da * db;
-      }
-      q.map(|v| v * weight)
-    })
-    .reduce(|| [F::ZERO; 3], add);
-  let a = F::ONE - rho;
-  let b = rho.double() - F::ONE;
-  [a * g[0], a * g[1] + b * g[0], a * g[2] + b * g[1], b * g[2]].map(|v| v * prefix)
 }
 
 /// Prove the committed batch with public folding/Spartan messages and one opening.
@@ -463,53 +377,77 @@ pub fn prove(pk: &ProverKey, binding: &[u8], committed: &Committed) -> Result<(P
     .collect::<Result<Vec<_>>>()?;
   let m = pk.shapes[0].num_cons;
   let n = pk.shapes[0].num_rest;
-  let row_weights: Vec<_> = std::iter::successors(Some(F::ONE), |w| Some(*w * tau))
-    .take(m)
-    .collect();
+  let rounds_x = m.ilog2() as usize;
+  let left = 1 << rounds_x.div_ceil(2);
+  let right = 1 << (rounds_x / 2);
   let started = Instant::now();
-  let mut layers = committed
-    .steps
-    .par_iter()
-    .zip(&committed.witnesses)
-    .map(|(u, w)| products(&pk.shapes[0], u, w))
-    .collect::<Result<Vec<_>>>()?;
-  let core = products(&pk.shapes[1], &committed.core, &committed.core_witness)?;
+  let (layers, core) = rayon::join(
+    || {
+      committed
+        .steps
+        .par_iter()
+        .zip(&committed.witnesses)
+        .map(|(u, w)| products(&pk.shapes[0], u, w))
+        .collect::<Result<Vec<_>>>()
+    },
+    || products(&pk.shapes[1], &committed.core, &committed.core_witness),
+  );
+  let mut layers = layers?;
+  let (az_core, bz_core, cz_core) = core?;
+  // Build the same small-value caches used by the ZK prover, inside the measured
+  // protocol phase: these matrix products depend on this proof's fresh witness.
+  let cache = (rounds_b > 0).then(|| small_matvec_cache(&layers));
   phases.matrix_ms = started.elapsed().as_secs_f64() * 1000.;
 
   let started = Instant::now();
   let mut folding = Vec::new();
-  let mut rb = Vec::new();
   let (mut claim, mut prefix) = (F::ZERO, F::ONE);
-  for j in 0..rounds_b {
-    let p = folding_poly(&layers, &row_weights, rhos[j], &rhos[j + 1..], prefix);
-    round(&mut t, &p, claim)?;
-    let r = t.squeeze(b"fold")?;
-    claim = eval(&p, r);
-    prefix *= (F::ONE - rhos[j]) * (F::ONE - r) + rhos[j] * r;
-    layers = fold_layers(layers, r);
-    folding.push(p);
-    rb.push(r);
-  }
-  let step = layers.pop().ok_or_else(|| error("empty step batch"))?;
-  let folded_target = if rounds_b == 0 {
-    F::ZERO
-  } else {
-    residual(&step, &row_weights)
-  };
-  if claim != prefix * folded_target {
-    return Err(error("invalid folding residual"));
-  }
+  let (mut eq, az_step, bz_step, cz_step, folded_w, folded_u, folded_target) =
+    if let Some((small, large_positions)) = cache {
+      let folded = NeutronNovaNIFS::<E>::prove_with_rounds(
+        &pk.shapes[0],
+        &pk.ck,
+        committed.steps.par_iter().cloned().collect(),
+        committed.witnesses.par_iter().cloned().collect(),
+        Some(layers),
+        Some(small),
+        &large_positions,
+        tau,
+        &rhos,
+        |j, p| {
+          round(&mut t, &p, claim)?;
+          let r = t.squeeze(b"fold")?;
+          claim = eval(&p, r);
+          prefix *= (F::ONE - rhos[j]) * (F::ONE - r) + rhos[j] * r;
+          folding.push(p);
+          Ok(r)
+        },
+      )?;
+      if prefix != folded.eq_rho || claim != prefix * folded.target {
+        return Err(error("invalid folding residual"));
+      }
+      (
+        folded.eq,
+        folded.az,
+        folded.bz,
+        folded.cz,
+        Cow::Owned(folded.witness),
+        Cow::Owned(folded.instance),
+        folded.target,
+      )
+    } else {
+      let (a, b, c) = layers.pop().ok_or_else(|| error("empty step batch"))?;
+      (
+        PowPolynomial::split_evals(tau, rounds_x, left, right),
+        a,
+        b,
+        c,
+        Cow::Borrowed(&committed.witnesses[0]),
+        Cow::Borrowed(&committed.steps[0]),
+        F::ZERO,
+      )
+    };
   t.absorb(b"folded-target", &folded_target);
-  let folded_u = if rounds_b == 0 {
-    Cow::Borrowed(&committed.steps[0])
-  } else {
-    Cow::Owned(R1CSInstance::fold_multiple(&rb, &committed.steps)?)
-  };
-  let folded_w = if rounds_b == 0 {
-    Cow::Borrowed(&committed.witnesses[0])
-  } else {
-    Cow::Owned(R1CSWitness::fold_multiple(&rb, &committed.witnesses)?)
-  };
   phases.folding_ms = if rounds_b == 0 {
     0.
   } else {
@@ -517,37 +455,47 @@ pub fn prove(pk: &ProverKey, binding: &[u8], committed: &Committed) -> Result<(P
   };
 
   let started = Instant::now();
-  let mut tables = [step, core];
-  let mut weights = row_weights;
+  let eq_right = eq.split_off(left);
+  let mut pow_left = MultilinearPolynomial::new(eq);
+  let pow_right = MultilinearPolynomial::new(eq_right);
+  let mut az_step = MultilinearPolynomial::new(az_step);
+  let mut bz_step = MultilinearPolynomial::new(bz_step);
+  let mut cz_step = MultilinearPolynomial::new(cz_step);
+  let mut az_core = MultilinearPolynomial::new(az_core);
+  let mut bz_core = MultilinearPolynomial::new(bz_core);
+  let mut cz_core = MultilinearPolynomial::new(cz_core);
   let mut claims = [folded_target, F::ZERO];
   let mut outer = Vec::new();
-  let mut rx = Vec::new();
-  while weights.len() > 1 {
-    let p = [
-      outer_poly(&tables[0], &weights),
-      outer_poly(&tables[1], &weights),
-    ];
-    for j in 0..2 {
-      round(&mut t, &p[j], claims[j])?;
-    }
-    let r = t.squeeze(b"outer")?;
-    for j in 0..2 {
-      claims[j] = eval(&p[j], r);
-      for v in &mut tables[j] {
-        bind(v, r);
+  let rx = SumcheckProof::<E>::prove_cubic_with_additive_term_batched_with_rounds(
+    &[folded_target, F::ZERO],
+    rounds_x,
+    &mut pow_left,
+    &pow_right,
+    &mut az_step,
+    &mut az_core,
+    &mut bz_step,
+    &mut bz_core,
+    &mut cz_step,
+    &mut cz_core,
+    |_, p| {
+      for j in 0..2 {
+        round(&mut t, &p[j], claims[j])?;
       }
-    }
-    bind(&mut weights, r);
-    outer.push(p);
-    rx.push(r);
-  }
-  let outer_claims = std::array::from_fn(|j| std::array::from_fn(|k| tables[j][k][0]));
+      let r = t.squeeze(b"outer")?;
+      claims = p.map(|q| eval(&q, r));
+      outer.push(p);
+      Ok(r)
+    },
+  )?;
+  let outer_claims = [
+    [az_step[0], bz_step[0], cz_step[0]],
+    [az_core[0], bz_core[0], cz_core[0]],
+  ];
+  let weight = PowPolynomial::new(&tau, rx.len()).evaluate(&rx)?;
   for (j, q) in outer_claims.iter().enumerate() {
-    if claims[j] != weights[0] * (q[0] * q[1] - q[2]) {
+    if claims[j] != weight * (q[0] * q[1] - q[2]) {
       return Err(error("invalid outer terminal"));
     }
-  }
-  for q in &outer_claims {
     t.absorb(b"outer-claims", &q.as_slice());
   }
   let alpha = t.squeeze(b"matrix-batch")?;
@@ -555,39 +503,44 @@ pub fn prove(pk: &ProverKey, binding: &[u8], committed: &Committed) -> Result<(P
 
   let started = Instant::now();
   let eq_rx = EqPolynomial::evals_from_points(&rx);
-  let mut matrix = std::array::from_fn::<_, 2, _>(|j| {
-    pk.shapes[j]
-      .bind_and_prepare_poly_ABC_full(&eq_rx, &alpha)
-      .0
+  let [mut matrix_step, mut matrix_core] = std::array::from_fn::<_, 2, _>(|j| {
+    MultilinearPolynomial::new(
+      pk.shapes[j]
+        .bind_and_prepare_poly_ABC_full(&eq_rx, &alpha)
+        .0,
+    )
   });
   let us = [&*folded_u, &committed.core];
   let ws = [&*folded_w, &committed.core_witness];
-  let mut z = std::array::from_fn::<_, 2, _>(|j| {
+  let [mut z_step, mut z_core] = std::array::from_fn::<_, 2, _>(|j| {
     let mut v = ws[j].W.clone();
     v.push(F::ONE);
     v.extend_from_slice(&us[j].X);
     v.resize(2 * n, F::ZERO);
-    v
+    MultilinearPolynomial::new(v)
   });
   claims = outer_claims.map(|q| q[0] + alpha * q[1] + alpha.square() * q[2]);
   let mut inner = Vec::new();
-  let mut ry = Vec::new();
-  while matrix[0].len() > 1 {
-    let p = [inner_poly(&matrix[0], &z[0]), inner_poly(&matrix[1], &z[1])];
-    for j in 0..2 {
-      round(&mut t, &p[j], claims[j])?;
-    }
-    let r = t.squeeze(b"inner")?;
-    for j in 0..2 {
-      claims[j] = eval(&p[j], r);
-      bind(&mut matrix[j], r);
-      bind(&mut z[j], r);
-    }
-    inner.push(p);
-    ry.push(r);
-  }
+  let initial_inner_claims = claims;
+  let (ry, terminals) = SumcheckProof::<E>::prove_quad_batched_with_rounds(
+    &initial_inner_claims,
+    n.ilog2() as usize + 1,
+    &mut matrix_step,
+    &mut matrix_core,
+    &mut z_step,
+    &mut z_core,
+    |_, p| {
+      for j in 0..2 {
+        round(&mut t, &p[j], claims[j])?;
+      }
+      let r = t.squeeze(b"inner")?;
+      claims = p.map(|q| eval(&q, r));
+      inner.push(p);
+      Ok(r)
+    },
+  )?;
   for j in 0..2 {
-    if claims[j] != matrix[j][0] * z[j][0] {
+    if claims[j] != terminals[j] * terminals[j + 2] {
       return Err(error("invalid inner terminal"));
     }
   }

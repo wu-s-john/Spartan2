@@ -73,6 +73,49 @@ pub struct NeutronNovaNIFS<E: Engine> {
   polys: Vec<UniPoly<E::Scalar>>,
 }
 
+/// Folded relation and witness produced independently of the message protocol.
+pub(crate) struct NeutronNovaFoldOutput<E: Engine> {
+  pub(crate) eq: Vec<E::Scalar>,
+  pub(crate) az: Vec<E::Scalar>,
+  pub(crate) bz: Vec<E::Scalar>,
+  pub(crate) cz: Vec<E::Scalar>,
+  pub(crate) witness: R1CSWitness<E>,
+  pub(crate) instance: R1CSInstance<E>,
+  pub(crate) target: E::Scalar,
+  pub(crate) eq_rho: E::Scalar,
+}
+
+/// Cache signed small values and their shared field-correction positions.
+pub(crate) fn small_matvec_cache<F: ff::PrimeField + MontgomeryLimbs>(
+  matvec: &[(Vec<F>, Vec<F>, Vec<F>)],
+) -> (Vec<(Vec<i64>, Vec<i64>, Vec<i64>)>, Vec<usize>) {
+  let mut all_i64 = Vec::with_capacity(matvec.len());
+  let mut large_pos_set = std::collections::BTreeSet::new();
+  for (az, bz, cz) in matvec {
+    let (az_i64, az_large) = to_small_vec_or_zero(az);
+    let (bz_i64, bz_large) = to_small_vec_or_zero(bz);
+    let (cz_i64, cz_large) = to_small_vec_or_zero(cz);
+    large_pos_set.extend(az_large);
+    large_pos_set.extend(bz_large);
+    large_pos_set.extend(cz_large);
+    all_i64.push((az_i64, bz_i64, cz_i64));
+  }
+  let large_positions: Vec<usize> = large_pos_set.into_iter().collect();
+  info!(
+    n_large = large_positions.len(),
+    total = matvec.first().map_or(0, |m| m.0.len()),
+    "i64_conversion_stats"
+  );
+  for (az_i64, bz_i64, cz_i64) in &mut all_i64 {
+    for &position in &large_positions {
+      az_i64[position] = 0;
+      bz_i64[position] = 0;
+      cz_i64[position] = 0;
+    }
+  }
+  (all_i64, large_positions)
+}
+
 #[inline(always)]
 #[allow(clippy::needless_range_loop)]
 fn suffix_weight_full<F: Field>(t: usize, ell_b: usize, pair_idx: usize, rhos: &[F]) -> F {
@@ -499,15 +542,9 @@ where
     }
   }
 
-  /// ZK version of NeutronNova NIFS prove. This function performs the NIFS folding
-  /// rounds while interacting with the multi-round verifier circuit/state to derive
-  /// per-round challenges via Fiat-Shamir, and populates the verifier circuit's
-  /// NIFS-related public values. It returns:
-  /// - the constructed NIFS (list of cubic univariate polynomials),
-  /// - the split equality polynomial evaluations E (length left+right),
-  /// - the final A/B/C layers after folding (as multilinear tables),
-  /// - the final outer claim T_out for the step branch, and
-  /// - the sequence of challenges r_b used to fold instances/witnesses.
+  /// Runs the shared folding kernel using the ZK verifier circuit for round
+  /// messages and challenges. Returns the equality weights, final A/B/C layers,
+  /// and folded witness and instance.
   pub fn prove(
     S: &SplitR1CSShape<E>,
     ck: &CommitmentKey<E>,
@@ -532,39 +569,124 @@ where
     ),
     SpartanError,
   > {
-    // Determine padding and NIFS rounds
+    if Us.is_empty() || Ws.len() != Us.len() {
+      return Err(SpartanError::InvalidInputLength {
+        reason: "NIFS requires a nonempty matching instance/witness batch".into(),
+      });
+    }
     let n = Us.len();
-    let n_padded = Us.len().next_power_of_two();
+    let n_padded = n.next_power_of_two();
     let ell_b = n_padded.log_2();
-
     info!(
       "NeutronNova NIFS prove for {} instances and padded to {} instances",
-      Us.len(),
-      n_padded
+      n, n_padded
     );
-
     let mut Us = Us;
     let mut Ws = Ws;
-    if Us.len() < n_padded {
+    if n < n_padded {
       Us.extend(vec![Us[0].clone(); n_padded - n]);
       Ws.extend(vec![Ws[0].clone(); n_padded - n]);
     }
-    for U in Us.iter() {
+    for U in &Us {
       transcript.absorb(b"U", U);
     }
-    let T = E::Scalar::ZERO;
-    transcript.absorb(b"T", &T);
-
-    // Squeeze tau and rhos fresh inside this function (like ZK sum-check APIs)
-    let (ell_cons, left, right) = compute_tensor_decomp(S.num_cons);
+    transcript.absorb(b"T", &E::Scalar::ZERO);
     let tau = transcript.squeeze(b"tau")?;
+    let rhos = (0..ell_b)
+      .map(|_| transcript.squeeze(b"rho"))
+      .collect::<Result<Vec<_>, _>>()?;
+    let folded = Self::prove_with_rounds(
+      S,
+      ck,
+      Us,
+      Ws,
+      cached_matvec,
+      cached_i64,
+      large_positions,
+      tau,
+      &rhos,
+      |round_index, coefficients| {
+        vc.nifs_polys[round_index] = coefficients;
+        let challenges = SatisfyingAssignment::<E>::process_round(
+          vc_state,
+          vc_shape,
+          vc_ck,
+          vc,
+          round_index,
+          transcript,
+        )?;
+        Ok(challenges[0])
+      },
+    )?;
+    vc.t_out_step = folded.target;
+    vc.eq_rho_at_rb = folded.eq_rho;
+    SatisfyingAssignment::<E>::process_round(vc_state, vc_shape, vc_ck, vc, ell_b, transcript)?;
+    Ok((
+      folded.eq,
+      folded.az,
+      folded.bz,
+      folded.cz,
+      folded.witness,
+      folded.instance,
+    ))
+  }
 
-    let E_eq = PowPolynomial::split_evals(tau, ell_cons, left, right);
-
-    let mut rhos = Vec::with_capacity(ell_b);
-    for _ in 0..ell_b {
-      rhos.push(transcript.squeeze(b"rho")?);
+  /// Shared optimized NIFS arithmetic for an already padded batch. The caller
+  /// binds each cubic polynomial and returns its Fiat-Shamir challenge. This
+  /// kernel neither allocates a verifier circuit nor accesses a transcript.
+  pub(crate) fn prove_with_rounds(
+    S: &SplitR1CSShape<E>,
+    ck: &CommitmentKey<E>,
+    Us: Vec<R1CSInstance<E>>,
+    mut Ws: Vec<R1CSWitness<E>>,
+    cached_matvec: Option<Vec<(Vec<E::Scalar>, Vec<E::Scalar>, Vec<E::Scalar>)>>,
+    cached_i64: Option<Vec<(Vec<i64>, Vec<i64>, Vec<i64>)>>,
+    large_positions: &[usize],
+    tau: E::Scalar,
+    rhos: &[E::Scalar],
+    mut round: impl FnMut(usize, [E::Scalar; 4]) -> Result<E::Scalar, SpartanError>,
+  ) -> Result<NeutronNovaFoldOutput<E>, SpartanError> {
+    let n_padded = Us.len();
+    if !n_padded.is_power_of_two() || Ws.len() != n_padded || !S.num_cons.is_power_of_two() {
+      return Err(SpartanError::InvalidInputLength {
+        reason: "NIFS requires a nonempty power-of-two batch and row domain".into(),
+      });
     }
+    let ell_b = n_padded.log_2();
+    if rhos.len() != ell_b {
+      return Err(SpartanError::InvalidInputLength {
+        reason: "NIFS batch challenge count mismatch".into(),
+      });
+    }
+    let witness_len = S.num_shared + S.num_precommitted + S.num_rest;
+    if Ws.iter().any(|w| w.W.len() != witness_len)
+      || Us
+        .iter()
+        .any(|u| u.X.len() != S.num_public + S.num_challenges)
+    {
+      return Err(SpartanError::InvalidWitnessLength);
+    }
+    if cached_matvec.as_ref().is_some_and(|cache| {
+      cache.len() > n_padded
+        || cache
+          .iter()
+          .any(|(a, b, c)| a.len() != S.num_cons || b.len() != S.num_cons || c.len() != S.num_cons)
+    }) || cached_i64.as_ref().is_some_and(|cache| {
+      cache.len() > n_padded
+        || cache
+          .iter()
+          .any(|(a, b, c)| a.len() != S.num_cons || b.len() != S.num_cons || c.len() != S.num_cons)
+    }) || large_positions
+      .iter()
+      .any(|&position| position >= S.num_cons)
+      || large_positions.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+      return Err(SpartanError::InvalidInputLength {
+        reason: "NIFS matrix cache dimensions or large-value positions are invalid".into(),
+      });
+    }
+    let (ell_cons, left, right) = compute_tensor_decomp(S.num_cons);
+    let E_eq = PowPolynomial::split_evals(tau, ell_cons, left, right);
 
     // Build Az, Bz, Cz tables for each (possibly padded) instance
 
@@ -640,7 +762,7 @@ where
       }
     }
 
-    // Execute NIFS rounds, generating cubic polynomials and driving r_b via multi-round state
+    // Execute the shared arithmetic; the caller supplies each round challenge.
 
     // Precompute C_val[b] = sum_k E_eq[k] * Cz_b[k] for each instance b.
     // This lets us skip C in fold_abc_pair and prove_helper, computing
@@ -692,7 +814,6 @@ where
       vec![]
     };
 
-    let mut polys: Vec<UniPoly<E::Scalar>> = Vec::with_capacity(ell_b);
     let mut r_bs: Vec<E::Scalar> = Vec::with_capacity(ell_b);
     let mut T_cur = E::Scalar::ZERO; // the current target value, starts at 0
     let mut acc_eq = E::Scalar::ONE;
@@ -718,14 +839,8 @@ where
         let poly_t = UniPoly {
           coeffs: vec![new_d, new_c, new_b, new_a],
         };
-        polys.push(poly_t.clone());
-
         let c = &poly_t.coeffs;
-        vc.nifs_polys[$t] = [c[0], c[1], c[2], c[3]];
-
-        let chals =
-          SatisfyingAssignment::<E>::process_round(vc_state, vc_shape, vc_ck, vc, $t, transcript)?;
-        let r_b = chals[0];
+        let r_b = round($t, [c[0], c[1], c[2], c[3]])?;
         r_bs.push(r_b);
 
         acc_eq *= (E::Scalar::ONE - r_b) * (E::Scalar::ONE - rho_t) + r_b * rho_t;
@@ -777,7 +892,7 @@ where
 
     // Round 0: prove_helper (compute_e0 = false for round 0)
     // Uses small-value integer arithmetic when i64 data is available.
-    {
+    if ell_b > 0 {
       let pairs = m / 2;
       let (e0, quad_coeff) = if has_i64 {
         // Small-value fast path: i64 subtraction + i128 multiplication
@@ -801,7 +916,7 @@ where
               &pair_b_i64[1],
               large_positions,
             );
-            let w = suffix_weight_full::<E::Scalar>(0, ell_b, pair_idx, &rhos);
+            let w = suffix_weight_full::<E::Scalar>(0, ell_b, pair_idx, rhos);
             qc * w
           })
           .reduce(|| E::Scalar::ZERO, |a, b| a + b);
@@ -824,7 +939,7 @@ where
               &pair_a[1],
               &pair_b[1],
             );
-            let w = suffix_weight_full::<E::Scalar>(0, ell_b, pair_idx, &rhos);
+            let w = suffix_weight_full::<E::Scalar>(0, ell_b, pair_idx, rhos);
             (e0 * w, quad_coeff * w)
           })
           .reduce(
@@ -1206,17 +1321,14 @@ where
     // T_out = poly_last(r_last) / eq(r_b, rho)
     let acc_eq_inv: Option<E::Scalar> = acc_eq.invert().into();
     let T_out = T_cur * acc_eq_inv.ok_or(SpartanError::DivisionByZero)?;
-    vc.t_out_step = T_out;
-    vc.eq_rho_at_rb = acc_eq;
-    let _ =
-      SatisfyingAssignment::<E>::process_round(vc_state, vc_shape, vc_ck, vc, ell_b, transcript)?;
 
-    // Truncate witness W vectors to skip zero rest portion before folding.
-    // The rest portion (indices effective_len..) is all zero for step circuits,
-    // so the folded result there is also zero. We resize back after folding.
-    // Only apply when shared+precommitted > 0 (otherwise truncation would zero everything).
+    // Skip the rest portion only when it is actually zero in every witness.
+    // General step circuits may allocate nonzero rest variables.
     let effective_len = S.num_shared + S.num_precommitted;
-    let use_truncated_fold = effective_len > 0;
+    let use_truncated_fold = effective_len > 0
+      && Ws
+        .iter()
+        .all(|w| w.W[effective_len..].iter().all(|x| bool::from(x.is_zero())));
     if use_truncated_fold {
       for w in Ws.iter_mut() {
         w.W.truncate(effective_len);
@@ -1262,14 +1374,16 @@ where
     let folded_U = R1CSInstance::<E>::new_unchecked(comm_acc, X_acc)?;
     info!(elapsed_ms = %fold_final_t.elapsed().as_millis(), "fold_instances");
 
-    Ok((
-      E_eq,
-      std::mem::take(&mut A_layers[0]),
-      std::mem::take(&mut B_layers[0]),
-      std::mem::take(&mut C_layers[0]),
-      folded_W,
-      folded_U,
-    ))
+    Ok(NeutronNovaFoldOutput {
+      eq: E_eq,
+      az: std::mem::take(&mut A_layers[0]),
+      bz: std::mem::take(&mut B_layers[0]),
+      cz: std::mem::take(&mut C_layers[0]),
+      witness: folded_W,
+      instance: folded_U,
+      target: T_out,
+      eq_rho: acc_eq,
+    })
   }
 }
 
@@ -1547,41 +1661,7 @@ where
             pk.S_step.multiply_vec(&z)
           })
           .collect::<Result<Vec<_>, _>>()?;
-        // Convert Az/Bz to i64 for small-value NIFS round 0 optimization.
-        let mut all_i64 = Vec::with_capacity(matvec.len());
-        let mut large_pos_set = std::collections::BTreeSet::new();
-        for (az, bz, cz) in &matvec {
-          let (az_i64, az_large) = to_small_vec_or_zero(az);
-          let (bz_i64, bz_large) = to_small_vec_or_zero(bz);
-          let (cz_i64, cz_large) = to_small_vec_or_zero(cz);
-          for pos in az_large {
-            large_pos_set.insert(pos);
-          }
-          for pos in bz_large {
-            large_pos_set.insert(pos);
-          }
-          for pos in cz_large {
-            large_pos_set.insert(pos);
-          }
-          all_i64.push((az_i64, bz_i64, cz_i64));
-        }
-        let lp: Vec<usize> = large_pos_set.into_iter().collect();
-        info!(
-          n_large = lp.len(),
-          total = matvec[0].0.len(),
-          "i64_conversion_stats"
-        );
-
-        // Zero out i64 values at ALL large_positions in ALL instances.
-        if !lp.is_empty() {
-          for (az_i64, bz_i64, cz_i64) in &mut all_i64 {
-            for &pos in &lp {
-              az_i64[pos] = 0;
-              bz_i64[pos] = 0;
-              cz_i64[pos] = 0;
-            }
-          }
-        }
+        let (all_i64, lp) = small_matvec_cache(&matvec);
         (Some(matvec), Some(all_i64), lp, step_public_values)
       } else {
         info!(
@@ -2353,6 +2433,203 @@ mod tests {
   };
   use bellpepper_core::{ConstraintSystem, SynthesisError};
   use core::marker::PhantomData;
+
+  type TestEngine = T256HyraxEngine;
+  type TestScalar = <TestEngine as Engine>::Scalar;
+
+  fn kernel_fixture(
+    num_rows: usize,
+    num_instances: usize,
+  ) -> (
+    SplitR1CSShape<TestEngine>,
+    CommitmentKey<TestEngine>,
+    Vec<R1CSInstance<TestEngine>>,
+    Vec<R1CSWitness<TestEngine>>,
+    Vec<(Vec<TestScalar>, Vec<TestScalar>, Vec<TestScalar>)>,
+  ) {
+    use crate::r1cs::SparseMatrix;
+    let one = TestScalar::ONE;
+    let large = TestScalar::from(1u64 << 40).square();
+    // precommitted a, rest a^2, constant one, and public a^2.
+    let a_entries = [(0, 0, one), (1, 1, one), (2, 0, -one), (3, 0, large)];
+    let b_entries = [(0, 0, one), (1, 2, one), (2, 2, one), (3, 2, one)];
+    let c_entries = [(0, 1, one), (1, 3, one), (2, 0, -one), (3, 0, large)];
+    let shape = SplitR1CSShape::<TestEngine>::new(
+      num_rows,
+      0,
+      1,
+      1,
+      1,
+      0,
+      SparseMatrix::new(&a_entries[..num_rows], num_rows, 4),
+      SparseMatrix::new(&b_entries[..num_rows], num_rows, 4),
+      SparseMatrix::new(&c_entries[..num_rows], num_rows, 4),
+    )
+    .unwrap();
+    let regular = shape.to_regular_shape();
+    let (ck, _) = SplitR1CSShape::commitment_key(&[&shape]).unwrap();
+    let mut instances = Vec::new();
+    let mut witnesses = Vec::new();
+    let mut matvec = Vec::new();
+    for index in 0..num_instances {
+      let a = if index % 2 == 0 {
+        -TestScalar::from(index as u64 + 2)
+      } else {
+        TestScalar::from(index as u64 + 2)
+      };
+      let mut values = vec![TestScalar::ZERO; regular.num_vars];
+      values[0] = a;
+      values[shape.num_precommitted] = a.square();
+      let (witness, commitment) = R1CSWitness::new(&ck, &regular, &mut values, false).unwrap();
+      let instance = R1CSInstance::new_unchecked(commitment, vec![a.square()]).unwrap();
+      let mut z = witness.W.clone();
+      z.push(TestScalar::ONE);
+      z.extend_from_slice(&instance.X);
+      matvec.push(shape.multiply_vec(&z).unwrap());
+      witnesses.push(witness);
+      instances.push(instance);
+    }
+    (shape, ck, instances, witnesses, matvec)
+  }
+
+  #[test]
+  fn shared_nifs_kernel_matches_cache_paths_and_preserves_rest() {
+    for num_rows in [1, 2, 4] {
+      for num_instances in [1usize, 2, 4, 8] {
+        let (shape, ck, instances, witnesses, matvec) = kernel_fixture(num_rows, num_instances);
+        let rounds = num_instances.log_2();
+        let rho: Vec<_> = (0..rounds)
+          .map(|i| TestScalar::from(19 + i as u64))
+          .collect();
+        let challenges: Vec<_> = (0..rounds)
+          .map(|i| TestScalar::from(11 + i as u64))
+          .collect();
+        let mut polynomials = Vec::new();
+        let full = NeutronNovaNIFS::prove_with_rounds(
+          &shape,
+          &ck,
+          instances.clone(),
+          witnesses.clone(),
+          Some(matvec.clone()),
+          None,
+          &[],
+          TestScalar::from(7),
+          &rho,
+          |round, coefficients| {
+            polynomials.push(coefficients);
+            Ok(challenges[round])
+          },
+        )
+        .unwrap();
+        let (cache, large_positions) = small_matvec_cache(&matvec);
+        assert_eq!(
+          large_positions,
+          if num_rows == 4 { vec![3] } else { vec![] }
+        );
+        let small = NeutronNovaNIFS::prove_with_rounds(
+          &shape,
+          &ck,
+          instances.clone(),
+          witnesses.clone(),
+          Some(matvec),
+          Some(cache),
+          &large_positions,
+          TestScalar::from(7),
+          &rho,
+          |round, coefficients| {
+            assert_eq!(coefficients, polynomials[round]);
+            Ok(challenges[round])
+          },
+        )
+        .unwrap();
+        assert_eq!(full.eq, small.eq);
+        assert_eq!(full.az, small.az);
+        assert_eq!(full.bz, small.bz);
+        assert_eq!(full.cz, small.cz);
+        assert_eq!(full.target, small.target);
+        assert_eq!(full.eq_rho, small.eq_rho);
+        let expected_witness = R1CSWitness::fold_multiple(&challenges, &witnesses).unwrap();
+        let expected_instance = R1CSInstance::fold_multiple(&challenges, &instances).unwrap();
+        assert_eq!(full.witness.W, expected_witness.W);
+        assert_eq!(small.witness.W, expected_witness.W);
+        assert_ne!(full.witness.W[shape.num_precommitted], TestScalar::ZERO);
+        assert_eq!(full.instance.X, expected_instance.X);
+        assert_eq!(small.instance.X, expected_instance.X);
+        assert_eq!(full.instance.comm_W, expected_instance.comm_W);
+        assert_eq!(small.instance.comm_W, expected_instance.comm_W);
+        let reconstructed_commitment =
+          <TestEngine as Engine>::PCS::commit(&ck, &full.witness.W, &full.witness.r_W, false)
+            .unwrap();
+        assert_eq!(full.instance.comm_W, reconstructed_commitment);
+        let mut z = full.witness.W.clone();
+        z.push(TestScalar::ONE);
+        z.extend_from_slice(&full.instance.X);
+        let (az, bz, cz) = shape.multiply_vec(&z).unwrap();
+        assert_eq!(full.az, az);
+        assert_eq!(full.bz, bz);
+        assert_eq!(full.cz, cz);
+        let (_, left, _) = compute_tensor_decomp(num_rows);
+        let residual: TestScalar = (0..num_rows)
+          .map(|k| full.eq[k % left] * full.eq[left + k / left] * (az[k] * bz[k] - cz[k]))
+          .sum();
+        assert_eq!(full.target, residual);
+        let mut target = TestScalar::ZERO;
+        for (coefficients, challenge) in polynomials.into_iter().zip(&challenges) {
+          let polynomial = UniPoly {
+            coeffs: coefficients.to_vec(),
+          };
+          assert_eq!(
+            polynomial.evaluate(&TestScalar::ZERO) + polynomial.evaluate(&TestScalar::ONE),
+            target
+          );
+          target = polynomial.evaluate(challenge);
+        }
+        assert_eq!(target, full.target * full.eq_rho);
+      }
+    }
+  }
+
+  #[test]
+  fn shared_nifs_kernel_rejects_invalid_dimensions() {
+    let (shape, ck, instances, witnesses, _) = kernel_fixture(1, 2);
+    let prove = |instances, witnesses, rho: &[TestScalar], cache| {
+      NeutronNovaNIFS::prove_with_rounds(
+        &shape,
+        &ck,
+        instances,
+        witnesses,
+        cache,
+        None,
+        &[],
+        TestScalar::from(7),
+        rho,
+        |_, _| panic!("invalid dimensions must fail before a round"),
+      )
+    };
+    assert!(prove(vec![], vec![], &[], None).is_err());
+    assert!(prove(instances.clone(), witnesses.clone(), &[], None).is_err());
+    assert!(
+      prove(
+        instances.clone(),
+        vec![witnesses[0].clone()],
+        &[TestScalar::from(19)],
+        None
+      )
+      .is_err()
+    );
+    assert!(
+      prove(
+        instances.clone(),
+        witnesses.clone(),
+        &[TestScalar::from(19)],
+        Some(vec![(vec![], vec![], vec![])])
+      )
+      .is_err()
+    );
+    let mut truncated = witnesses;
+    truncated[0].W.pop();
+    assert!(prove(instances, truncated, &[TestScalar::from(19)], None).is_err());
+  }
 
   #[derive(Clone, Debug)]
   struct Sha256Circuit<E: Engine> {

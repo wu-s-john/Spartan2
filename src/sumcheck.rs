@@ -713,6 +713,42 @@ impl<E: Engine> SumcheckProof<E> {
     transcript: &mut E::TE,
     start_round: usize,
   ) -> Result<(Vec<E::Scalar>, Vec<E::Scalar>), SpartanError> {
+    Self::prove_quad_batched_with_rounds(
+      claims,
+      num_rounds,
+      poly_A_0,
+      poly_A_1,
+      poly_B_0,
+      poly_B_1,
+      |j, [coeffs_step, coeffs_core]| {
+        verifier_circuit.inner_polys_step[j] = coeffs_step;
+        verifier_circuit.inner_polys_core[j] = coeffs_core;
+        let chals = SatisfyingAssignment::<E>::process_round(
+          state,
+          vc_shape,
+          vc_ck,
+          verifier_circuit,
+          start_round + j,
+          transcript,
+        )?;
+        Ok(chals[0])
+      },
+    )
+  }
+
+  /// Shared arithmetic for the two inner sum-check branches.
+  ///
+  /// The callback records both coefficient arrays and supplies their common
+  /// challenge. It owns all transcript or verifier-circuit interaction.
+  pub(crate) fn prove_quad_batched_with_rounds(
+    claims: &[E::Scalar; 2],
+    num_rounds: usize,
+    poly_A_0: &mut MultilinearPolynomial<E::Scalar>,
+    poly_A_1: &mut MultilinearPolynomial<E::Scalar>,
+    poly_B_0: &mut MultilinearPolynomial<E::Scalar>,
+    poly_B_1: &mut MultilinearPolynomial<E::Scalar>,
+    mut emit_round: impl FnMut(usize, [[E::Scalar; 3]; 2]) -> Result<E::Scalar, SpartanError>,
+  ) -> Result<(Vec<E::Scalar>, Vec<E::Scalar>), SpartanError> {
     let mut r_y: Vec<E::Scalar> = Vec::with_capacity(num_rounds);
     // Maintain separate claims for step and core branches
     let mut claim_step_round = claims[0];
@@ -739,19 +775,8 @@ impl<E: Engine> SumcheckProof<E> {
       let poly_c = UniPoly::from_evals(&evals_c)?;
       let coeffs_core = [poly_c.coeffs[0], poly_c.coeffs[1], poly_c.coeffs[2]];
 
-      verifier_circuit.inner_polys_step[j] = coeffs_step;
-      verifier_circuit.inner_polys_core[j] = coeffs_core;
-
-      // -------- transcript / witness handling --------
-      let chals = SatisfyingAssignment::<E>::process_round(
-        state,
-        vc_shape,
-        vc_ck,
-        verifier_circuit,
-        start_round + j,
-        transcript,
-      )?;
-      let r_j = chals[0];
+      // Both branches must be recorded before the common challenge is sampled.
+      let r_j = emit_round(j, [coeffs_step, coeffs_core])?;
       r_y.push(r_j);
 
       // -------- bind polys --------
@@ -800,13 +825,58 @@ impl<E: Engine> SumcheckProof<E> {
     transcript: &mut E::TE,
     start_round: usize,
   ) -> Result<Vec<E::Scalar>, SpartanError> {
+    Self::prove_cubic_with_additive_term_batched_with_rounds(
+      &[verifier_circuit.t_out_step, E::Scalar::ZERO],
+      num_rounds,
+      pow_tau_left,
+      pow_tau_right,
+      poly_A_step,
+      poly_A_core,
+      poly_B_step,
+      poly_B_core,
+      poly_C_step,
+      poly_C_core,
+      |i, [coeffs_step, coeffs_core]| {
+        verifier_circuit.outer_polys_step[i] = coeffs_step;
+        verifier_circuit.outer_polys_core[i] = coeffs_core;
+        let chals = SatisfyingAssignment::<E>::process_round(
+          state,
+          vc_shape,
+          vc_ck,
+          verifier_circuit,
+          start_round + i,
+          transcript,
+        )?;
+        Ok(chals[0])
+      },
+    )
+  }
+
+  /// Shared arithmetic for the two outer sum-check branches.
+  ///
+  /// The tau powers stay factored into two tables, and the callback records both
+  /// coefficient arrays before supplying their common challenge. On return,
+  /// `pow_tau_left[0]` contains the power polynomial at the returned point.
+  pub(crate) fn prove_cubic_with_additive_term_batched_with_rounds(
+    claims: &[E::Scalar; 2],
+    num_rounds: usize,
+    pow_tau_left: &mut MultilinearPolynomial<E::Scalar>,
+    pow_tau_right: &MultilinearPolynomial<E::Scalar>,
+    poly_A_step: &mut MultilinearPolynomial<E::Scalar>,
+    poly_A_core: &mut MultilinearPolynomial<E::Scalar>,
+    poly_B_step: &mut MultilinearPolynomial<E::Scalar>,
+    poly_B_core: &mut MultilinearPolynomial<E::Scalar>,
+    poly_C_step: &mut MultilinearPolynomial<E::Scalar>,
+    poly_C_core: &mut MultilinearPolynomial<E::Scalar>,
+    mut emit_round: impl FnMut(usize, [[E::Scalar; 4]; 2]) -> Result<E::Scalar, SpartanError>,
+  ) -> Result<Vec<E::Scalar>, SpartanError> {
     let mut base_tau = E::Scalar::ONE;
     let mut len_pow_tau = pow_tau_left.Z.len() * pow_tau_right.Z.len();
 
     let mut r_x: Vec<E::Scalar> = Vec::with_capacity(num_rounds);
 
-    let mut claim_step = verifier_circuit.t_out_step;
-    let mut claim_core = E::Scalar::ZERO;
+    let mut claim_step = claims[0];
+    let mut claim_core = claims[1];
 
     for i in 0..num_rounds {
       // step branch
@@ -857,19 +927,8 @@ impl<E: Engine> SumcheckProof<E> {
         poly_c.coeffs[3],
       ];
 
-      verifier_circuit.outer_polys_step[i] = coeffs_step;
-      verifier_circuit.outer_polys_core[i] = coeffs_core;
-
-      // -------- transcript / witness handling --------
-      let chals = SatisfyingAssignment::<E>::process_round(
-        state,
-        vc_shape,
-        vc_ck,
-        verifier_circuit,
-        start_round + i,
-        transcript,
-      )?;
-      let r_i = chals[0];
+      // Both branches must be recorded before the common challenge is sampled.
+      let r_i = emit_round(i, [coeffs_step, coeffs_core])?;
       r_x.push(r_i);
 
       // -------- advance claim and bind polys --------
@@ -1425,6 +1484,181 @@ pub(crate) mod eq_sumcheck {
       // is init_num_vars (as we do init_num_vars rounds), so the index is always >= 0.
       &self.poly_eq_right[self.init_num_vars - self.round]
     }
+  }
+}
+
+#[cfg(test)]
+mod shared_round_tests {
+  use super::*;
+  use crate::provider::{Bn254Engine, T256HyraxEngine};
+
+  fn bound<F: Field>(values: &[F], point: F) -> Vec<F> {
+    let half = values.len() / 2;
+    (0..half)
+      .map(|i| values[i] + point * (values[i + half] - values[i]))
+      .collect()
+  }
+
+  fn evaluate_coeffs<F: Field>(coeffs: &[F], point: F) -> F {
+    coeffs
+      .iter()
+      .rev()
+      .fold(F::ZERO, |acc, coefficient| acc * point + coefficient)
+  }
+
+  fn test_shared_quad<E: Engine>() {
+    for num_rounds in 0..=5 {
+      let len = 1 << num_rounds;
+      let tables: [Vec<E::Scalar>; 4] = std::array::from_fn(|table| {
+        (0..len)
+          .map(|i| {
+            if table == 1 && i > len / 4 {
+              E::Scalar::ZERO
+            } else {
+              E::Scalar::from((3 + i * i + table * 7) as u64)
+            }
+          })
+          .collect()
+      });
+      let claims = std::array::from_fn(|branch| {
+        tables[branch]
+          .iter()
+          .zip(&tables[branch + 2])
+          .map(|(a, b)| *a * b)
+          .sum()
+      });
+      let mut direct_tables = tables.clone();
+      let mut direct_claims = claims;
+      let [mut a0, mut a1, mut b0, mut b1] = tables.map(MultilinearPolynomial::new);
+      let (point, terminal) = SumcheckProof::<E>::prove_quad_batched_with_rounds(
+        &claims,
+        num_rounds,
+        &mut a0,
+        &mut a1,
+        &mut b0,
+        &mut b1,
+        |round, coeffs| {
+          for branch in 0..2 {
+            assert_eq!(
+              coeffs[branch][0] + evaluate_coeffs(&coeffs[branch], E::Scalar::ONE),
+              direct_claims[branch]
+            );
+            for x in 0..=2 {
+              let x = E::Scalar::from(x);
+              let a = bound(&direct_tables[branch], x);
+              let b = bound(&direct_tables[branch + 2], x);
+              let expected: E::Scalar = a.iter().zip(&b).map(|(a, b)| *a * b).sum();
+              assert_eq!(evaluate_coeffs(&coeffs[branch], x), expected);
+            }
+          }
+          let challenge = E::Scalar::from((round + 5) as u64);
+          for table in &mut direct_tables {
+            *table = bound(table, challenge);
+          }
+          direct_claims = coeffs.map(|coeffs| evaluate_coeffs(&coeffs, challenge));
+          Ok(challenge)
+        },
+      )
+      .unwrap();
+      assert_eq!(point.len(), num_rounds);
+      assert_eq!(terminal, direct_tables.map(|table| table[0]).to_vec());
+      for branch in 0..2 {
+        assert_eq!(
+          direct_claims[branch],
+          terminal[branch] * terminal[branch + 2]
+        );
+      }
+    }
+  }
+
+  fn test_shared_cubic<E: Engine>() {
+    for num_rounds in 0..=5 {
+      for tau in [E::Scalar::ZERO, E::Scalar::ONE, E::Scalar::from(7)] {
+        let len = 1 << num_rounds;
+        let tables: [Vec<E::Scalar>; 6] = std::array::from_fn(|table| {
+          (0..len)
+            .map(|i| E::Scalar::from((2 + i * i + table * 7) as u64))
+            .collect()
+        });
+        let powers = std::iter::successors(Some(E::Scalar::ONE), |power| Some(*power * tau))
+          .take(len)
+          .collect::<Vec<_>>();
+        let claims = std::array::from_fn(|branch| {
+          (0..len)
+            .map(|i| {
+              powers[i] * (tables[branch][i] * tables[branch + 2][i] - tables[branch + 4][i])
+            })
+            .sum()
+        });
+        let mut direct_tables = tables.clone();
+        let mut direct_powers = powers.clone();
+        let mut direct_claims = claims;
+        let left_len = 1 << (num_rounds / 2);
+        let mut left = MultilinearPolynomial::new(powers[..left_len].to_vec());
+        let right = MultilinearPolynomial::new(powers.iter().step_by(left_len).copied().collect());
+        let [mut a0, mut a1, mut b0, mut b1, mut c0, mut c1] =
+          tables.map(MultilinearPolynomial::new);
+        let point = SumcheckProof::<E>::prove_cubic_with_additive_term_batched_with_rounds(
+          &claims,
+          num_rounds,
+          &mut left,
+          &right,
+          &mut a0,
+          &mut a1,
+          &mut b0,
+          &mut b1,
+          &mut c0,
+          &mut c1,
+          |round, coeffs| {
+            for branch in 0..2 {
+              assert_eq!(
+                coeffs[branch][0] + evaluate_coeffs(&coeffs[branch], E::Scalar::ONE),
+                direct_claims[branch]
+              );
+              for x in 0..=3 {
+                let x = E::Scalar::from(x);
+                let a = bound(&direct_tables[branch], x);
+                let b = bound(&direct_tables[branch + 2], x);
+                let c = bound(&direct_tables[branch + 4], x);
+                let pow = bound(&direct_powers, x);
+                let expected: E::Scalar = (0..a.len()).map(|i| pow[i] * (a[i] * b[i] - c[i])).sum();
+                assert_eq!(evaluate_coeffs(&coeffs[branch], x), expected);
+              }
+            }
+            let challenge = E::Scalar::from((round + 5) as u64);
+            for table in &mut direct_tables {
+              *table = bound(table, challenge);
+            }
+            direct_powers = bound(&direct_powers, challenge);
+            direct_claims = coeffs.map(|coeffs| evaluate_coeffs(&coeffs, challenge));
+            Ok(challenge)
+          },
+        )
+        .unwrap();
+        assert_eq!(point.len(), num_rounds);
+        let terminal = [a0[0], a1[0], b0[0], b1[0], c0[0], c1[0]];
+        assert_eq!(terminal, direct_tables.map(|table| table[0]));
+        assert_eq!(left[0], direct_powers[0]);
+        for branch in 0..2 {
+          assert_eq!(
+            direct_claims[branch],
+            left[0] * (terminal[branch] * terminal[branch + 2] - terminal[branch + 4])
+          );
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn shared_quad_rounds_match_direct_polynomial() {
+    test_shared_quad::<Bn254Engine>();
+    test_shared_quad::<T256HyraxEngine>();
+  }
+
+  #[test]
+  fn shared_cubic_rounds_match_direct_polynomial() {
+    test_shared_cubic::<Bn254Engine>();
+    test_shared_cubic::<T256HyraxEngine>();
   }
 }
 

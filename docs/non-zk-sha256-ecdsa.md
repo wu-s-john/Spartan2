@@ -50,6 +50,14 @@ for setup; there are no witness-dependent circuit shapes.
 
 ## Public protocol
 
+The non-ZK entry points reuse `NeutronNovaNIFS::prove_with_rounds` in
+`neutronnova_zk.rs` and the shared batched kernels in `sumcheck.rs`. The existing
+ZK entry points call those same kernels. Callbacks determine whether a round's
+polynomials enter the ZK verifier circuit or are absorbed directly into the
+public transcript. Both branch polynomials bind before their common challenge.
+The `neutronnova.rs` module contains the non-ZK API, message encoding, and native
+verification; it does not implement a second set of folding or sumcheck kernels.
+
 1. Commit to all K SHA witnesses and the core witness. Bind the public key
    digest, length-prefixed application statement, and ordered instances to
    the transcript before sampling challenges.
@@ -76,16 +84,24 @@ opening and public protocol messages do not make a ZK proof.
 ## Measurement and scope
 
 `generate_witness` synthesizes assignments; `commit` creates all commitments;
-`prove` includes matrix products, folding, both sumchecks and opening. No
-matrix products are hidden in witness preparation. `Phases` contains
+`prove` includes matrix products, small-value cache construction, folding,
+both sumchecks and opening. No matrix products are hidden in witness
+preparation. The signed small-value conversion, field corrections, delayed
+reductions, and parallel folding/sumcheck kernels are shared with the ZK path.
+`Phases` contains
 non-overlapping matrix, folding, outer, inner and opening timers. Setup,
 witness generation, commitment, proving, codec and full application
 verification can therefore be timed separately by a caller.
 
-This is a new non-ZK adaptation of the fork's matrix and Hyrax infrastructure,
-not the stock ZK multi-circuit prover or a reproduction of the Vega paper's
-published measurements. It does not port every optimized kernel/cache from
-that path. Security metadata should identify T256 DLOG, the P-256 coordinate
+This non-ZK path omits the verifier-circuit commitments and auxiliary ZK proof,
+and checks their corresponding equations natively. It is not a reproduction of
+the Vega paper's published ZK measurements. Its Bellpepper circuit layout and
+per-proof cache accounting differ from applications using the stock shared and
+precommitted witness interface. The public transcript is domain-separated as
+`non-zk-mc/v2`; proofs from the earlier standalone implementation are not
+accepted by this version. Historical measurements at commit `bf99f4f8` describe
+that earlier implementation and must not be relabeled as shared-kernel results.
+Security metadata should identify T256 DLOG, the P-256 coordinate
 field, Keccak256 Fiat-Shamir, and direct Hyrax; nominal 128-bit group security
 is distinct from F2Z's economic proof-of-work security targets.
 

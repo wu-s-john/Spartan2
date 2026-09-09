@@ -76,9 +76,7 @@ impl<Scalar: PrimeField> PowPolynomial<Scalar> {
     // take the last entry from left, multiply with t to get the second entry in right
     let left_last_times_t = left[left.len() - 1] * t;
     let mut right = vec![Scalar::ONE; len_right];
-    right[0] = Scalar::ONE;
-    right[1] = left_last_times_t;
-    for i in 2..len_right {
+    for i in 1..len_right {
       right[i] = right[i - 1] * left_last_times_t;
     }
 
@@ -90,6 +88,7 @@ impl<Scalar: PrimeField> PowPolynomial<Scalar> {
 mod tests {
   use super::*;
   use crate::provider::pasta::pallas;
+  use ff::Field;
   use rand::rngs::OsRng;
 
   fn test_evals_with<Scalar: PrimeField>() {
@@ -158,5 +157,26 @@ mod tests {
   #[test]
   fn test_split_evals() {
     test_split_evals_with::<pallas::Scalar>();
+  }
+
+  #[test]
+  fn split_evals_covers_small_and_asymmetric_domains() {
+    for ell in 0usize..=6 {
+      for left_bits in 0..=ell {
+        let left_len = 1 << left_bits;
+        let right_len = 1 << (ell - left_bits);
+        let tau = pallas::Scalar::from(7);
+        let split = PowPolynomial::split_evals(tau, ell, left_len, right_len);
+        let (left, right) = split.split_at(left_len);
+        let expanded: Vec<_> = right
+          .iter()
+          .flat_map(|r| left.iter().map(move |l| *r * l))
+          .collect();
+        let expected: Vec<_> = successors(Some(pallas::Scalar::ONE), |v| Some(*v * tau))
+          .take(1 << ell)
+          .collect();
+        assert_eq!(expanded, expected);
+      }
+    }
   }
 }
