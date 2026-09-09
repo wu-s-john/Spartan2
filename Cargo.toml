@@ -16,7 +16,7 @@ bellpepper = "0.4.0"
 ff = { version = "0.13.0", features = ["derive"] }
 digest = "0.10"
 sha3 = "0.10"
-sha2 = "0.10.7"
+sha2 = { version = "0.10.7", features = ["compress"] }
 rayon = "1.10.0"
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 rand = "0.8"
@@ -36,6 +36,7 @@ group = "0.13.0"
 once_cell = "1.18.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
+p256 = { version = "0.13.2", features = ["ecdsa"], optional = true }
 tikv-jemallocator = { version = "0.6.0", optional = true }
 
 # Use halo2curves ASM on x86_64 by default; disable ASM on non-x86_64
@@ -59,6 +60,7 @@ proptest = "1.2.0"
 
 [features]
 default = []
+sha256-ecdsa = ["dep:p256"]
 jem = ["tikv-jemallocator"]
 
 [[bench]]

@@ -44,6 +44,9 @@ mod sumcheck;
 
 // public modules for proof systems
 pub mod neutronnova_zk; // NeutronNova with zero-knowledge
+pub mod neutronnova; // Fixed-batch, non-ZK NeutronNova with a direct Hyrax opening
+#[cfg(feature = "sha256-ecdsa")]
+pub mod sha256_ecdsa; // SHA chains and native P-256 signature verification
 pub mod spartan; // Spartan without zero-knowledge
 pub mod spartan_relaxed; // Spartan for relaxed R1CS (non-ZK)
 pub mod spartan_zk; // Spartan with zero-knowledge
