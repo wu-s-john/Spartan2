@@ -32,7 +32,7 @@ use ff::Field;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use std::{borrow::Cow, time::Instant};
+use std::borrow::Cow;
 
 /// T256/Hyrax engine used by this non-ZK implementation.
 pub type E = T256HyraxEngine;
@@ -129,21 +129,6 @@ pub struct Proof {
   evaluations: [F; 2],
   opening: Vec<F>,
   opening_blind: F,
-}
-
-#[derive(Default, Clone, Debug, Serialize)]
-/// Non-overlapping prover phase times in milliseconds.
-pub struct Phases {
-  /// Construction of the step/core matrix-vector products.
-  pub matrix_ms: f64,
-  /// NeutronNova sumcheck and witness/instance folding.
-  pub folding_ms: f64,
-  /// Paired outer reduction and terminal-claim batching.
-  pub outer_ms: f64,
-  /// Matrix binding, paired inner reduction, and evaluation batching.
-  pub inner_ms: f64,
-  /// Combined witness construction and direct Hyrax opening.
-  pub opening_ms: f64,
 }
 
 impl Proof {
@@ -364,11 +349,15 @@ fn round<const N: usize>(t: &mut Transcript, p: &[F; N], claim: F) -> Result<()>
 }
 
 /// Prove the committed batch with public folding/Spartan messages and one opening.
-pub fn prove(pk: &ProverKey, binding: &[u8], committed: &Committed) -> Result<(Proof, Phases)> {
+///
+/// Synchronous `tracing` spans mark the non-overlapping matrix, folding, outer,
+/// inner, and opening phases with `component = "spartan2.<phase>"`. The caller's
+/// subscriber owns timing and reporting; this function returns only the proof.
+/// The folding span also covers single-step preparation when `rounds = 0`.
+pub fn prove(pk: &ProverKey, binding: &[u8], committed: &Committed) -> Result<Proof> {
   if committed.key_digest != pk.digest {
     return Err(error("commitment belongs to a different setup"));
   }
-  let mut phases = Phases::default();
   let mut t = transcript(&pk.digest, binding, &committed.steps, &committed.core);
   let tau = t.squeeze(b"tau")?;
   let rounds_b = pk.steps.ilog2() as usize;
@@ -380,7 +369,7 @@ pub fn prove(pk: &ProverKey, binding: &[u8], committed: &Committed) -> Result<(P
   let rounds_x = m.ilog2() as usize;
   let left = 1 << rounds_x.div_ceil(2);
   let right = 1 << (rounds_x / 2);
-  let started = Instant::now();
+  let matrix_span = tracing::info_span!("matrix", component = "spartan2.matrix").entered();
   let (layers, core) = rayon::join(
     || {
       committed
@@ -397,9 +386,10 @@ pub fn prove(pk: &ProverKey, binding: &[u8], committed: &Committed) -> Result<(P
   // Build the same small-value caches used by the ZK prover, inside the measured
   // protocol phase: these matrix products depend on this proof's fresh witness.
   let cache = (rounds_b > 0).then(|| small_matvec_cache(&layers));
-  phases.matrix_ms = started.elapsed().as_secs_f64() * 1000.;
+  drop(matrix_span);
 
-  let started = Instant::now();
+  let folding_span =
+    tracing::info_span!("folding", component = "spartan2.folding", rounds = rounds_b).entered();
   let mut folding = Vec::new();
   let (mut claim, mut prefix) = (F::ZERO, F::ONE);
   let (mut eq, az_step, bz_step, cz_step, folded_w, folded_u, folded_target) =
@@ -448,13 +438,9 @@ pub fn prove(pk: &ProverKey, binding: &[u8], committed: &Committed) -> Result<(P
       )
     };
   t.absorb(b"folded-target", &folded_target);
-  phases.folding_ms = if rounds_b == 0 {
-    0.
-  } else {
-    started.elapsed().as_secs_f64() * 1000.
-  };
+  drop(folding_span);
 
-  let started = Instant::now();
+  let outer_span = tracing::info_span!("outer", component = "spartan2.outer").entered();
   let eq_right = eq.split_off(left);
   let mut pow_left = MultilinearPolynomial::new(eq);
   let pow_right = MultilinearPolynomial::new(eq_right);
@@ -499,9 +485,9 @@ pub fn prove(pk: &ProverKey, binding: &[u8], committed: &Committed) -> Result<(P
     t.absorb(b"outer-claims", &q.as_slice());
   }
   let alpha = t.squeeze(b"matrix-batch")?;
-  phases.outer_ms = started.elapsed().as_secs_f64() * 1000.;
+  drop(outer_span);
 
-  let started = Instant::now();
+  let inner_span = tracing::info_span!("inner", component = "spartan2.inner").entered();
   let eq_rx = EqPolynomial::evals_from_points(&rx);
   let [mut matrix_step, mut matrix_core] = std::array::from_fn::<_, 2, _>(|j| {
     MultilinearPolynomial::new(
@@ -548,9 +534,9 @@ pub fn prove(pk: &ProverKey, binding: &[u8], committed: &Committed) -> Result<(P
   let evaluations = ws.map(|w| w.W.par_iter().zip(&eq_w).map(|(a, b)| *a * b).sum());
   t.absorb(b"witness-evaluations", &evaluations.as_slice());
   let eta = t.squeeze(b"opening-batch")?;
-  phases.inner_ms = started.elapsed().as_secs_f64() * 1000.;
+  drop(inner_span);
 
-  let started = Instant::now();
+  let opening_span = tracing::info_span!("opening", component = "spartan2.opening").entered();
   let witness = folded_w
     .W
     .par_iter()
@@ -562,22 +548,19 @@ pub fn prove(pk: &ProverKey, binding: &[u8], committed: &Committed) -> Result<(P
     &[F::ONE, eta],
   )?;
   let (opening, opening_blind) = Pcs::prove_direct(&pk.ck, &witness, &blind, &ry[1..])?;
-  phases.opening_ms = started.elapsed().as_secs_f64() * 1000.;
-  Ok((
-    Proof {
-      steps: committed.steps.clone(),
-      core: committed.core.clone(),
-      folding,
-      folded_target,
-      outer,
-      outer_claims,
-      inner,
-      evaluations,
-      opening,
-      opening_blind,
-    },
-    phases,
-  ))
+  drop(opening_span);
+  Ok(Proof {
+    steps: committed.steps.clone(),
+    core: committed.core.clone(),
+    folding,
+    folded_target,
+    outer,
+    outer_claims,
+    inner,
+    evaluations,
+    opening,
+    opening_blind,
+  })
 }
 
 /// Verify dimensions, folding, both Spartan branches, and the final opening.
@@ -691,6 +674,60 @@ pub fn verify(vk: &VerificationKey, binding: &[u8], proof: &Proof) -> Result<()>
 mod tests {
   use super::*;
   use bellpepper_core::SynthesisError;
+  use std::sync::{Arc, Mutex};
+  use tracing::{
+    Subscriber,
+    field::Visit,
+    span::{Attributes, Id},
+  };
+  use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
+
+  #[derive(Clone, Default, Debug, PartialEq, Eq)]
+  struct Phase {
+    component: String,
+    rounds: Option<u64>,
+  }
+
+  impl Visit for Phase {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+      if field.name() == "component" {
+        self.component = value.to_owned();
+      }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+      if field.name() == "rounds" {
+        self.rounds = Some(value);
+      }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+  }
+
+  #[derive(Clone, Default)]
+  struct PhaseEvents(Arc<Mutex<Vec<(bool, Phase)>>>);
+
+  impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for PhaseEvents {
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+      let mut phase = Phase::default();
+      attrs.record(&mut phase);
+      if phase.component.starts_with("spartan2.") {
+        ctx.span(id).unwrap().extensions_mut().insert(phase);
+      }
+    }
+
+    fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
+      if let Some(phase) = ctx.span(id).unwrap().extensions().get::<Phase>() {
+        self.0.lock().unwrap().push((true, phase.clone()));
+      }
+    }
+
+    fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
+      if let Some(phase) = ctx.span(id).unwrap().extensions().get::<Phase>() {
+        self.0.lock().unwrap().push((false, phase.clone()));
+      }
+    }
+  }
 
   #[derive(Clone)]
   struct Multiply {
@@ -728,6 +765,38 @@ mod tests {
   }
 
   #[test]
+  fn phase_spans_are_ordered_and_do_not_change_the_proof() {
+    for count in [1, 2] {
+      let (pk, vk) = setup(circuit(1), circuit(2), count, 2048).unwrap();
+      let steps = (0..count).map(|i| circuit(3 + i as u64)).collect();
+      let witness = generate_witness(&pk, steps, circuit(100)).unwrap();
+      let committed = commit(&pk, witness).unwrap();
+      let plain =
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+          prove(&pk, b"statement", &committed).unwrap()
+        });
+      let events = PhaseEvents::default();
+      let traced = tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(events.clone()),
+        || prove(&pk, b"statement", &committed).unwrap(),
+      );
+      assert_eq!(plain.to_bytes().unwrap(), traced.to_bytes().unwrap());
+      verify(&vk, b"statement", &traced).unwrap();
+      let expected: Vec<_> = ["matrix", "folding", "outer", "inner", "opening"]
+        .into_iter()
+        .flat_map(|name| {
+          let phase = Phase {
+            component: format!("spartan2.{name}"),
+            rounds: (name == "folding").then_some(u64::from(count.ilog2())),
+          };
+          [(true, phase.clone()), (false, phase)]
+        })
+        .collect();
+      assert_eq!(*events.0.lock().unwrap(), expected);
+    }
+  }
+
+  #[test]
   fn folds_batches_and_rejects_altered_messages() {
     for count in [1, 2, 4, 8] {
       let (pk, vk) = setup(circuit(1), circuit(2), count, 2048).unwrap();
@@ -735,7 +804,7 @@ mod tests {
         let steps = (0..count).map(|i| circuit(seed + i as u64)).collect();
         let w = generate_witness(&pk, steps, circuit(seed + 100)).unwrap();
         let committed = commit(&pk, w).unwrap();
-        let (proof, _) = prove(&pk, b"statement", &committed).unwrap();
+        let proof = prove(&pk, b"statement", &committed).unwrap();
         verify(&vk, b"statement", &proof).unwrap();
         assert_eq!(proof.folding.len(), count.ilog2() as usize);
         assert_eq!(proof.opening.len(), 2048);

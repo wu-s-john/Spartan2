@@ -13,7 +13,7 @@ use p256::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use crate::neutronnova::{CircuitSize, Committed, Phases, Proof, Result, Witness};
+pub use crate::neutronnova::{CircuitSize, Committed, Proof, Result, Witness};
 
 const IV: [u32; 8] = [
   0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -248,8 +248,8 @@ impl Prepared {
   pub fn commit(&self, witness: Witness) -> Result<Committed> {
     neutronnova::commit(&self.pk, witness)
   }
-  /// Prove the committed relation, returning separate phase measurements.
-  pub fn prove(&self, statement: &Statement, committed: &Committed) -> Result<(Proof, Phases)> {
+  /// Prove the committed relation, emitting phase spans through [`neutronnova::prove`].
+  pub fn prove(&self, statement: &Statement, committed: &Committed) -> Result<Proof> {
     self.check_statement(statement)?;
     neutronnova::prove(&self.pk, &statement.to_bytes(), committed)
   }

@@ -106,7 +106,7 @@ fn sha_chain_and_signature_proofs_cover_chunkings_and_tampering() {
     let (statement, message) = fixture(3, 5);
     let witness = prepared.generate_witness(&statement, &message).unwrap();
     let committed = prepared.commit(witness).unwrap();
-    let (proof, _) = prepared.prove(&statement, &committed).unwrap();
+    let proof = prepared.prove(&statement, &committed).unwrap();
     let bytes = proof.to_bytes().unwrap();
     let decoded = Proof::from_bytes(&bytes).unwrap();
     prepared.verify(&statement, &decoded).unwrap();
@@ -138,7 +138,7 @@ fn sha_chain_and_signature_proofs_cover_chunkings_and_tampering() {
     let (statement, message) = fixture(3, 11);
     let witness = prepared.generate_witness(&statement, &message).unwrap();
     let committed = prepared.commit(witness).unwrap();
-    let (proof, _) = prepared.prove(&statement, &committed).unwrap();
+    let proof = prepared.prove(&statement, &committed).unwrap();
     prepared.verify(&statement, &proof).unwrap();
   }
 }
